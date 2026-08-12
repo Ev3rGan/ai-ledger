@@ -8,10 +8,12 @@ from rich.console import Console
 
 from ai_intel_agent.persistence import database_url_from_environment
 from ai_intel_agent.pipeline import persist_sample_story
+from ai_intel_agent.source_audit import run_source_definition_activation_audit
 
 app = typer.Typer(help="Run the deterministic AI intelligence workflow.")
 console = Console()
 DEFAULT_OUTPUT = Path("reports/daily.md")
+DEFAULT_SOURCE_AUDIT_OUTPUT = Path("reports/source-activation-audit.md")
 
 
 @app.callback()
@@ -40,6 +42,19 @@ def run_pipeline(
         f"{sample_story.story.id} (Evidence Span {sample_story.evidence_span.id})"
     )
     console.print(f"[green]Wrote sample report:[/] {output}")
+
+
+@app.command("audit-sources")
+def audit_source_definitions(
+    output: Annotated[
+        Path,
+        typer.Option("--output", "-o", help="Write the first-wave activation audit here."),
+    ] = DEFAULT_SOURCE_AUDIT_OUTPUT,
+) -> None:
+    audit = run_source_definition_activation_audit(output)
+    console.print(
+        f"[green]Audited {len(audit.source_definitions)} first-wave Source Definitions:[/] {output}"
+    )
 
 
 if __name__ == "__main__":

@@ -15,6 +15,17 @@ class EvidenceRole(StrEnum):
     COMMUNITY = "community"
 
 
+class Topic(StrEnum):
+    MODELS = "Models"
+    RESEARCH = "Research"
+    PRODUCTS_AND_TOOLS = "Products and Tools"
+    INDUSTRY_AND_INFRASTRUCTURE = "Industry and Infrastructure"
+    BUSINESS = "Business"
+    APPLICATIONS = "Applications"
+    POLICY_AND_SAFETY = "Policy and Safety"
+    COMMUNITY = "Community"
+
+
 @dataclass(frozen=True)
 class Candidate:
     id: UUID

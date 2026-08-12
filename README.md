@@ -23,6 +23,18 @@ uv run ai-intel-agent run --sample
 The sample uses a fixed Asia/Shanghai clock, fixed source data, and deterministic identifiers.
 Running it again leaves exactly one corresponding set of records and writes the same report.
 
+Audit the versioned first-wave Source Definitions without network access or production
+credentials:
+
+```powershell
+uv run ai-intel-agent audit-sources --output reports\source-activation-audit.md
+```
+
+The audit records each official entry point, language and Topic scope, robots and terms
+findings, private-storage and public-excerpt policy, pause conditions, and a conservative
+activation conclusion. Refresh the underlying evidence before activating a Source Definition
+whose conclusion is `needs-verification`.
+
 ## Verification
 
 The dev environment bundles an isolated PostgreSQL/pgvector test server. The acceptance test
@@ -33,6 +45,7 @@ starts it, applies the migration, invokes the CLI twice, and removes its data af
 uv run --extra dev pytest
 uv run --extra dev ruff check .
 uv run ai-intel-agent run --sample --output reports\daily.md
+uv run ai-intel-agent audit-sources --output reports\source-activation-audit.md
 ```
 
 The sample slice intentionally does not include Web pages, administrator review, real sources,
@@ -46,6 +59,7 @@ src/ai_intel_agent/
   sample.py       # fixed clock, fake source adapter, and sample data
   persistence.py  # SQLAlchemy mappings and idempotent repository
   pipeline.py     # application operation
+  source_audit.py # versioned first-wave Source Definition activation audit
   cli.py          # supported CLI transport
 alembic/          # clean PostgreSQL/pgvector baseline migration
 tests/            # CLI-to-database acceptance test
