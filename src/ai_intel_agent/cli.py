@@ -6,6 +6,10 @@ from typing import Annotated
 import typer
 from rich.console import Console
 
+from ai_intel_agent.extraction_benchmark import (
+    BenchmarkConfigurationError,
+    run_document_extraction_benchmark,
+)
 from ai_intel_agent.persistence import database_url_from_environment
 from ai_intel_agent.pipeline import persist_sample_story
 from ai_intel_agent.source_audit import run_source_definition_activation_audit
@@ -14,6 +18,7 @@ app = typer.Typer(help="Run the deterministic AI intelligence workflow.")
 console = Console()
 DEFAULT_OUTPUT = Path("reports/daily.md")
 DEFAULT_SOURCE_AUDIT_OUTPUT = Path("reports/source-activation-audit.md")
+DEFAULT_EXTRACTION_BENCHMARK_OUTPUT = Path("reports/document-extraction-benchmark.md")
 
 
 @app.callback()
@@ -54,6 +59,49 @@ def audit_source_definitions(
     audit = run_source_definition_activation_audit(output)
     console.print(
         f"[green]Audited {len(audit.source_definitions)} first-wave Source Definitions:[/] {output}"
+    )
+
+
+@app.command("benchmark-extraction")
+def benchmark_document_extraction(
+    output: Annotated[
+        Path,
+        typer.Option("--output", "-o", help="Write the Document extraction benchmark here."),
+    ] = DEFAULT_EXTRACTION_BENCHMARK_OUTPUT,
+    attempts: Annotated[
+        int,
+        typer.Option(
+            "--attempts",
+            min=2,
+            help="Run each URL and extraction path this many times.",
+        ),
+    ] = 2,
+    concurrency: Annotated[
+        int,
+        typer.Option(
+            "--concurrency",
+            min=1,
+            help="Maximum number of extraction attempts in flight.",
+        ),
+    ] = 12,
+) -> None:
+    def progress(completed: int, total: int, label: str) -> None:
+        if completed == total or completed % 20 == 0:
+            console.print(f"[cyan]Benchmark progress:[/] {completed}/{total} ({label})")
+
+    try:
+        benchmark = run_document_extraction_benchmark(
+            output,
+            attempts=attempts,
+            concurrency=concurrency,
+            progress=progress,
+        )
+    except BenchmarkConfigurationError as error:
+        raise typer.BadParameter(str(error)) from error
+    console.print(
+        "[green]Benchmarked "
+        f"{len(benchmark.corpus)} fixed corpus URLs across "
+        f"{len(benchmark.extraction_paths)} extraction paths:[/] {output}"
     )
 
 

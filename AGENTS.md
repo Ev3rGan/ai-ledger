@@ -14,9 +14,11 @@
 - **GitHub:** `https://github.com/Ev3rGan/ai-ledger`
 - Use the configured `origin` remote and `main` default branch for repository operations.
 
-### GitHub CLI authentication
+### GitHub connector and CLI fallback
 
-Use the repository's installed GitHub CLI at `D:\AgentDev\gh\bin\gh.exe`. Authentication is stored in the Windows keyring and must be verified before Issue or remote operations:
+Use the Codex GitHub connector first for GitHub Issue and Pull Request reads and writes, including issue fetch/create/update, labels, comments, and PR creation/metadata updates. This avoids depending on the local process's access to the Windows keyring.
+
+Use the repository's installed GitHub CLI at `D:\AgentDev\gh\bin\gh.exe` only when connector coverage is insufficient, especially for local branch/PR discovery, GitHub Actions logs, native issue dependencies, or Git operations that need Git's credential helper. Authentication is stored in the Windows keyring and must be verified before CLI-backed GitHub API or remote operations:
 
 ```powershell
 $gh = 'D:\AgentDev\gh\bin\gh.exe'
@@ -31,13 +33,13 @@ A successful status reports the active `Ev3rGan` account and `keyring`; the API 
 & $gh auth setup-git --hostname github.com
 ```
 
-If `gh auth status` reports an invalid token or the API returns `401`, re-authenticate with the same installed `gh.exe` in a visible desktop PowerShell window, then rerun both verification commands. A restricted Codex process may be unable to access the user's Windows keyring; treat that as a credential-context problem, not proof that the token was revoked, and run GitHub writes in an approved desktop-user context. Never copy tokens into `GH_TOKEN`, repository files, `.env`, or plaintext configuration. Re-login is normally needed only after authorization is revoked, the keyring is cleared, the Windows user changes, or GitHub invalidates the token.
+If `gh auth status` reports an invalid token or the API returns `401`, switch Issue/PR work to the Codex GitHub connector. Re-authenticate with the same installed `gh.exe` in a visible desktop PowerShell window only when CLI-backed Git or `gh` operations are unavoidable, then rerun both verification commands. A restricted Codex process may be unable to access the user's Windows keyring; treat that as a credential-context problem, not proof that the token was revoked, and run unavoidable CLI-backed GitHub writes in an approved desktop-user context. Never copy tokens into `GH_TOKEN`, repository files, `.env`, or plaintext configuration. Re-login is normally needed only after authorization is revoked, the keyring is cleared, the Windows user changes, or GitHub invalidates the token.
 
 ## Agent skills
 
 ### Issue tracker
 
-Track work in GitHub Issues using `gh`. See `docs/agents/issue-tracker.md`.
+Track work in GitHub Issues using the Codex GitHub connector first. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
