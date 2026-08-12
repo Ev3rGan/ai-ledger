@@ -11,8 +11,27 @@
 
 ## Repository
 
-- **GitHub:** `https://github.com/Ev3rGan/ai-agent-dev`
+- **GitHub:** `https://github.com/Ev3rGan/ai-ledger`
 - Use the configured `origin` remote and `main` default branch for repository operations.
+
+### GitHub CLI authentication
+
+Use the repository's installed GitHub CLI at `D:\AgentDev\gh\bin\gh.exe`. Authentication is stored in the Windows keyring and must be verified before Issue or remote operations:
+
+```powershell
+$gh = 'D:\AgentDev\gh\bin\gh.exe'
+& $gh auth status --hostname github.com
+& $gh api user --jq .login
+```
+
+A successful status reports the active `Ev3rGan` account and `keyring`; the API command must return the expected login. After a successful browser/device login, configure Git's HTTPS credential helper once:
+
+```powershell
+& $gh auth login --hostname github.com --git-protocol https --web --skip-ssh-key
+& $gh auth setup-git --hostname github.com
+```
+
+If `gh auth status` reports an invalid token or the API returns `401`, re-authenticate with the same installed `gh.exe` in a visible desktop PowerShell window, then rerun both verification commands. A restricted Codex process may be unable to access the user's Windows keyring; treat that as a credential-context problem, not proof that the token was revoked, and run GitHub writes in an approved desktop-user context. Never copy tokens into `GH_TOKEN`, repository files, `.env`, or plaintext configuration. Re-login is normally needed only after authorization is revoked, the keyring is cleared, the Windows user changes, or GitHub invalidates the token.
 
 ## Agent skills
 

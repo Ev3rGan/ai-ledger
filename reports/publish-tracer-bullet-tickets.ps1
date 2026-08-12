@@ -1,5 +1,5 @@
 ﻿$ErrorActionPreference = "Stop"
-$repo = "Ev3rGan/ai-agent-dev"
+$repo = "Ev3rGan/ai-ledger"
 $parent = 1
 $label = "ready-for-agent"
 
