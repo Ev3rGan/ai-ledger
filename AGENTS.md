@@ -11,7 +11,7 @@
 
 ## Repository
 
-- **GitHub:** `https://github.com/Ev3rGan/ai-agent-dev`
+- **GitHub:** `https://github.com/Ev3rGan/ai-ledger`
 - Use the configured `origin` remote and `main` default branch for repository operations.
 
 ## Agent skills
