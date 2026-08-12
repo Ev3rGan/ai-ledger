@@ -1,0 +1,3 @@
+# Restrict public research to curated knowledge
+
+The public Research Agent may read only accepted knowledge that has passed through the acquisition and intelligence workflow. It may not search or fetch the live web, even when the model provider offers such tools; an administrator can request a refresh, but new material must enter through the normal pipeline before it can support an answer. Extracted source text remains private evidence, while public output is limited to AI-marked summaries, bounded excerpts, and source links. Community material may support a Community Signal about public discussion, but it cannot alone establish the underlying product, performance, business, or safety fact. This deliberately favors provenance and compliance over immediate freshness.

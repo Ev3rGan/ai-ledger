@@ -9,6 +9,25 @@
 - **CLI entry point:** `ai-intel-agent`
 - **Generated reports:** `reports/*.md` are ignored by Git.
 
+## Repository
+
+- **GitHub:** `https://github.com/Ev3rGan/ai-agent-dev`
+- Use the configured `origin` remote and `main` default branch for repository operations.
+
+## Agent skills
+
+### Issue tracker
+
+Track work in GitHub Issues using `gh`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the five default Matt Pocock triage labels. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Use the single-context layout with root `CONTEXT.md` and `docs/adr/`. See `docs/agents/domain.md`.
+
 ## Environment
 
 - This project uses Python 3.12.

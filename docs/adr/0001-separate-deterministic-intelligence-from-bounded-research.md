@@ -1,0 +1,3 @@
+# Separate deterministic intelligence from bounded research
+
+The product will remain a modular Python monolith with two core product modules: a deterministic intelligence workflow for acquisition, normalization, clustering, verification, and editorial preparation, and a bounded Agentic RAG module for public research. Only the research module uses graph-based agent orchestration; collection is not modeled as an autonomous agent, and anonymous requests do not receive durable per-request checkpoints. This trades maximum autonomy for auditability, predictable cost, and failure recovery at explicit seams.
