@@ -1,67 +1,55 @@
-# AI Intelligence Agent Template
+# AI Intelligence Agent
 
-A compact Python template for demonstrating AI Agent engineering skills through an automated AI intelligence pipeline.
+The first vertical slice of a traceable AI intelligence application. Its deterministic sample
+workflow persists one Candidate, immutable Document Version, Story, atomic Claim, anchored
+Evidence Span, and Structured Trace in PostgreSQL/pgvector.
 
-This project is inspired by a Rebabel-style content workflow: collect candidate AI news, normalize untrusted web content, retrieve memory, cluster duplicate stories, rank by novelty and authority, draft grounded briefs, verify claims, and export a reviewable daily report.
+## Quick start
 
-## What This Shows
-
-- Agent harness design
-- Context engineering and structured prompts
-- Content memory instead of user memory
-- Retrieval-friendly story records
-- Duplicate detection and novelty ranking
-- Claim-level evidence placeholders
-- Human-in-the-loop publishing workflow
-
-## Quick Start
+Use Python 3.12 and the repository-local locked environment:
 
 ```powershell
 uv sync --locked --python 3.12 --extra ch3
-.\.venv\Scripts\activate
-ai-intel-agent run --sample
-```
-
-If `uv` is not on PATH, install it first or call the same command through the uv executable available on your machine.
-
-## Project Flow
-
-```text
-scheduled trigger
-  -> source collection
-  -> normalization and sanitization
-  -> memory retrieval
-  -> clustering and deduplication
-  -> ranking
-  -> evidence research
-  -> editor drafting
-  -> claim verification
-  -> daily report export
-  -> optional publishing
-```
-
-## Repository Layout
-
-```text
-src/ai_intel_agent/
-  agents.py       # collector, editor, verifier placeholders
-  models.py       # typed story, evidence, brief, report models
-  pipeline.py     # end-to-end orchestration
-  memory.py       # simple local content memory
-  cli.py          # command line interface
-examples/
-  sample_sources.json
-```
-
-## Environment
-
-Copy `.env.example` to `.env` when adding real provider integrations. Do not commit secrets.
-
-```powershell
 copy .env.example .env
 ```
 
-The current implementation runs without API keys by using deterministic placeholder logic. Replace the TODO sections with OpenAI, search, vector database, WordPress, or messaging integrations as the project evolves.
+Create the PostgreSQL database named in `.env`, then apply the baseline migration:
+
+```powershell
+uv run alembic upgrade head
+uv run ai-intel-agent run --sample
+```
+
+The sample uses a fixed Asia/Shanghai clock, fixed source data, and deterministic identifiers.
+Running it again leaves exactly one corresponding set of records and writes the same report.
+
+## Verification
+
+The dev environment bundles an isolated PostgreSQL/pgvector test server. The acceptance test
+starts it, applies the migration, invokes the CLI twice, and removes its data afterward. Set
+`TEST_DATABASE_URL` only when you want the same test to use an existing disposable database.
+
+```powershell
+uv run --extra dev pytest
+uv run --extra dev ruff check .
+uv run ai-intel-agent run --sample --output reports\daily.md
+```
+
+The sample slice intentionally does not include Web pages, administrator review, real sources,
+model providers, or placeholder tables for later work.
+
+## Repository layout
+
+```text
+src/ai_intel_agent/
+  domain.py       # persistence-independent domain records
+  sample.py       # fixed clock, fake source adapter, and sample data
+  persistence.py  # SQLAlchemy mappings and idempotent repository
+  pipeline.py     # application operation
+  cli.py          # supported CLI transport
+alembic/          # clean PostgreSQL/pgvector baseline migration
+tests/            # CLI-to-database acceptance test
+```
 
 ## License
 

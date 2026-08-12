@@ -11,11 +11,14 @@ requires-python = ">=3.12,<3.14"
 license = { text = "MIT" }
 authors = [{ name = "AI Agent Developer" }]
 dependencies = [
+    "alembic>=1.14",
+    "psycopg[binary]>=3.2",
     "pydantic>=2.9",
     "pydantic-settings>=2.4",
     "python-dotenv>=1.0",
     "typer>=0.12",
     "rich>=13.7",
+    "sqlalchemy>=2.0",
 ]
 
 [project.optional-dependencies]
@@ -29,6 +32,7 @@ ch3 = [
     "rapidfuzz>=3.9",
 ]
 dev = [
+    "pg0-embedded==0.15.1",
     "pytest>=8.3",
     "ruff>=0.6",
 ]
@@ -46,3 +50,6 @@ target-version = "py312"
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
+markers = [
+    "postgres: runs against PostgreSQL with pgvector",
+]

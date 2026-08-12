@@ -1,28 +1,15 @@
 from __future__ import annotations
 
-from ai_intel_agent.agents import (
-    ClaimVerifier,
-    ContentNormalizer,
-    EditorAgent,
-    SourceScout,
-    StoryClusterer,
-)
-from ai_intel_agent.memory import ContentMemory
-from ai_intel_agent.models import DailyReport
+from ai_intel_agent.domain import SampleStory
+from ai_intel_agent.persistence import SampleStoryRepository, create_database_engine
+from ai_intel_agent.sample import build_sample_story
 
 
-def run_daily_report(sample: bool = False) -> DailyReport:
-    scout = SourceScout()
-    normalizer = ContentNormalizer()
-    memory = ContentMemory()
-    clusterer = StoryClusterer()
-    editor = EditorAgent()
-    verifier = ClaimVerifier()
-
-    candidates = scout.collect(sample=sample)
-    documents = normalizer.normalize(candidates)
-    clusters = clusterer.cluster(documents, memory)
-    briefs = verifier.keep_supported(editor.draft(clusters))
-    memory.add_many(documents)
-
-    return DailyReport(title="AI Intelligence Daily", briefs=briefs)
+def persist_sample_story(database_url: str) -> SampleStory:
+    sample = build_sample_story()
+    engine = create_database_engine(database_url)
+    try:
+        SampleStoryRepository(engine).persist(sample)
+    finally:
+        engine.dispose()
+    return sample
