@@ -1,5 +1,10 @@
 FROM python:3.12.11-slim-bookworm
 
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends postgresql-client \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir "psycopg[binary]==3.2.9"
+
 WORKDIR /opt/runtime-benchmark
 COPY src/ai_intel_agent/runtime_workload.py ./runtime_workload.py
 

@@ -8,7 +8,8 @@ This protocol compares the three candidates retained by ADR 0005 without deployi
 
 Use one Linux node in Hong Kong for each candidate with at least 2 vCPUs and 4 GiB of memory.
 The comparison is valid only when all three nodes use the same Git commit, workload image
-SHA-256, protocol SHA-256, observer label, and observation window.
+and PostgreSQL image SHA-256 values, protocol SHA-256, observer label, and 24-hour observation
+window.
 
 ## What the fixed workload measures
 
@@ -18,8 +19,9 @@ SHA-256, protocol SHA-256, observer label, and observation window.
 - Model API: unauthenticated DeepSeek and Kimi endpoint reachability from the node. These probes
   never send provider credentials and never make billed inference requests.
 - OAuth: GitHub authorization-endpoint reachability from the node; no OAuth login is completed.
-- Resource: one fixed 100,000-round SHA-256 loop, a touched 128 MiB allocation, and a synced
-  16 MiB write/read inside the representative container.
+- Resource: one fixed 100,000-round SHA-256 loop, a touched 128 MiB allocation, a synced
+  16 MiB write/read, and a 10,000-row PostgreSQL logical dump/drop/restore verification inside
+  the representative Web/worker/database stack.
 - Cost: a dated USD-normalized price observation with an official source. It expires after the
   configured evidence window and is not a permanent fact.
 
@@ -29,8 +31,8 @@ fixed observer, then remove each benchmark node after its evidence is captured.
 
 ## Build one identical image
 
-Build once, record the image ID, and transfer that exact image to every candidate node. Do not
-rebuild independently on each node.
+Build once, pull PostgreSQL once, record both image IDs, and transfer those exact images to every
+candidate node. Do not rebuild or re-pull independently on each node.
 
 ```bash
 docker build --pull \
@@ -41,12 +43,16 @@ docker build --pull \
 docker image inspect \
   --format '{{.Id}}' \
   ai-ledger-runtime-benchmark:2026-08-13-v1
+
+docker pull postgres:16.10-bookworm
+docker image inspect --format '{{.Id}}' postgres:16.10-bookworm
 ```
 
 Export and import the image when the nodes do not share an image registry:
 
 ```bash
-docker save ai-ledger-runtime-benchmark:2026-08-13-v1 | gzip > runtime-benchmark.tar.gz
+docker save ai-ledger-runtime-benchmark:2026-08-13-v1 postgres:16.10-bookworm \
+  | gzip > runtime-benchmark.tar.gz
 gunzip --stdout runtime-benchmark.tar.gz | docker load
 ```
 
@@ -57,12 +63,9 @@ Terminate TLS in front of port 8080 and expose only the fixed observer to the wo
 
 ```bash
 export RUNTIME_BENCHMARK_TOKEN='<temporary-random-token>'
+export RUNTIME_BENCHMARK_DATABASE_PASSWORD='<temporary-random-password>'
 
-docker run --detach --rm \
-  --name ai-ledger-runtime-benchmark \
-  --env RUNTIME_BENCHMARK_TOKEN \
-  --publish 127.0.0.1:8080:8080 \
-  ai-ledger-runtime-benchmark:2026-08-13-v1
+docker compose --file docker/runtime-benchmark.compose.yml up --detach --no-build
 ```
 
 The reverse proxy must preserve streaming responses and disable buffering for `/events`.
@@ -75,7 +78,8 @@ official evidence URL and date.
 
 ```powershell
 $env:RUNTIME_BENCHMARK_TOKEN = '<temporary-random-token>'
-$imageSha = '<64 hexadecimal characters from docker image inspect>'
+$workloadImageSha = '<workload image ID: 64 hexadecimal characters>'
+$databaseImageSha = '<PostgreSQL image ID: 64 hexadecimal characters>'
 
 uv run ai-intel-agent benchmark-runtime probe `
   --candidate tencent-lighthouse-hk `
@@ -84,7 +88,8 @@ uv run ai-intel-agent benchmark-runtime probe `
   --monthly-cost-usd 13.20 `
   --price-observed-at 2026-08-13 `
   --price-source https://cloud.tencent.com/document/product/1207/73452/ `
-  --workload-image-sha256 $imageSha `
+  --workload-image-sha256 $workloadImageSha `
+  --database-image-sha256 $databaseImageSha `
   --output reports/tencent-lighthouse-hk.json
 ```
 
@@ -102,14 +107,15 @@ uv run ai-intel-agent benchmark-runtime compare `
 ```
 
 The comparator fails closed unless it receives exactly one result for each configured candidate,
-all generated with the same protocol, workload image, and observer. A candidate is eligible only
+all generated with the same protocol, workload images, observer, distinct target origin, exact
+probe/attempt set, current official price evidence, and observation window. A candidate is eligible only
 when every Network, SSE, Source egress, Model API, OAuth, Resource, and Cost measurement passes.
 Eligible candidates are ordered by median Network latency, median SSE first-event latency, CPU
 workload latency, monthly cost, and stable identifier. No opaque aggregate score is used.
 
 ## Interpretation limits
 
-- Results describe one dated node configuration, observer, ISP path, and workload image.
+- Results describe one dated node configuration, observer, ISP path, and workload stack.
 - Repeat the benchmark after material provider, route, instance, image, or price changes.
 - The OAuth probe tests endpoint reachability, not callback correctness or administrator access.
 - The model probes test egress only, not model quality, latency, price, or availability under load.

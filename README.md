@@ -87,9 +87,9 @@ uv run ai-intel-agent benchmark-runtime compare --help
 ```
 
 The probe covers public HTTPS and SSE, node-side source, model API, and OAuth egress, a bounded
-CPU/memory/disk container workload, and dated cost evidence. It sends no model credentials or
+CPU/memory/disk and PostgreSQL dump/restore workload, and dated cost evidence. It sends no model credentials or
 billed model requests. The comparator requires all three configured candidates to use the same
-protocol, workload image SHA-256, and observer before it emits a report or recommendation. See
+protocol, workload and database image SHA-256 values, and observer before it emits a report or recommendation. See
 [`docs/research/hong-kong-runtime-benchmark-protocol-2026-08-13.md`](docs/research/hong-kong-runtime-benchmark-protocol-2026-08-13.md)
 for the complete reproducible procedure.
 
@@ -134,6 +134,7 @@ src/ai_intel_agent/
 alembic/          # clean PostgreSQL/pgvector baseline migration
 tests/            # CLI-to-database acceptance test
 docker/runtime-benchmark.Dockerfile # benchmark-only workload image
+docker/runtime-benchmark.compose.yml # representative workload plus PostgreSQL
 ```
 
 ## License

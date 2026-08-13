@@ -5,14 +5,16 @@ import hmac
 import json
 import math
 import os
+import subprocess
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 WORKLOAD_VERSION = "hong-kong-runtime-workload-2026-08-13.v1"
@@ -154,6 +156,101 @@ def run_resource_probe() -> dict[str, int | float]:
     }
 
 
+def _execute_database_restore_probe(psycopg, database_url: str) -> dict[str, int | float]:
+    parsed = urlsplit(database_url)
+    if parsed.scheme not in {"postgresql", "postgres"} or not parsed.hostname:
+        raise OSError("RUNTIME_BENCHMARK_DATABASE_URL must be a PostgreSQL URL")
+    database_name = unquote(parsed.path.lstrip("/"))
+    command_base = [
+        "--host",
+        parsed.hostname,
+        "--port",
+        str(parsed.port or 5432),
+        "--username",
+        unquote(parsed.username or "postgres"),
+        "--dbname",
+        database_name,
+    ]
+    process_environment = os.environ.copy()
+    if parsed.password:
+        process_environment["PGPASSWORD"] = unquote(parsed.password)
+
+    dump_path: str | None = None
+    with psycopg.connect(database_url, autocommit=True) as connection:
+        try:
+            connection.execute("DROP SCHEMA IF EXISTS runtime_benchmark CASCADE")
+            connection.execute("CREATE SCHEMA runtime_benchmark")
+            connection.execute(
+                "CREATE TABLE runtime_benchmark.restore_fixture AS "
+                "SELECT value, md5(value::text) AS digest "
+                "FROM generate_series(1, 10000) AS value"
+            )
+            with tempfile.NamedTemporaryFile(suffix=".dump", delete=False) as dump_file:
+                dump_path = dump_file.name
+
+            dump_started = time.perf_counter()
+            subprocess.run(
+                [
+                    "pg_dump",
+                    *command_base,
+                    "--format",
+                    "custom",
+                    "--schema",
+                    "runtime_benchmark",
+                    "--file",
+                    dump_path,
+                ],
+                check=True,
+                capture_output=True,
+                env=process_environment,
+                timeout=30,
+            )
+            database_dump_ms = (time.perf_counter() - dump_started) * 1000
+            connection.execute("DROP SCHEMA runtime_benchmark CASCADE")
+
+            restore_started = time.perf_counter()
+            subprocess.run(
+                [
+                    "pg_restore",
+                    *command_base,
+                    "--no-owner",
+                    "--no-privileges",
+                    dump_path,
+                ],
+                check=True,
+                capture_output=True,
+                env=process_environment,
+                timeout=30,
+            )
+            database_restore_ms = (time.perf_counter() - restore_started) * 1000
+            database_rows_restored = connection.execute(
+                "SELECT count(*) FROM runtime_benchmark.restore_fixture"
+            ).fetchone()[0]
+        except (subprocess.SubprocessError, OSError) as error:
+            raise OSError("PostgreSQL dump/restore probe failed") from error
+        finally:
+            connection.execute("DROP SCHEMA IF EXISTS runtime_benchmark CASCADE")
+            if dump_path is not None:
+                Path(dump_path).unlink(missing_ok=True)
+
+    return {
+        "database_dump_ms": round(database_dump_ms, 3),
+        "database_restore_ms": round(database_restore_ms, 3),
+        "database_rows_restored": int(database_rows_restored),
+    }
+
+
+def run_database_restore_probe(database_url: str) -> dict[str, int | float]:
+    try:
+        import psycopg
+    except ImportError as error:
+        raise OSError("psycopg is required by the representative workload") from error
+    try:
+        return _execute_database_restore_probe(psycopg, database_url)
+    except psycopg.Error as error:
+        raise OSError("PostgreSQL dump/restore probe failed") from error
+
+
 def run_egress_probe(identifier: str) -> tuple[int, dict[str, object]]:
     target = EGRESS_TARGETS.get(identifier)
     if target is None:
@@ -194,6 +291,10 @@ class RuntimeWorkloadHandler(BaseHTTPRequestHandler):
     @property
     def expected_token(self) -> str:
         return self.server.benchmark_token  # type: ignore[attr-defined]
+
+    @property
+    def database_probe(self) -> Callable[[], dict[str, int | float]]:
+        return self.server.database_probe  # type: ignore[attr-defined]
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -239,6 +340,7 @@ class RuntimeWorkloadHandler(BaseHTTPRequestHandler):
         if path == "/resource":
             try:
                 payload = run_resource_probe()
+                payload.update(self.database_probe())
             except OSError as error:
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -256,6 +358,7 @@ class RuntimeWorkloadHandler(BaseHTTPRequestHandler):
 
 class RuntimeWorkloadServer(ThreadingHTTPServer):
     benchmark_token: str
+    database_probe: Callable[[], dict[str, int | float]]
 
 
 def create_runtime_workload_server(
@@ -263,11 +366,19 @@ def create_runtime_workload_server(
     port: int,
     *,
     token: str,
+    database_probe: Callable[[], dict[str, int | float]] | None = None,
 ) -> RuntimeWorkloadServer:
     if not token:
         raise ValueError("runtime benchmark token is required")
     server = RuntimeWorkloadServer((host, port), RuntimeWorkloadHandler)
     server.benchmark_token = token
+    database_url = os.environ.get("RUNTIME_BENCHMARK_DATABASE_URL", "")
+    if database_probe is None and not database_url:
+        server.server_close()
+        raise ValueError("RUNTIME_BENCHMARK_DATABASE_URL is required")
+    server.database_probe = database_probe or (
+        lambda: run_database_restore_probe(database_url)
+    )
     return server
 
 

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Annotated
 
 import typer
+from dotenv import load_dotenv
 from rich.console import Console
 
 from ai_intel_agent.extraction_benchmark import (
@@ -192,19 +194,18 @@ def probe_hong_kong_runtime(
         str,
         typer.Option("--price-source", help="Official HTTPS evidence for the observed price."),
     ],
-    workload_token: Annotated[
-        str,
-        typer.Option(
-            "--workload-token",
-            envvar="RUNTIME_BENCHMARK_TOKEN",
-            help="Temporary token required by the benchmark container.",
-        ),
-    ],
     workload_image_sha256: Annotated[
         str,
         typer.Option(
             "--workload-image-sha256",
             help="Local Docker image ID from docker image inspect.",
+        ),
+    ],
+    database_image_sha256: Annotated[
+        str,
+        typer.Option(
+            "--database-image-sha256",
+            help="PostgreSQL Docker image ID from docker image inspect.",
         ),
     ],
     output: Annotated[Path, typer.Option("--output", "-o")],
@@ -214,6 +215,12 @@ def probe_hong_kong_runtime(
         cost = Decimal(monthly_cost_usd)
         observed_at = date.fromisoformat(price_observed_at)
         configuration = load_runtime_benchmark_configuration()
+        load_dotenv()
+        workload_token = os.environ.get("RUNTIME_BENCHMARK_TOKEN", "")
+        if not workload_token:
+            raise RuntimeBenchmarkConfigurationError(
+                "set RUNTIME_BENCHMARK_TOKEN in the environment or untracked .env"
+            )
         client = HttpRuntimeProbeClient(
             target_url,
             configuration=configuration,
@@ -229,6 +236,7 @@ def probe_hong_kong_runtime(
                 price_observed_at=observed_at,
                 price_source=price_source,
                 workload_image_sha256=workload_image_sha256,
+                database_image_sha256=database_image_sha256,
                 client=client,
                 configuration=configuration,
             )

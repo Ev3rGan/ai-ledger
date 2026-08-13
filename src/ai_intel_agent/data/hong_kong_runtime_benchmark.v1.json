@@ -6,6 +6,7 @@
   "sse_events": 3,
   "maximum_monthly_cost_usd": "30.00",
   "maximum_pricing_age_days": 31,
+  "maximum_observation_window_hours": 24,
   "candidates": [
     {
       "identifier": "tencent-lighthouse-hk",
@@ -13,7 +14,7 @@
       "region": "China (Hong Kong)",
       "minimum_vcpus": 2,
       "minimum_memory_gib": 4,
-      "official_sources": [
+      "pricing_sources": [
         "https://cloud.tencent.com/document/product/1207/73452/"
       ]
     },
@@ -23,8 +24,7 @@
       "region": "Asia Pacific (Hong Kong), ap-east-1",
       "minimum_vcpus": 2,
       "minimum_memory_gib": 4,
-      "official_sources": [
-        "https://docs.aws.amazon.com/lightsail/latest/userguide/understanding-regions-and-availability-zones-in-amazon-lightsail.html",
+      "pricing_sources": [
         "https://docs.aws.amazon.com/lightsail/latest/userguide/amazon-lightsail-bundles.html"
       ]
     },
@@ -34,8 +34,7 @@
       "region": "China (Hong Kong)",
       "minimum_vcpus": 2,
       "minimum_memory_gib": 4,
-      "official_sources": [
-        "https://www.alibabacloud.com/help/en/simple-application-server/product-overview/instance-families/",
+      "pricing_sources": [
         "https://www.alibabacloud.com/help/en/simple-application-server/product-overview/billing-faq"
       ]
     }

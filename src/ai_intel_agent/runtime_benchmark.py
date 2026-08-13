@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -31,7 +32,36 @@ class RuntimeCandidate:
     region: str
     minimum_vcpus: int
     minimum_memory_gib: int
-    official_sources: tuple[str, ...]
+    pricing_sources: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PricingObservation:
+    monthly_cost_usd: Decimal
+    observed_at: date
+    source: str
+
+    def validate(
+        self,
+        *,
+        candidate: RuntimeCandidate,
+        observed_by: datetime,
+        configuration: RuntimeBenchmarkConfiguration,
+    ) -> int:
+        if not self.monthly_cost_usd.is_finite() or self.monthly_cost_usd < 0:
+            raise RuntimeBenchmarkConfigurationError(
+                "monthly cost must be a finite non-negative value"
+            )
+        if self.observed_at > observed_by.date():
+            raise RuntimeBenchmarkConfigurationError("price observation cannot be in the future")
+        if self.source not in candidate.pricing_sources:
+            raise RuntimeBenchmarkConfigurationError(
+                f"price source for {candidate.identifier} must be one of its configured official sources"
+            )
+        price_age_days = (observed_by.date() - self.observed_at).days
+        if price_age_days > configuration.maximum_pricing_age_days:
+            raise RuntimeBenchmarkConfigurationError("price observation is stale")
+        return price_age_days
 
 
 @dataclass(frozen=True)
@@ -50,6 +80,7 @@ class RuntimeBenchmarkConfiguration:
     sse_events: int
     maximum_monthly_cost_usd: Decimal
     maximum_pricing_age_days: int
+    maximum_observation_window_hours: int
     candidates: tuple[RuntimeCandidate, ...]
     egress_probes: tuple[EgressProbe, ...]
     protocol_sha256: str
@@ -77,7 +108,7 @@ def load_runtime_benchmark_configuration(
                 region=item["region"],
                 minimum_vcpus=int(item["minimum_vcpus"]),
                 minimum_memory_gib=int(item["minimum_memory_gib"]),
-                official_sources=tuple(item["official_sources"]),
+                pricing_sources=tuple(item["pricing_sources"]),
             )
             for item in payload["candidates"]
         )
@@ -110,6 +141,7 @@ def load_runtime_benchmark_configuration(
         sse_events=int(payload["sse_events"]),
         maximum_monthly_cost_usd=maximum_cost,
         maximum_pricing_age_days=int(payload["maximum_pricing_age_days"]),
+        maximum_observation_window_hours=int(payload["maximum_observation_window_hours"]),
         candidates=candidates,
         egress_probes=egress_probes,
         protocol_sha256=hashlib.sha256(raw).hexdigest(),
@@ -127,6 +159,15 @@ def _target_origin(target_url: str) -> str:
             "remote benchmark workloads must use HTTPS"
         )
     return urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+
+
+def _normalize_image_sha256(value: str, label: str) -> str:
+    normalized = value.removeprefix("sha256:").lower()
+    if re.fullmatch(r"[0-9a-f]{64}", normalized) is None:
+        raise RuntimeBenchmarkConfigurationError(
+            f"{label} image SHA-256 must contain exactly 64 hexadecimal characters"
+        )
+    return normalized
 
 
 class HttpRuntimeProbeClient:
@@ -274,6 +315,9 @@ class HttpRuntimeProbeClient:
                 and memory_gib >= candidate.minimum_memory_gib * 0.90
                 and float(payload["disk_write_mib_per_second"]) > 0
                 and float(payload["disk_read_mib_per_second"]) > 0
+                and float(payload["database_dump_ms"]) > 0
+                and float(payload["database_restore_ms"]) > 0
+                and int(payload["database_rows_restored"]) == 10000
             )
             return {
                 "category": "resource",
@@ -287,6 +331,9 @@ class HttpRuntimeProbeClient:
                 "disk_write_mib_per_second": float(payload["disk_write_mib_per_second"]),
                 "disk_read_mib_per_second": float(payload["disk_read_mib_per_second"]),
                 "memory_probe_mib": int(payload["memory_probe_mib"]),
+                "database_dump_ms": float(payload["database_dump_ms"]),
+                "database_restore_ms": float(payload["database_restore_ms"]),
+                "database_rows_restored": int(payload["database_rows_restored"]),
                 "error": None if passed else "candidate does not satisfy the fixed resource gate",
             }
         except (httpx.HTTPError, KeyError, TypeError, ValueError) as error:
@@ -310,6 +357,7 @@ def run_hong_kong_runtime_probe(
     price_observed_at: date,
     price_source: str,
     workload_image_sha256: str,
+    database_image_sha256: str,
     client: HttpRuntimeProbeClient,
     configuration: RuntimeBenchmarkConfiguration | None = None,
     now: Callable[[], datetime] | None = None,
@@ -321,29 +369,20 @@ def run_hong_kong_runtime_probe(
         raise RuntimeBenchmarkConfigurationError("benchmark clock must be timezone-aware")
     if not observer.strip():
         raise RuntimeBenchmarkConfigurationError("observer label is required")
-    if not monthly_cost_usd.is_finite() or monthly_cost_usd < 0:
-        raise RuntimeBenchmarkConfigurationError("monthly cost must be a finite non-negative value")
     if _target_origin(target_url) != client.target_origin:
         raise RuntimeBenchmarkConfigurationError(
             "probe client target does not match the requested target URL"
         )
-    normalized_image_sha256 = workload_image_sha256.removeprefix("sha256:").lower()
-    if re.fullmatch(r"[0-9a-f]{64}", normalized_image_sha256) is None:
-        raise RuntimeBenchmarkConfigurationError(
-            "workload image SHA-256 must contain exactly 64 hexadecimal characters"
-        )
-    if price_observed_at > run_at.date():
-        raise RuntimeBenchmarkConfigurationError("price observation cannot be in the future")
-    parsed_price_source = urlsplit(price_source)
-    if (
-        parsed_price_source.scheme != "https"
-        or not parsed_price_source.netloc
-        or parsed_price_source.query
-        or parsed_price_source.fragment
-    ):
-        raise RuntimeBenchmarkConfigurationError(
-            "price source must be an absolute HTTPS URL without query or fragment"
-        )
+    normalized_image_sha256 = _normalize_image_sha256(workload_image_sha256, "workload")
+    normalized_database_image_sha256 = _normalize_image_sha256(
+        database_image_sha256, "database"
+    )
+    pricing = PricingObservation(monthly_cost_usd, price_observed_at, price_source)
+    pricing_age_days = pricing.validate(
+        candidate=candidate,
+        observed_by=run_at,
+        configuration=configuration,
+    )
 
     measurements: list[dict[str, object]] = []
     for attempt in range(1, configuration.attempts + 1):
@@ -354,10 +393,8 @@ def run_hong_kong_runtime_probe(
             measurements.append(client.egress(probe, attempt))
     measurements.append(client.resource(candidate))
 
-    pricing_age_days = (run_at.date() - price_observed_at).days
     cost_passed = (
-        monthly_cost_usd <= configuration.maximum_monthly_cost_usd
-        and pricing_age_days <= configuration.maximum_pricing_age_days
+        pricing.monthly_cost_usd <= configuration.maximum_monthly_cost_usd
     )
     measurements.append(
         {
@@ -365,7 +402,7 @@ def run_hong_kong_runtime_probe(
             "probe": "observed-monthly-price",
             "attempt": 1,
             "passed": cost_passed,
-            "monthly_cost_usd": format(monthly_cost_usd, "f"),
+            "monthly_cost_usd": format(pricing.monthly_cost_usd, "f"),
             "price_age_days": pricing_age_days,
             "maximum_monthly_cost_usd": format(
                 configuration.maximum_monthly_cost_usd, "f"
@@ -379,6 +416,7 @@ def run_hong_kong_runtime_probe(
         "protocol_sha256": configuration.protocol_sha256,
         "workload_version": configuration.workload_version,
         "workload_image_sha256": normalized_image_sha256,
+        "database_image_sha256": normalized_database_image_sha256,
         "run_at": run_at.isoformat(),
         "observer": observer.strip(),
         "target_origin": client.target_origin,
@@ -388,12 +426,12 @@ def run_hong_kong_runtime_probe(
             "region": candidate.region,
             "minimum_vcpus": candidate.minimum_vcpus,
             "minimum_memory_gib": candidate.minimum_memory_gib,
-            "official_sources": list(candidate.official_sources),
+            "pricing_sources": list(candidate.pricing_sources),
         },
         "pricing": {
-            "monthly_cost_usd": format(monthly_cost_usd, "f"),
-            "observed_at": price_observed_at.isoformat(),
-            "source": price_source,
+            "monthly_cost_usd": format(pricing.monthly_cost_usd, "f"),
+            "observed_at": pricing.observed_at.isoformat(),
+            "source": pricing.source,
             "warning": "Observed comparison input; cloud prices are not permanent facts.",
         },
         "measurements": measurements,
@@ -423,7 +461,9 @@ def _measurements_for(
 def _require_complete_result(
     result: dict[str, object],
     configuration: RuntimeBenchmarkConfiguration,
-) -> None:
+    *,
+    comparison_at: datetime,
+) -> datetime:
     if result.get("benchmark_version") != configuration.version:
         raise RuntimeBenchmarkConfigurationError("runtime result benchmark version mismatch")
     if result.get("protocol_sha256") != configuration.protocol_sha256:
@@ -432,25 +472,76 @@ def _require_complete_result(
         raise RuntimeBenchmarkConfigurationError("runtime result workload version mismatch")
     if re.fullmatch(r"[0-9a-f]{64}", str(result.get("workload_image_sha256", ""))) is None:
         raise RuntimeBenchmarkConfigurationError("runtime result has no valid workload image SHA-256")
+    if re.fullmatch(r"[0-9a-f]{64}", str(result.get("database_image_sha256", ""))) is None:
+        raise RuntimeBenchmarkConfigurationError("runtime result has no valid database image SHA-256")
 
-    expected_counts = {
-        "network": configuration.attempts,
-        "SSE": configuration.attempts,
-        "source egress": configuration.attempts
-        * sum(probe.category == "source egress" for probe in configuration.egress_probes),
-        "model API": configuration.attempts
-        * sum(probe.category == "model API" for probe in configuration.egress_probes),
-        "OAuth": configuration.attempts
-        * sum(probe.category == "OAuth" for probe in configuration.egress_probes),
-        "resource": 1,
-        "cost": 1,
-    }
-    for category, expected in expected_counts.items():
-        actual = len(_measurements_for(result, category))
-        if actual != expected:
-            raise RuntimeBenchmarkConfigurationError(
-                f"runtime result requires {expected} {category} measurements; found {actual}"
-            )
+    measurements = result.get("measurements")
+    if not isinstance(measurements, list) or not all(
+        isinstance(item, dict) for item in measurements
+    ):
+        raise RuntimeBenchmarkConfigurationError("runtime result has invalid measurements")
+    expected_measurements = [
+        ("network", "public-workload-health", attempt)
+        for attempt in range(1, configuration.attempts + 1)
+    ] + [
+        ("SSE", "public-event-stream", attempt)
+        for attempt in range(1, configuration.attempts + 1)
+    ]
+    for probe in configuration.egress_probes:
+        expected_measurements.extend(
+            (probe.category, probe.identifier, attempt)
+            for attempt in range(1, configuration.attempts + 1)
+        )
+    expected_measurements.extend(
+        [
+            ("resource", "representative-container-workload", 1),
+            ("cost", "observed-monthly-price", 1),
+        ]
+    )
+    actual_measurements = Counter(
+        (str(item.get("category")), str(item.get("probe")), item.get("attempt"))
+        for item in measurements
+    )
+    if actual_measurements != Counter(expected_measurements):
+        raise RuntimeBenchmarkConfigurationError(
+            "runtime result does not contain every fixed probe and attempt exactly once"
+        )
+
+    try:
+        run_at = datetime.fromisoformat(str(result["run_at"])).astimezone(UTC)
+        candidate_identifier = str(result["candidate"]["identifier"])
+        pricing_payload = result["pricing"]
+        pricing = PricingObservation(
+            monthly_cost_usd=Decimal(str(pricing_payload["monthly_cost_usd"])),
+            observed_at=date.fromisoformat(str(pricing_payload["observed_at"])),
+            source=str(pricing_payload["source"]),
+        )
+    except (KeyError, TypeError, ValueError, InvalidOperation) as error:
+        raise RuntimeBenchmarkConfigurationError(
+            f"runtime result has invalid run or pricing evidence: {error}"
+        ) from error
+    if run_at > comparison_at:
+        raise RuntimeBenchmarkConfigurationError("runtime result was captured in the future")
+    pricing.validate(
+        candidate=configuration.candidate(candidate_identifier),
+        observed_by=run_at,
+        configuration=configuration,
+    )
+    pricing_age_days = pricing.validate(
+        candidate=configuration.candidate(candidate_identifier),
+        observed_by=comparison_at,
+        configuration=configuration,
+    )
+    cost = _measurements_for(result, "cost")[0]
+    cost_should_pass = (
+        pricing.monthly_cost_usd <= configuration.maximum_monthly_cost_usd
+        and pricing_age_days <= configuration.maximum_pricing_age_days
+    )
+    if bool(cost.get("passed")) != cost_should_pass:
+        raise RuntimeBenchmarkConfigurationError(
+            "runtime result cost gate does not match current price evidence"
+        )
+    return run_at
 
 
 def _format_metric(value: float | None, suffix: str = "") -> str:
@@ -462,9 +553,15 @@ def compare_hong_kong_runtime_results(
     output: Path,
     *,
     configuration: RuntimeBenchmarkConfiguration | None = None,
+    now: Callable[[], datetime] | None = None,
 ) -> dict[str, object]:
     configuration = configuration or load_runtime_benchmark_configuration()
+    comparison_at = (now or (lambda: datetime.now(UTC)))()
+    if comparison_at.tzinfo is None:
+        raise RuntimeBenchmarkConfigurationError("comparison clock must be timezone-aware")
+    comparison_at = comparison_at.astimezone(UTC)
     results: list[dict[str, object]] = []
+    run_times: list[datetime] = []
     for path in inputs:
         try:
             result = json.loads(path.read_text(encoding="utf-8"))
@@ -474,7 +571,13 @@ def compare_hong_kong_runtime_results(
             ) from error
         if not isinstance(result, dict):
             raise RuntimeBenchmarkConfigurationError(f"runtime result {path} is not an object")
-        _require_complete_result(result, configuration)
+        run_times.append(
+            _require_complete_result(
+                result,
+                configuration,
+                comparison_at=comparison_at,
+            )
+        )
         result["_evidence_path"] = str(path)
         results.append(result)
 
@@ -489,10 +592,27 @@ def compare_hong_kong_runtime_results(
         raise RuntimeBenchmarkConfigurationError(
             "comparison results must use one fixed non-empty observer label"
         )
+    target_origins = {str(result.get("target_origin", "")) for result in results}
+    if len(target_origins) != len(results) or "" in target_origins:
+        raise RuntimeBenchmarkConfigurationError(
+            "comparison results must come from distinct candidate target origins"
+        )
+    observation_window_hours = (
+        max(run_times) - min(run_times)
+    ).total_seconds() / 3600
+    if observation_window_hours > configuration.maximum_observation_window_hours:
+        raise RuntimeBenchmarkConfigurationError(
+            "comparison results exceed the fixed observation window"
+        )
     workload_images = {str(result["workload_image_sha256"]) for result in results}
     if len(workload_images) != 1:
         raise RuntimeBenchmarkConfigurationError(
             "comparison results must use the same workload image SHA-256"
+        )
+    database_images = {str(result["database_image_sha256"]) for result in results}
+    if len(database_images) != 1:
+        raise RuntimeBenchmarkConfigurationError(
+            "comparison results must use the same database image SHA-256"
         )
 
     summaries: list[dict[str, object]] = []
@@ -538,6 +658,8 @@ def compare_hong_kong_runtime_results(
             "cpu_ms": resource.get("cpu_sha256_ms"),
             "disk_write_mib_per_second": resource.get("disk_write_mib_per_second"),
             "disk_read_mib_per_second": resource.get("disk_read_mib_per_second"),
+            "database_restore_ms": resource.get("database_restore_ms"),
+            "database_rows_restored": resource.get("database_rows_restored"),
             "monthly_cost_usd": Decimal(str(cost["monthly_cost_usd"])),
             "pricing": result["pricing"],
             "evidence_path": result["_evidence_path"],
@@ -565,6 +687,7 @@ def compare_hong_kong_runtime_results(
         f"- Protocol SHA-256: `{configuration.protocol_sha256}`",
         f"- Representative workload: `{configuration.workload_version}`",
         f"- Workload image SHA-256: `{next(iter(workload_images))}`",
+        f"- Database image SHA-256: `{next(iter(database_images))}`",
         f"- Fixed observer: `{next(iter(observers))}`",
         f"- Candidate results: {len(results)}",
         (
@@ -590,7 +713,9 @@ def compare_hong_kong_runtime_results(
             f"{item['vcpus']} vCPU / {_format_metric(item['memory_gib'], ' GiB')}; "
             f"CPU {_format_metric(item['cpu_ms'], ' ms')}; "
             f"disk W/R {_format_metric(item['disk_write_mib_per_second'])}/"
-            f"{_format_metric(item['disk_read_mib_per_second'], ' MiB/s')}"
+            f"{_format_metric(item['disk_read_mib_per_second'], ' MiB/s')}; "
+            f"PG restore {_format_metric(item['database_restore_ms'], ' ms')} "
+            f"({item['database_rows_restored']} rows)"
         )
         lines.append(
             f"| `{item['identifier']}` | {'PASS' if item['eligible'] else 'FAIL'} | "
@@ -644,6 +769,7 @@ def compare_hong_kong_runtime_results(
         "protocol_sha256": configuration.protocol_sha256,
         "observer": next(iter(observers)),
         "workload_image_sha256": next(iter(workload_images)),
+        "database_image_sha256": next(iter(database_images)),
         "recommendation": recommendation,
         "summaries": ordered,
     }

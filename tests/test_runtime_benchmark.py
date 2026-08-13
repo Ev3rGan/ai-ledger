@@ -60,6 +60,9 @@ def _workload_transport(request: httpx.Request) -> httpx.Response:
                 "disk_write_mib_per_second": 180,
                 "disk_read_mib_per_second": 420,
                 "memory_probe_mib": 128,
+                "database_dump_ms": 40,
+                "database_restore_ms": 55,
+                "database_rows_restored": 10000,
             },
         )
     raise AssertionError(f"unexpected workload request: {request.url}")
@@ -80,6 +83,7 @@ def test_probe_records_every_fixed_dimension_without_model_credentials(
             price_observed_at=date(2026, 8, 13),
             price_source="https://cloud.tencent.com/document/product/1207/73452/",
             workload_image_sha256="a" * 64,
+            database_image_sha256="b" * 64,
             client=HttpRuntimeProbeClient(
                 "https://benchmark.example",
                 configuration=configuration,
@@ -98,6 +102,7 @@ def test_probe_records_every_fixed_dimension_without_model_credentials(
     assert stored["pricing"]["observed_at"] == "2026-08-13"
     assert stored["target_origin"] == "https://benchmark.example"
     assert stored["workload_image_sha256"] == "a" * 64
+    assert stored["database_image_sha256"] == "b" * 64
     assert result == stored
 
     categories = {measurement["category"] for measurement in stored["measurements"]}
@@ -113,6 +118,11 @@ def test_probe_records_every_fixed_dimension_without_model_credentials(
     assert len([item for item in stored["measurements"] if item["category"] == "network"]) == 3
     assert len([item for item in stored["measurements"] if item["category"] == "SSE"]) == 3
     assert all(item["passed"] for item in stored["measurements"])
+    resource = next(
+        item for item in stored["measurements"] if item["category"] == "resource"
+    )
+    assert resource["database_restore_ms"] == 55
+    assert resource["database_rows_restored"] == 10000
 
 
 def _write_candidate_result(
@@ -131,8 +141,9 @@ def _write_candidate_result(
             observer="fixed-mainland-observer",
             monthly_cost_usd=Decimal(monthly_cost),
             price_observed_at=date(2026, 8, 13),
-            price_source=configuration.candidate(candidate_identifier).official_sources[0],
+            price_source=configuration.candidate(candidate_identifier).pricing_sources[0],
             workload_image_sha256="a" * 64,
+            database_image_sha256="b" * 64,
             client=HttpRuntimeProbeClient(
                 f"https://{candidate_identifier}.example",
                 configuration=configuration,
@@ -201,6 +212,86 @@ def test_compare_requires_complete_same_protocol_evidence_and_recommends_by_gate
         compare_hong_kong_runtime_results(inputs, tmp_path / "mixed-images.md")
 
 
+def test_compare_rejects_substituted_probes_nodes_windows_and_stale_prices(
+    tmp_path: Path,
+) -> None:
+    inputs = [
+        _write_candidate_result(tmp_path, "tencent-lighthouse-hk", "13.20", 80),
+        _write_candidate_result(tmp_path, "aws-lightsail-hk", "24.00", 120),
+        _write_candidate_result(tmp_path, "alibaba-swas-hk", "18.00", 90),
+    ]
+
+    substituted = json.loads(inputs[0].read_text(encoding="utf-8"))
+    measurement = next(
+        item
+        for item in substituted["measurements"]
+        if item["probe"] == "source-github-releases"
+    )
+    measurement["probe"] = "source-arxiv-api"
+    inputs[0].write_text(
+        json.dumps(substituted, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    with pytest.raises(RuntimeBenchmarkConfigurationError, match="exactly once"):
+        compare_hong_kong_runtime_results(inputs, tmp_path / "substituted.md")
+
+    inputs[0] = _write_candidate_result(
+        tmp_path, "tencent-lighthouse-hk", "13.20", 80
+    )
+    repeated_node = json.loads(inputs[1].read_text(encoding="utf-8"))
+    repeated_node["target_origin"] = "https://tencent-lighthouse-hk.example"
+    inputs[1].write_text(
+        json.dumps(repeated_node, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    with pytest.raises(RuntimeBenchmarkConfigurationError, match="distinct candidate"):
+        compare_hong_kong_runtime_results(inputs, tmp_path / "same-node.md")
+
+    inputs[1] = _write_candidate_result(tmp_path, "aws-lightsail-hk", "24.00", 120)
+    late = json.loads(inputs[2].read_text(encoding="utf-8"))
+    late["run_at"] = "2026-08-14T08:00:00+00:00"
+    inputs[2].write_text(
+        json.dumps(late, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    with pytest.raises(RuntimeBenchmarkConfigurationError, match="observation window"):
+        compare_hong_kong_runtime_results(
+            inputs,
+            tmp_path / "wide-window.md",
+            now=lambda: datetime(2026, 8, 15, tzinfo=UTC),
+        )
+
+    inputs[2] = _write_candidate_result(tmp_path, "alibaba-swas-hk", "18.00", 90)
+    with pytest.raises(RuntimeBenchmarkConfigurationError, match="stale"):
+        compare_hong_kong_runtime_results(
+            inputs,
+            tmp_path / "stale-price.md",
+            now=lambda: datetime(2026, 9, 20, tzinfo=UTC),
+        )
+
+
+def test_probe_requires_candidate_official_price_evidence(tmp_path: Path) -> None:
+    configuration = load_runtime_benchmark_configuration()
+    with httpx.Client(transport=httpx.MockTransport(_workload_transport)) as http_client:
+        client = HttpRuntimeProbeClient(
+            "https://benchmark.example",
+            configuration=configuration,
+            http_client=http_client,
+        )
+        with pytest.raises(RuntimeBenchmarkConfigurationError, match="official sources"):
+            run_hong_kong_runtime_probe(
+                tmp_path / "unofficial.json",
+                candidate_identifier="tencent-lighthouse-hk",
+                target_url="https://benchmark.example",
+                observer="fixed-mainland-observer",
+                monthly_cost_usd=Decimal("13.20"),
+                price_observed_at=date(2026, 8, 13),
+                price_source="https://example.com/pricing",
+                workload_image_sha256="a" * 64,
+                database_image_sha256="b" * 64,
+                client=client,
+                configuration=configuration,
+                now=lambda: datetime(2026, 8, 13, 4, 0, tzinfo=UTC),
+            )
+
+
 def test_cli_exposes_probe_and_compare_commands(monkeypatch, tmp_path: Path) -> None:
     probe_output = tmp_path / "probe.json"
     report_output = tmp_path / "report.md"
@@ -230,6 +321,7 @@ def test_cli_exposes_probe_and_compare_commands(monkeypatch, tmp_path: Path) -> 
     monkeypatch.setattr(cli, "HttpRuntimeProbeClient", FakeClient)
     monkeypatch.setattr(cli, "run_hong_kong_runtime_probe", fake_probe)
     monkeypatch.setattr(cli, "compare_hong_kong_runtime_results", fake_compare)
+    monkeypatch.setenv("RUNTIME_BENCHMARK_TOKEN", "environment-only-secret")
 
     probe_result = runner.invoke(
         cli.app,
@@ -248,10 +340,10 @@ def test_cli_exposes_probe_and_compare_commands(monkeypatch, tmp_path: Path) -> 
             "2026-08-13",
             "--price-source",
             "https://cloud.tencent.com/document/product/1207/73452/",
-            "--workload-token",
-            "temporary-secret",
             "--workload-image-sha256",
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--database-image-sha256",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "--output",
             str(probe_output),
         ],
@@ -274,7 +366,7 @@ def test_cli_exposes_probe_and_compare_commands(monkeypatch, tmp_path: Path) -> 
 
     assert probe_result.exit_code == 0, probe_result.output
     assert compare_result.exit_code == 0, compare_result.output
-    assert observed["workload_token"] == "temporary-secret"
+    assert observed["workload_token"] == "environment-only-secret"
     assert observed["probe_output"] == probe_output
     assert observed["closed"] is True
     assert observed["compare_inputs"] == [probe_output, probe_output, probe_output]
@@ -283,7 +375,16 @@ def test_cli_exposes_probe_and_compare_commands(monkeypatch, tmp_path: Path) -> 
 
 
 def test_representative_workload_http_boundary_is_fixed_and_token_protected() -> None:
-    server = create_runtime_workload_server("127.0.0.1", 0, token="temporary-secret")
+    server = create_runtime_workload_server(
+        "127.0.0.1",
+        0,
+        token="temporary-secret",
+        database_probe=lambda: {
+            "database_dump_ms": 40,
+            "database_restore_ms": 55,
+            "database_rows_restored": 10000,
+        },
+    )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     host, port = server.server_address
@@ -311,6 +412,9 @@ def test_representative_workload_http_boundary_is_fixed_and_token_protected() ->
         assert resource_payload["disk_write_mib_per_second"] > 0
         assert resource_payload["disk_read_mib_per_second"] > 0
         assert resource_payload["memory_probe_mib"] == 128
+        assert resource_payload["database_dump_ms"] == 40
+        assert resource_payload["database_restore_ms"] == 55
+        assert resource_payload["database_rows_restored"] == 10000
         assert unknown.status_code == 404
     finally:
         server.shutdown()

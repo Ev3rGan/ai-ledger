@@ -1,0 +1,28 @@
+services:
+  postgres:
+    image: postgres:16.10-bookworm
+    environment:
+      POSTGRES_DB: runtime_benchmark
+      POSTGRES_USER: runtime_benchmark
+      POSTGRES_PASSWORD: ${RUNTIME_BENCHMARK_DATABASE_PASSWORD:?required}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U runtime_benchmark -d runtime_benchmark"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    tmpfs:
+      - /var/lib/postgresql/data:size=768m
+
+  workload:
+    image: ai-ledger-runtime-benchmark:2026-08-13-v1
+    build:
+      context: ..
+      dockerfile: docker/runtime-benchmark.Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      RUNTIME_BENCHMARK_TOKEN: ${RUNTIME_BENCHMARK_TOKEN:?required}
+      RUNTIME_BENCHMARK_DATABASE_URL: postgresql://runtime_benchmark:${RUNTIME_BENCHMARK_DATABASE_PASSWORD}@postgres:5432/runtime_benchmark
+    ports:
+      - 127.0.0.1:8080:8080
