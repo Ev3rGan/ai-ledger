@@ -33,6 +33,10 @@ ch3 = [
     "feedparser>=6.0",
     "rapidfuzz>=3.9",
 ]
+retrieval = [
+    "fastembed>=0.8,<0.9",
+    "psutil>=7,<8",
+]
 dev = [
     "pg0-embedded==0.15.1",
     "pytest>=8.3",
