@@ -1,0 +1,286 @@
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import math
+import os
+import tempfile
+import time
+from dataclasses import dataclass
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit, urlunsplit
+from urllib.request import Request, urlopen
+
+WORKLOAD_VERSION = "hong-kong-runtime-workload-2026-08-13.v1"
+USER_AGENT = "ai-ledger-hong-kong-runtime-workload/0.1"
+SSE_EVENT_COUNT = 3
+SSE_INTERVAL_SECONDS = 0.05
+CPU_ITERATIONS = 100_000
+DISK_PROBE_MIB = 16
+MEMORY_PROBE_MIB = 128
+
+
+@dataclass(frozen=True)
+class EgressTarget:
+    url: str
+    accepted_statuses: tuple[int, ...]
+
+
+EGRESS_TARGETS = {
+    "source-github-releases": EgressTarget(
+        "https://api.github.com/repos/openai/openai-python/releases/latest",
+        (200,),
+    ),
+    "source-arxiv-api": EgressTarget(
+        "https://export.arxiv.org/api/query?search_query=cat:cs.AI&max_results=1",
+        (200,),
+    ),
+    "model-deepseek-api": EgressTarget(
+        "https://api.deepseek.com/models",
+        (200, 401, 403),
+    ),
+    "model-kimi-api": EgressTarget(
+        "https://api.moonshot.cn/v1/models",
+        (200, 401, 403),
+    ),
+    "oauth-github": EgressTarget(
+        "https://github.com/login/oauth/authorize?client_id=runtime-benchmark-invalid",
+        (200, 302, 400, 401, 403, 404, 422),
+    ),
+}
+
+
+def _target_origin(url: str) -> str:
+    parsed = urlsplit(url)
+    return urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+
+
+def _effective_vcpus() -> int:
+    cpu_max = Path("/sys/fs/cgroup/cpu.max")
+    try:
+        quota, period = cpu_max.read_text(encoding="utf-8").strip().split()
+        if quota != "max":
+            return max(1, math.ceil(int(quota) / int(period)))
+    except (OSError, ValueError):
+        pass
+    return os.cpu_count() or 1
+
+
+def _windows_memory_total_bytes() -> int:
+    import ctypes
+
+    class MemoryStatus(ctypes.Structure):
+        _fields_ = [
+            ("length", ctypes.c_ulong),
+            ("memory_load", ctypes.c_ulong),
+            ("total_physical", ctypes.c_ulonglong),
+            ("available_physical", ctypes.c_ulonglong),
+            ("total_page_file", ctypes.c_ulonglong),
+            ("available_page_file", ctypes.c_ulonglong),
+            ("total_virtual", ctypes.c_ulonglong),
+            ("available_virtual", ctypes.c_ulonglong),
+            ("available_extended_virtual", ctypes.c_ulonglong),
+        ]
+
+    status = MemoryStatus()
+    status.length = ctypes.sizeof(MemoryStatus)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        raise OSError("GlobalMemoryStatusEx failed")
+    return int(status.total_physical)
+
+
+def _effective_memory_total_bytes() -> int:
+    memory_max = Path("/sys/fs/cgroup/memory.max")
+    try:
+        value = memory_max.read_text(encoding="utf-8").strip()
+        if value != "max":
+            return int(value)
+    except (OSError, ValueError):
+        pass
+    if hasattr(os, "sysconf"):
+        try:
+            return int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
+        except (OSError, ValueError):
+            pass
+    if os.name == "nt":
+        return _windows_memory_total_bytes()
+    raise OSError("cannot determine available memory")
+
+
+def run_resource_probe() -> dict[str, int | float]:
+    seed = b"ai-ledger-hong-kong-runtime-benchmark"
+    started = time.perf_counter()
+    digest = seed
+    for _ in range(CPU_ITERATIONS):
+        digest = hashlib.sha256(digest).digest()
+    cpu_sha256_ms = (time.perf_counter() - started) * 1000
+
+    memory = bytearray(MEMORY_PROBE_MIB * 1024 * 1024)
+    for offset in range(0, len(memory), 4096):
+        memory[offset] = digest[offset % len(digest)]
+
+    probe_path: str | None = None
+    payload = digest * (1024 * 1024 // len(digest))
+    try:
+        with tempfile.NamedTemporaryFile(delete=False) as probe_file:
+            probe_path = probe_file.name
+            write_started = time.perf_counter()
+            for _ in range(DISK_PROBE_MIB):
+                probe_file.write(payload)
+            probe_file.flush()
+            os.fsync(probe_file.fileno())
+        write_seconds = max(time.perf_counter() - write_started, 0.000001)
+
+        read_started = time.perf_counter()
+        with open(probe_path, "rb") as probe_file:
+            while probe_file.read(1024 * 1024):
+                pass
+        read_seconds = max(time.perf_counter() - read_started, 0.000001)
+    finally:
+        if probe_path is not None:
+            Path(probe_path).unlink(missing_ok=True)
+
+    return {
+        "vcpus": _effective_vcpus(),
+        "memory_total_bytes": _effective_memory_total_bytes(),
+        "cpu_sha256_ms": round(cpu_sha256_ms, 3),
+        "disk_write_mib_per_second": round(DISK_PROBE_MIB / write_seconds, 3),
+        "disk_read_mib_per_second": round(DISK_PROBE_MIB / read_seconds, 3),
+        "memory_probe_mib": MEMORY_PROBE_MIB,
+    }
+
+
+def run_egress_probe(identifier: str) -> tuple[int, dict[str, object]]:
+    target = EGRESS_TARGETS.get(identifier)
+    if target is None:
+        return HTTPStatus.NOT_FOUND, {"error": "unknown fixed egress probe"}
+
+    request = Request(
+        target.url,
+        method="GET",
+        headers={"User-Agent": USER_AGENT, "Accept": "*/*"},
+    )
+    started = time.perf_counter()
+    try:
+        with urlopen(request, timeout=10) as response:
+            status_code = response.status
+            response.read(1)
+        error = None
+    except HTTPError as http_error:
+        status_code = http_error.code
+        error = None if status_code in target.accepted_statuses else "HTTPError"
+    except (URLError, TimeoutError, OSError) as network_error:
+        status_code = None
+        error = type(network_error).__name__
+    latency_ms = round((time.perf_counter() - started) * 1000, 3)
+    reachable = status_code in target.accepted_statuses
+    return HTTPStatus.OK, {
+        "reachable": reachable,
+        "status_code": status_code,
+        "latency_ms": latency_ms,
+        "target_origin": _target_origin(target.url),
+        "error": error if not reachable else None,
+    }
+
+
+class RuntimeWorkloadHandler(BaseHTTPRequestHandler):
+    server_version = "AiLedgerRuntimeWorkload/0.1"
+    protocol_version = "HTTP/1.1"
+
+    @property
+    def expected_token(self) -> str:
+        return self.server.benchmark_token  # type: ignore[attr-defined]
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+    def _authorized(self) -> bool:
+        supplied = self.headers.get("X-Benchmark-Token", "")
+        return bool(supplied) and hmac.compare_digest(supplied, self.expected_token)
+
+    def _send_json(self, status: int, payload: dict[str, object]) -> None:
+        body = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        if not self._authorized():
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": "invalid benchmark token"})
+            return
+        path = urlsplit(self.path).path
+        if path == "/health":
+            self._send_json(
+                HTTPStatus.OK,
+                {"status": "ok", "workload_version": WORKLOAD_VERSION},
+            )
+            return
+        if path == "/events":
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache, no-transform")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            for event_id in range(1, SSE_EVENT_COUNT + 1):
+                self.wfile.write(
+                    f"id: {event_id}\ndata: event-{event_id}\n\n".encode()
+                )
+                self.wfile.flush()
+                time.sleep(SSE_INTERVAL_SECONDS)
+            self.close_connection = True
+            return
+        if path == "/resource":
+            try:
+                payload = run_resource_probe()
+            except OSError as error:
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {"error": type(error).__name__},
+                )
+                return
+            self._send_json(HTTPStatus.OK, payload)
+            return
+        if path.startswith("/egress/"):
+            status, payload = run_egress_probe(path.removeprefix("/egress/"))
+            self._send_json(status, payload)
+            return
+        self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown workload path"})
+
+
+class RuntimeWorkloadServer(ThreadingHTTPServer):
+    benchmark_token: str
+
+
+def create_runtime_workload_server(
+    host: str,
+    port: int,
+    *,
+    token: str,
+) -> RuntimeWorkloadServer:
+    if not token:
+        raise ValueError("runtime benchmark token is required")
+    server = RuntimeWorkloadServer((host, port), RuntimeWorkloadHandler)
+    server.benchmark_token = token
+    return server
+
+
+def main() -> None:
+    token = os.environ.get("RUNTIME_BENCHMARK_TOKEN", "")
+    host = os.environ.get("RUNTIME_BENCHMARK_HOST", "0.0.0.0")
+    port = int(os.environ.get("RUNTIME_BENCHMARK_PORT", "8080"))
+    server = create_runtime_workload_server(host, port, token=token)
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()

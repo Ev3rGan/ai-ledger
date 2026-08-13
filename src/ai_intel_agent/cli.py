@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import date
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Annotated
 
@@ -20,14 +22,26 @@ from ai_intel_agent.model_routing_evaluation import (
 )
 from ai_intel_agent.persistence import database_url_from_environment
 from ai_intel_agent.pipeline import persist_sample_story
+from ai_intel_agent.runtime_benchmark import (
+    HttpRuntimeProbeClient,
+    RuntimeBenchmarkConfigurationError,
+    compare_hong_kong_runtime_results,
+    load_runtime_benchmark_configuration,
+    run_hong_kong_runtime_probe,
+)
 from ai_intel_agent.source_audit import run_source_definition_activation_audit
 
 app = typer.Typer(help="Run the deterministic AI intelligence workflow.")
+runtime_benchmark_app = typer.Typer(
+    help="Capture and compare fixed Hong Kong runtime probes."
+)
+app.add_typer(runtime_benchmark_app, name="benchmark-runtime")
 console = Console()
 DEFAULT_OUTPUT = Path("reports/daily.md")
 DEFAULT_SOURCE_AUDIT_OUTPUT = Path("reports/source-activation-audit.md")
 DEFAULT_EXTRACTION_BENCHMARK_OUTPUT = Path("reports/document-extraction-benchmark.md")
 DEFAULT_MODEL_ROUTING_OUTPUT = Path("reports/model-routing-evaluation.md")
+DEFAULT_RUNTIME_BENCHMARK_OUTPUT = Path("reports/hong-kong-runtime-benchmark.md")
 
 
 @app.callback()
@@ -150,6 +164,104 @@ def evaluate_model_routes(
         f"[green]Evaluated DeepSeek and Kimi routes for {eligible}/5 task classes:[/] "
         f"{output}"
     )
+
+
+@runtime_benchmark_app.command("probe")
+def probe_hong_kong_runtime(
+    candidate: Annotated[
+        str,
+        typer.Option("--candidate", help="Configured Hong Kong runtime candidate identifier."),
+    ],
+    target_url: Annotated[
+        str,
+        typer.Option("--target-url", help="Public URL of the fixed benchmark workload."),
+    ],
+    observer: Annotated[
+        str,
+        typer.Option("--observer", help="Stable label for the fixed mainland observer."),
+    ],
+    monthly_cost_usd: Annotated[
+        str,
+        typer.Option("--monthly-cost-usd", help="Current observed monthly node price in USD."),
+    ],
+    price_observed_at: Annotated[
+        str,
+        typer.Option("--price-observed-at", help="Price observation date in YYYY-MM-DD form."),
+    ],
+    price_source: Annotated[
+        str,
+        typer.Option("--price-source", help="Official HTTPS evidence for the observed price."),
+    ],
+    workload_token: Annotated[
+        str,
+        typer.Option(
+            "--workload-token",
+            envvar="RUNTIME_BENCHMARK_TOKEN",
+            help="Temporary token required by the benchmark container.",
+        ),
+    ],
+    workload_image_sha256: Annotated[
+        str,
+        typer.Option(
+            "--workload-image-sha256",
+            help="Local Docker image ID from docker image inspect.",
+        ),
+    ],
+    output: Annotated[Path, typer.Option("--output", "-o")],
+) -> None:
+    """Capture the fixed probe set for one Hong Kong candidate."""
+    try:
+        cost = Decimal(monthly_cost_usd)
+        observed_at = date.fromisoformat(price_observed_at)
+        configuration = load_runtime_benchmark_configuration()
+        client = HttpRuntimeProbeClient(
+            target_url,
+            configuration=configuration,
+            workload_token=workload_token,
+        )
+        try:
+            result = run_hong_kong_runtime_probe(
+                output,
+                candidate_identifier=candidate,
+                target_url=target_url,
+                observer=observer,
+                monthly_cost_usd=cost,
+                price_observed_at=observed_at,
+                price_source=price_source,
+                workload_image_sha256=workload_image_sha256,
+                client=client,
+                configuration=configuration,
+            )
+        finally:
+            client.close()
+    except (InvalidOperation, ValueError, RuntimeBenchmarkConfigurationError) as error:
+        raise typer.BadParameter(str(error)) from error
+
+    console.print(
+        f"[green]Captured fixed Hong Kong runtime probes for {candidate}:[/] {output} "
+        f"({'PASS' if result['passed'] else 'FAIL'})"
+    )
+
+
+@runtime_benchmark_app.command("compare")
+def compare_hong_kong_runtimes(
+    inputs: Annotated[
+        list[Path],
+        typer.Option("--input", "-i", help="Candidate JSON result; provide one per node."),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option("--output", "-o", help="Write the reproducible comparison report here."),
+    ] = DEFAULT_RUNTIME_BENCHMARK_OUTPUT,
+) -> None:
+    """Compare the complete fixed-protocol evidence from all candidate nodes."""
+    try:
+        comparison = compare_hong_kong_runtime_results(inputs, output)
+    except RuntimeBenchmarkConfigurationError as error:
+        raise typer.BadParameter(str(error)) from error
+
+    recommendation = comparison["recommendation"] or "none"
+    console.print(f"[green]Recommended Hong Kong runtime: {recommendation}[/] ({output})")
 
 
 if __name__ == "__main__":
