@@ -12,6 +12,7 @@ license = { text = "MIT" }
 authors = [{ name = "AI Agent Developer" }]
 dependencies = [
     "alembic>=1.14",
+    "fastapi>=0.116,<1",
     "psycopg[binary]>=3.2",
     "pydantic>=2.9",
     "pydantic-settings>=2.4",
@@ -38,6 +39,7 @@ retrieval = [
     "psutil>=7,<8",
 ]
 dev = [
+    "httpx2>=2,<3",
     "pg0-embedded==0.15.1",
     "pytest>=8.3",
     "ruff>=0.6",

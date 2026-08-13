@@ -4,8 +4,10 @@ import os
 from hashlib import sha256
 from pathlib import Path
 from uuid import uuid4
+from xml.etree import ElementTree
 
 import pytest
+from fastapi.testclient import TestClient
 from pg0 import Pg0
 from sqlalchemy import func, insert, select, text, update
 from sqlalchemy.exc import ProgrammingError
@@ -26,7 +28,8 @@ from ai_intel_agent.persistence import (
     create_database_engine,
     upgrade_database,
 )
-from ai_intel_agent.pipeline import persist_sample_story
+from ai_intel_agent.pipeline import persist_sample_story, publish_sample_digest
+from ai_intel_agent.web import create_app
 
 runner = CliRunner()
 RECORD_TYPES = (
@@ -327,3 +330,65 @@ def test_published_digest_membership_cannot_move_to_a_draft_digest(
             .where(DigestStoryRecord.digest_id == published_digest_id)
             .values(digest_id=draft_digest_id)
         )
+
+
+@pytest.mark.postgres
+def test_anonymous_visitor_reads_published_digest_through_web_and_rss(
+    postgres_url: str, empty_database
+) -> None:
+    publish_sample_digest(postgres_url)
+
+    headline = "AI Agent 用任务轨迹支持结果复现"
+    claim = "示例发布者的 AI Agent 会记录任务轨迹。"
+    evidence_excerpt = "其 AI Agent 现在会记录任务轨迹"
+    evidence_state = "单一来源"
+    evidence_role = "第一方证据"
+    source_url = "https://example.com/ai-agent-evidence"
+    private_source_text = (
+        "示例发布者宣布：其 AI Agent 现在会记录任务轨迹，以便复现实验结果。"
+    )
+    public_values = (
+        headline,
+        claim,
+        evidence_excerpt,
+        evidence_state,
+        evidence_role,
+        source_url,
+    )
+
+    with TestClient(create_app(postgres_url)) as client:
+        home = client.get("/")
+        assert 'href="/digests/2026-08-12"' in home.text
+        assert 'href="/stories/sample-story-v1"' in home.text
+        assert 'href="/browse"' in home.text
+        assert 'href="/rss.xml"' in home.text
+
+        digest = client.get("/digests/2026-08-12")
+        assert 'href="/stories/sample-story-v1"' in digest.text
+
+        story = client.get("/stories/sample-story-v1")
+        browse = client.get("/browse")
+
+        for response in (home, digest, story, browse):
+            assert response.status_code == 200
+            assert all(value in response.text for value in public_values)
+            assert "<strong>发布者：</strong>示例发布者" in response.text
+            assert "<strong>原文链接：</strong>" in response.text
+            assert "<strong>来源：</strong>" not in response.text
+            assert private_source_text not in response.text
+            assert "证据不足的 AI 性能声明" not in response.text
+            assert "等待审核的 AI 工具候选" not in response.text
+
+        rss = client.get("/rss.xml")
+
+    assert rss.status_code == 200
+    assert rss.headers["content-type"].startswith("application/rss+xml")
+    assert private_source_text not in rss.text
+
+    channel = ElementTree.fromstring(rss.content).find("channel")
+    assert channel is not None
+    items = channel.findall("item")
+    assert len(items) == 1
+    assert items[0].findtext("link") == "http://testserver/digests/2026-08-12"
+    description = items[0].findtext("description") or ""
+    assert all(value in description for value in public_values)
