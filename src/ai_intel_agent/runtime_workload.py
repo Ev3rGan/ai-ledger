@@ -18,7 +18,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlsplit, urlunsplit
 from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
-WORKLOAD_VERSION = "hong-kong-runtime-workload-2026-08-13.v1"
+WORKLOAD_VERSION = "hong-kong-runtime-workload-2026-08-13.v2"
 USER_AGENT = "ai-ledger-hong-kong-runtime-workload/0.1"
 SSE_EVENT_COUNT = 3
 SSE_INTERVAL_SECONDS = 0.05

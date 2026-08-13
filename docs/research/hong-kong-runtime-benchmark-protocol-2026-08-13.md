@@ -36,15 +36,21 @@ fixed observer, then remove each benchmark node after its evidence is captured.
 Build once, pull PostgreSQL once, record both image IDs, and transfer those exact images to every
 candidate node. Do not rebuild or re-pull independently on each node.
 
+Protocol v2 corrects only the workload image packaging: the Debian Bookworm base image's
+unversioned `postgresql-client` installed `pg_dump` 15, which cannot dump the pinned PostgreSQL
+16 server. The v2 image installs `postgresql-client-16` from the official PGDG repository and
+publishes a new workload version and image SHA-256. Keep any v1 result as diagnostic evidence;
+do not compare or combine v1 and v2 results.
+
 ```bash
 docker build --pull \
   --file docker/runtime-benchmark.Dockerfile \
-  --tag ai-ledger-runtime-benchmark:2026-08-13-v1 \
+  --tag ai-ledger-runtime-benchmark:2026-08-13-v2 \
   .
 
 docker image inspect \
   --format '{{.Id}}' \
-  ai-ledger-runtime-benchmark:2026-08-13-v1
+  ai-ledger-runtime-benchmark:2026-08-13-v2
 
 docker pull postgres:16.10-bookworm
 docker image inspect --format '{{.Id}}' postgres:16.10-bookworm
@@ -53,7 +59,7 @@ docker image inspect --format '{{.Id}}' postgres:16.10-bookworm
 Export and import the image when the nodes do not share an image registry:
 
 ```bash
-docker save ai-ledger-runtime-benchmark:2026-08-13-v1 postgres:16.10-bookworm \
+docker save ai-ledger-runtime-benchmark:2026-08-13-v2 postgres:16.10-bookworm \
   | gzip > runtime-benchmark.tar.gz
 gunzip --stdout runtime-benchmark.tar.gz | docker load
 ```

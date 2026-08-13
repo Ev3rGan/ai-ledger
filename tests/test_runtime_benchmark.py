@@ -19,9 +19,16 @@ from ai_intel_agent.runtime_benchmark import (
     load_runtime_benchmark_configuration,
     run_hong_kong_runtime_probe,
 )
-from ai_intel_agent.runtime_workload import create_runtime_workload_server
+from ai_intel_agent.runtime_workload import WORKLOAD_VERSION, create_runtime_workload_server
 
 runner = CliRunner()
+
+
+def test_fixed_protocol_and_workload_publish_the_same_v2_version() -> None:
+    configuration = load_runtime_benchmark_configuration()
+
+    assert WORKLOAD_VERSION == "hong-kong-runtime-workload-2026-08-13.v2"
+    assert configuration.workload_version == WORKLOAD_VERSION
 
 
 def _workload_transport(request: httpx.Request) -> httpx.Response:
@@ -32,7 +39,7 @@ def _workload_transport(request: httpx.Request) -> httpx.Response:
             200,
             json={
                 "status": "ok",
-                "workload_version": "hong-kong-runtime-workload-2026-08-13.v1",
+                "workload_version": "hong-kong-runtime-workload-2026-08-13.v2",
             },
         )
     if request.url.path == "/events":
@@ -458,7 +465,7 @@ def test_representative_workload_http_boundary_is_fixed_and_token_protected() ->
 
         assert health.json() == {
             "status": "ok",
-            "workload_version": "hong-kong-runtime-workload-2026-08-13.v1",
+            "workload_version": "hong-kong-runtime-workload-2026-08-13.v2",
         }
         assert events.headers["content-type"].startswith("text/event-stream")
         assert events.text.count("data:") == 3

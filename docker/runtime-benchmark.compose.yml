@@ -14,7 +14,7 @@ services:
       - runtime-benchmark-postgres:/var/lib/postgresql/data
 
   workload:
-    image: ai-ledger-runtime-benchmark:2026-08-13-v1
+    image: ai-ledger-runtime-benchmark:2026-08-13-v2
     build:
       context: ..
       dockerfile: docker/runtime-benchmark.Dockerfile

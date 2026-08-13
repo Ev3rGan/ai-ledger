@@ -17,7 +17,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 
 CONFIGURATION_PATH = (
-    Path(__file__).parent / "data" / "hong_kong_runtime_benchmark.v1.json"
+    Path(__file__).parent / "data" / "hong_kong_runtime_benchmark.v2.json"
 )
 
 
