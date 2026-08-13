@@ -10,6 +10,14 @@ from ai_intel_agent.extraction_benchmark import (
     BenchmarkConfigurationError,
     run_document_extraction_benchmark,
 )
+from ai_intel_agent.model_routing_evaluation import (
+    HttpModelEvaluationClient,
+    ModelEvaluationConfigurationError,
+    ModelEvaluationCredentials,
+    load_candidate_configuration,
+    load_protocol_configuration,
+    run_model_routing_evaluation,
+)
 from ai_intel_agent.persistence import database_url_from_environment
 from ai_intel_agent.pipeline import persist_sample_story
 from ai_intel_agent.source_audit import run_source_definition_activation_audit
@@ -19,6 +27,7 @@ console = Console()
 DEFAULT_OUTPUT = Path("reports/daily.md")
 DEFAULT_SOURCE_AUDIT_OUTPUT = Path("reports/source-activation-audit.md")
 DEFAULT_EXTRACTION_BENCHMARK_OUTPUT = Path("reports/document-extraction-benchmark.md")
+DEFAULT_MODEL_ROUTING_OUTPUT = Path("reports/model-routing-evaluation.md")
 
 
 @app.callback()
@@ -102,6 +111,44 @@ def benchmark_document_extraction(
         "[green]Benchmarked "
         f"{len(benchmark.corpus)} fixed corpus URLs across "
         f"{len(benchmark.extraction_paths)} extraction paths:[/] {output}"
+    )
+
+
+@app.command("evaluate-model-routes")
+def evaluate_model_routes(
+    output: Annotated[
+        Path,
+        typer.Option("--output", "-o", help="Write the versioned routing evaluation here."),
+    ] = DEFAULT_MODEL_ROUTING_OUTPUT,
+) -> None:
+    """Evaluate DeepSeek and Kimi task routes on the frozen corpus."""
+
+    def progress(completed: int, total: int, label: str) -> None:
+        console.print(f"[cyan]Model evaluation:[/] {completed}/{total} ({label})")
+
+    try:
+        configuration = load_candidate_configuration()
+        protocol = load_protocol_configuration()
+        credentials = ModelEvaluationCredentials.from_environment(
+            configuration=configuration
+        )
+        evaluation = run_model_routing_evaluation(
+            output,
+            client=HttpModelEvaluationClient(
+                credentials=credentials,
+                protocol=protocol,
+            ),
+            configuration=configuration,
+            protocol=protocol,
+            progress=progress,
+        )
+    except ModelEvaluationConfigurationError as error:
+        raise typer.BadParameter(str(error)) from error
+
+    eligible = sum(route is not None for route in evaluation.recommendations.values())
+    console.print(
+        f"[green]Evaluated DeepSeek and Kimi routes for {eligible}/5 task classes:[/] "
+        f"{output}"
     )
 
 

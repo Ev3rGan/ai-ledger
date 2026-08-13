@@ -1,0 +1,68 @@
+{
+  "version": "model-routing-protocol-2026-08-12.v1",
+  "prompt_version": "model-routing-prompt-2026-08-12.v1",
+  "schema_version": "model-routing-output-schema-2026-08-12.v1",
+  "prompt_templates": {
+    "system": "You are evaluating an evidence-bounded AI intelligence workflow. Use only supplied evidence; never use live web knowledge. Output one JSON object with exactly the versioned schema keys and no Markdown. For every task except classification, write a non-empty answer in Simplified Chinese. Abstention still requires a concise Chinese explanation of missing evidence. The facts object must contain exactly the requested fact keys with canonical English values inferred from the evidence.\nPrompt version: {prompt_version}\nSchema version: {schema_version}\nSchema: {output_schema}",
+    "user": "Task: {task}\n\nEvidence:\n{evidence}\n\nQuestion: {question}\n\nRequired facts keys: {fact_keys}"
+  },
+  "output_schema": {
+    "required_keys": ["answer", "label", "verdict", "abstained", "citations", "facts"],
+    "additional_properties": false,
+    "fields": {
+      "answer": {
+        "types": ["string"],
+        "description": "A concise Simplified Chinese explanation; use exactly an empty string for pure classification."
+      },
+      "label": {
+        "types": ["string", "null"],
+        "description": "The classification label for classification tasks; otherwise null."
+      },
+      "verdict": {
+        "types": ["string", "null"],
+        "allowed_values": ["supported", "contradicted", "insufficient", null],
+        "description": "For every non-classification task choose supported, contradicted, or insufficient; otherwise null."
+      },
+      "abstained": {
+        "types": ["boolean"],
+        "description": "True only when evidence is insufficient and the answer explicitly abstains."
+      },
+      "citations": {
+        "types": ["array"],
+        "item_types": ["string"],
+        "description": "Exact supplied Evidence identifiers without brackets or invented identifiers."
+      },
+      "facts": {
+        "types": ["object"],
+        "key_types": ["string"],
+        "value_types": ["string"],
+        "description": "Exactly the requested fact keys with concise canonical English values; use missing when evidence lacks a value."
+      }
+    }
+  },
+  "retry_policy": {
+    "max_attempts": 2,
+    "backoff_seconds": [0.5],
+    "retry_status_codes": [408, 429, 500, 502, 503, 504]
+  },
+  "budget_policy": {
+    "maximum_evaluation_cost_usd": 0.25,
+    "monthly_external_api_cap_usd": 100.0
+  },
+  "route_selection_policy": {
+    "eligibility": "pass every critical gate for every case in the task class",
+    "rank_by": [
+      "quality_score descending",
+      "estimated_cost_usd ascending",
+      "median_latency_ms ascending",
+      "candidate_identifier ascending"
+    ]
+  },
+  "task_maximum_output_tokens": {
+    "classification": 512,
+    "chinese_summarization": 1024,
+    "claim_verification": 1024,
+    "simple_question": 1024,
+    "complex_reasoning": 4096
+  }
+}

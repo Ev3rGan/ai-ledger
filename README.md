@@ -51,6 +51,32 @@ report. The command recommends at most one managed fallback and keeps rewritten 
 output ineligible for Evidence. It does not activate production Source Definitions or
 Collection Runs.
 
+Add `DEEPSEEK_API_KEY` and a Kimi China-platform `KIMI_API_KEY` to `.env`, then run the
+standalone model-routing evaluation over the frozen, human-approved corpus:
+
+```powershell
+uv run ai-intel-agent evaluate-model-routes --output reports\model-routing-evaluation.md
+```
+
+The command compares the versioned DeepSeek V4 Flash, DeepSeek V4 Pro, and Kimi K2.6
+candidates on classification, Chinese summarization, Claim verification, simple questions,
+and complex reasoning. Every case applies strict structure, factual, citation, and abstention
+gates before comparing quality, latency, and token-based cost. A failed critical gate makes a
+candidate ineligible regardless of aggregate score. Model IDs, endpoints, thinking routes,
+prices, the CNY-to-USD evaluation conversion, human-approval provenance, prompt, output schema,
+retry policy, route ranking, per-task token limits, per-run cost budget, and gold criteria are
+versioned inputs. Eligible candidates rank by quality, then cost, then latency, preserving
+DeepSeek as the economical default when quality is tied. The command checks the worst-case
+request budget before making any provider call; provider invoices remain authoritative. This
+evaluation does not connect any model to the production application.
+
+The frozen v1 corpus is an initial route smoke evaluation: classification, Chinese
+summarization, Claim verification, and complex reasoning each have one case, while simple
+questions have two. A single failed case therefore makes its whole task route ineligible. The
+complex-reasoning case measures application of the approved routing policy; it does not measure
+general complex-reasoning ability. Treat recommendations as project-specific starting routes,
+not broad model-capability conclusions.
+
 ## Verification
 
 The dev environment bundles an isolated PostgreSQL/pgvector test server. The acceptance test
@@ -65,10 +91,11 @@ uv run ai-intel-agent audit-sources --output reports\source-activation-audit.md
 ```
 
 Run `benchmark-extraction` separately when a live, credit-consuming benchmark refresh is
-intended.
+intended. Run `evaluate-model-routes` separately when a live, token-billed model evaluation
+refresh is intended.
 
 The sample slice intentionally does not include Web pages, administrator review, real sources,
-model providers, or placeholder tables for later work.
+production model-provider integration, or placeholder tables for later work.
 
 ## Repository layout
 
@@ -81,6 +108,10 @@ src/ai_intel_agent/
   source_audit.py # versioned first-wave Source Definition activation audit
   extraction_corpus.py # fixed 60-URL benchmark corpus
   extraction_benchmark.py # fixed-corpus Document extraction benchmark
+  model_routing_evaluation.py # frozen-corpus DeepSeek/Kimi route evaluation
+  data/model_routing_evaluation.v1.json # human-approved gold cases and gates
+  data/model_routing_candidates.v1.json # versioned models, endpoints, and prices
+  data/model_routing_protocol.v1.json # versioned prompt, schema, retries, and budgets
   cli.py          # supported CLI transport
 alembic/          # clean PostgreSQL/pgvector baseline migration
 tests/            # CLI-to-database acceptance test
