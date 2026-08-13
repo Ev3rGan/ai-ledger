@@ -31,6 +31,13 @@ from ai_intel_agent.runtime_benchmark import (
     compare_hong_kong_runtime_results,
     load_runtime_benchmark_configuration,
     run_hong_kong_runtime_probe,
+from ai_intel_agent.retrieval_calibration import (
+    FastEmbedCalibrationRuntime,
+    RetrievalCalibrationConfigurationError,
+    load_retrieval_candidate_configuration,
+    load_retrieval_corpus,
+    require_human_approved_retrieval_corpus,
+    run_retrieval_calibration,
 )
 from ai_intel_agent.source_audit import run_source_definition_activation_audit
 
@@ -45,6 +52,8 @@ DEFAULT_SOURCE_AUDIT_OUTPUT = Path("reports/source-activation-audit.md")
 DEFAULT_EXTRACTION_BENCHMARK_OUTPUT = Path("reports/document-extraction-benchmark.md")
 DEFAULT_MODEL_ROUTING_OUTPUT = Path("reports/model-routing-evaluation.md")
 DEFAULT_RUNTIME_BENCHMARK_OUTPUT = Path("reports/hong-kong-runtime-benchmark.md")
+DEFAULT_RETRIEVAL_CALIBRATION_OUTPUT = Path("reports/retrieval-calibration.md")
+DEFAULT_RETRIEVAL_PROFILE_OUTPUT = Path("reports/retrieval-profile.v1.json")
 
 
 @app.callback()
@@ -272,6 +281,45 @@ def compare_hong_kong_runtimes(
 
     recommendation = comparison["recommendation"] or "none"
     console.print(f"[green]Recommended Hong Kong runtime: {recommendation}[/] ({output})")
+@app.command("calibrate-retrieval")
+def calibrate_retrieval(
+    output: Annotated[
+        Path,
+        typer.Option("--output", "-o", help="Write the retrieval calibration report here."),
+    ] = DEFAULT_RETRIEVAL_CALIBRATION_OUTPUT,
+    profile_output: Annotated[
+        Path,
+        typer.Option(
+            "--profile-output",
+            help="Export the selected versioned Retrieval Profile here.",
+        ),
+    ] = DEFAULT_RETRIEVAL_PROFILE_OUTPUT,
+) -> None:
+    """Calibrate candidates and export one versioned Retrieval Profile."""
+
+    def progress(completed: int, total: int, label: str) -> None:
+        console.print(f"[cyan]Retrieval calibration:[/] {completed}/{total} ({label})")
+
+    try:
+        corpus = load_retrieval_corpus()
+        require_human_approved_retrieval_corpus(corpus)
+        configuration = load_retrieval_candidate_configuration()
+        calibration = run_retrieval_calibration(
+            output,
+            profile_output,
+            runtime=FastEmbedCalibrationRuntime(threads=configuration.runtime.threads),
+            corpus=corpus,
+            configuration=configuration,
+            progress=progress,
+        )
+    except RetrievalCalibrationConfigurationError as error:
+        raise typer.BadParameter(str(error)) from error
+
+    console.print(
+        f"[green]Calibrated {len(calibration.measurements)} Retrieval Profile candidates:[/] "
+        f"{output}"
+    )
+    console.print(f"[green]Exported Retrieval Profile:[/] {profile_output}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,115 @@
+{
+  "schema_version": "retrieval-candidates.v1",
+  "candidate_configuration_version": "retrieval-candidates-2026-08-13.v1",
+  "runtime": {
+    "provider": "fastembed",
+    "version": "0.8.x",
+    "execution_provider": "CPUExecutionProvider",
+    "threads": 4,
+    "source_url": "https://qdrant.github.io/fastembed/"
+  },
+  "embedding_candidates": [
+    {
+      "candidate_id": "multilingual-minilm-l12-v2",
+      "provider": "fastembed",
+      "model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+      "dimensions": 384,
+      "pooling": "mean",
+      "model_size_gb": 0.22,
+      "license": "apache-2.0",
+      "source_url": "https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    },
+    {
+      "candidate_id": "multilingual-mpnet-base-v2",
+      "provider": "fastembed",
+      "model_id": "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
+      "dimensions": 768,
+      "pooling": "mean",
+      "model_size_gb": 1.0,
+      "license": "apache-2.0",
+      "source_url": "https://huggingface.co/sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+    }
+  ],
+  "reranker_candidates": [
+    {
+      "candidate_id": "no-reranker-control",
+      "provider": "none",
+      "model_id": null,
+      "model_size_gb": 0.0,
+      "license": "n/a",
+      "source_url": null
+    },
+    {
+      "candidate_id": "bge-reranker-base",
+      "provider": "fastembed",
+      "model_id": "BAAI/bge-reranker-base",
+      "model_size_gb": 1.04,
+      "license": "mit",
+      "source_url": "https://huggingface.co/BAAI/bge-reranker-base"
+    }
+  ],
+  "chunk_profiles": [
+    {
+      "profile_id": "compact-windows",
+      "strategy": "type-aware-character-window",
+      "document_types": {
+        "technical_note": {"max_characters": 180, "overlap_characters": 40},
+        "release": {"max_characters": 180, "overlap_characters": 40},
+        "documentation": {"max_characters": 200, "overlap_characters": 48},
+        "paper": {"max_characters": 220, "overlap_characters": 56}
+      }
+    },
+    {
+      "profile_id": "evidence-windows",
+      "strategy": "type-aware-character-window",
+      "document_types": {
+        "technical_note": {"max_characters": 320, "overlap_characters": 80},
+        "release": {"max_characters": 320, "overlap_characters": 80},
+        "documentation": {"max_characters": 360, "overlap_characters": 96},
+        "paper": {"max_characters": 400, "overlap_characters": 112}
+      }
+    }
+  ],
+  "fusion_profiles": [
+    {
+      "profile_id": "balanced-rrf",
+      "method": "weighted-reciprocal-rank-fusion",
+      "rrf_k": 60,
+      "weights": {"lexical": 0.35, "semantic": 0.45, "exact_entity": 0.2},
+      "lexical_candidate_count": 12,
+      "semantic_candidate_count": 12,
+      "exact_entity_candidate_count": 8,
+      "fused_candidate_count": 10,
+      "rerank_depth": 8,
+      "final_top_k": 5
+    },
+    {
+      "profile_id": "semantic-heavy-rrf",
+      "method": "weighted-reciprocal-rank-fusion",
+      "rrf_k": 60,
+      "weights": {"lexical": 0.2, "semantic": 0.6, "exact_entity": 0.2},
+      "lexical_candidate_count": 12,
+      "semantic_candidate_count": 12,
+      "exact_entity_candidate_count": 8,
+      "fused_candidate_count": 10,
+      "rerank_depth": 8,
+      "final_top_k": 5
+    }
+  ],
+  "selection_policy": {
+    "cross_language_recall_at_k_minimum": 0.75,
+    "exact_entity_recall_at_k_minimum": 1.0,
+    "evidence_span_recall_at_k_minimum": 0.75,
+    "ranking_order": [
+      "worst_recall_desc",
+      "mean_recall_desc",
+      "evidence_span_recall_desc",
+      "cross_language_recall_desc",
+      "declared_model_size_gb_asc",
+      "index_throughput_desc",
+      "median_query_latency_ms_asc",
+      "p95_query_latency_ms_asc",
+      "stable_candidate_id_asc"
+    ]
+  }
+}
