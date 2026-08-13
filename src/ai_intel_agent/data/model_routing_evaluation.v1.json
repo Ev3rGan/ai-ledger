@@ -1,0 +1,216 @@
+{
+  "version": "model-routing-evaluation-2026-08-12.v1",
+  "review_state": "human-approved",
+  "description": "Frozen task-routing corpus derived only from normative, human-authored Parent Spec #1 and Issue #5 text.",
+  "approval_record": {
+    "approved_by": "Ev3rGan",
+    "approved_at": "2026-08-13T10:51:08+08:00",
+    "approved_cases_sha256": "8de5085eb331ce7ef869467583018a76598caa296bf3ce7221e76e7d2f616ca7",
+    "method": "Administrator explicitly approved the exact cases SHA-256, including gold facts, rejection conditions, answer bounds, citations, and failure gates.",
+    "sources": [
+      {
+        "url": "https://github.com/Ev3rGan/ai-ledger/issues/1",
+        "updated_at": "2026-08-11T19:07:21Z"
+      },
+      {
+        "url": "https://github.com/Ev3rGan/ai-ledger/issues/5",
+        "updated_at": "2026-08-12T03:48:20Z"
+      }
+    ]
+  },
+  "cases": [
+    {
+      "identifier": "classification-research-01",
+      "task_class": "classification",
+      "instruction": "Classify the item into exactly one primary Topic.",
+      "context": [
+        {
+          "identifier": "EV-SPEC-CLASSIFICATION",
+          "source_url": "https://github.com/Ev3rGan/ai-ledger/issues/1",
+          "text": "As an AI developer, I want papers and benchmarks classified as Research, so that research material is easy to find."
+        }
+      ],
+      "question": "Choose one label from Models, Research, Applications, Tools, Policy and Safety, or Companies and Funding.",
+      "critical_gates": ["structure", "factual", "citation", "abstention"],
+      "gold": {
+        "expected_label": "Research",
+        "expected_verdict": null,
+        "expected_abstained": false,
+        "expected_facts": {"primary_topic": "Research"},
+        "required_fact_groups": [],
+        "rejection_patterns": [],
+        "required_citations": ["EV-SPEC-CLASSIFICATION"],
+        "allowed_citations": ["EV-SPEC-CLASSIFICATION"],
+        "require_chinese": false,
+        "minimum_answer_characters": 0,
+        "maximum_answer_characters": 0
+      }
+    },
+    {
+      "identifier": "chinese-summary-architecture-01",
+      "task_class": "chinese_summarization",
+      "instruction": "Write a concise Chinese summary using only the supplied evidence.",
+      "context": [
+        {
+          "identifier": "EV-SPEC-ARCHITECTURE",
+          "source_url": "https://github.com/Ev3rGan/ai-ledger/issues/1",
+          "text": "The application uses PostgreSQL as its system of record, pgvector and PostgreSQL full-text search for hybrid retrieval, DeepSeek and Kimi behind a capability-oriented Model Gateway, GitHub OAuth for the single administrator, and a small Hong Kong deployment."
+        }
+      ],
+      "question": "Summarize the architecture for a mainland-China-oriented technical reader.",
+      "critical_gates": ["structure", "factual", "citation", "abstention"],
+      "gold": {
+        "expected_label": null,
+        "expected_verdict": "supported",
+        "expected_abstained": false,
+        "expected_facts": {
+          "system_of_record": "PostgreSQL",
+          "semantic_retrieval": "pgvector",
+          "lexical_retrieval": "PostgreSQL full-text search",
+          "model_providers": "DeepSeek and Kimi",
+          "deployment_region": "Hong Kong"
+        },
+        "required_fact_groups": [],
+        "rejection_patterns": [
+          "(?:不|未|没有|并未)(?:采用|使用|基于)?\\s*PostgreSQL",
+          "(?:不|未|没有|并未)(?:采用|使用|基于)?\\s*pgvector",
+          "(?:不在|不是).{0,6}(?:香港|Hong Kong)"
+        ],
+        "required_citations": ["EV-SPEC-ARCHITECTURE"],
+        "allowed_citations": ["EV-SPEC-ARCHITECTURE"],
+        "require_chinese": true,
+        "minimum_answer_characters": 30,
+        "maximum_answer_characters": 220
+      }
+    },
+    {
+      "identifier": "claim-verification-live-web-01",
+      "task_class": "claim_verification",
+      "instruction": "Verify the Claim against the supplied evidence.",
+      "context": [
+        {
+          "identifier": "EV-SPEC-LIVE-WEB",
+          "source_url": "https://github.com/Ev3rGan/ai-ledger/issues/1",
+          "text": "Restrict public Research to accepted knowledge. Provider web-search tools, direct live-web fetching, and direct live-web citations are disabled for public requests."
+        }
+      ],
+      "question": "Claim: Public Research may use provider live-web search when curated knowledge is insufficient.",
+      "critical_gates": ["structure", "factual", "citation", "abstention"],
+      "gold": {
+        "expected_label": null,
+        "expected_verdict": "contradicted",
+        "expected_abstained": false,
+        "expected_facts": {
+          "knowledge_boundary": "accepted knowledge only",
+          "provider_web_search": "disabled"
+        },
+        "required_fact_groups": [],
+        "rejection_patterns": [
+          "(?<!不)(?<!未)(?<!不得)(?<!不能)(?<!不应)(?<!不可)(?<!禁止)(?<!并非)(?:允许|可以|可用|启用).{0,12}(?:实时网络|联网|live-web|web search)"
+        ],
+        "required_citations": ["EV-SPEC-LIVE-WEB"],
+        "allowed_citations": ["EV-SPEC-LIVE-WEB"],
+        "require_chinese": true,
+        "minimum_answer_characters": 15,
+        "maximum_answer_characters": 180
+      }
+    },
+    {
+      "identifier": "simple-question-editorial-window-01",
+      "task_class": "simple_question",
+      "instruction": "Answer the question from the supplied evidence only.",
+      "context": [
+        {
+          "identifier": "EV-SPEC-EDITORIAL-WINDOW",
+          "source_url": "https://github.com/Ev3rGan/ai-ledger/issues/1",
+          "text": "The Digest Editorial Window spans the previous day at 06:00 through the publication day at 05:59."
+        }
+      ],
+      "question": "What are the Digest Editorial Window boundaries?",
+      "critical_gates": ["structure", "factual", "citation", "abstention"],
+      "gold": {
+        "expected_label": null,
+        "expected_verdict": "supported",
+        "expected_abstained": false,
+        "expected_facts": {
+          "window_start": "previous day 06:00",
+          "window_end": "publication day 05:59"
+        },
+        "required_fact_groups": [],
+        "rejection_patterns": [],
+        "required_citations": ["EV-SPEC-EDITORIAL-WINDOW"],
+        "allowed_citations": ["EV-SPEC-EDITORIAL-WINDOW"],
+        "require_chinese": true,
+        "minimum_answer_characters": 15,
+        "maximum_answer_characters": 160
+      }
+    },
+    {
+      "identifier": "simple-question-abstention-01",
+      "task_class": "simple_question",
+      "instruction": "Answer only when the supplied evidence contains the answer; otherwise abstain explicitly.",
+      "context": [
+        {
+          "identifier": "EV-SPEC-SAMPLE-MODE",
+          "source_url": "https://github.com/Ev3rGan/ai-ledger/issues/1",
+          "text": "It remains usable without provider credentials through deterministic sample mode."
+        }
+      ],
+      "question": "What exact monthly anonymous Research request allowance does the Spec require?",
+      "critical_gates": ["structure", "factual", "citation", "abstention"],
+      "gold": {
+        "expected_label": null,
+        "expected_verdict": "insufficient",
+        "expected_abstained": true,
+        "expected_facts": {"monthly_anonymous_request_allowance": "missing"},
+        "required_fact_groups": [],
+        "rejection_patterns": ["(?:每月|月度).{0,8}[0-9]+(?:次|个请求|requests)"] ,
+        "required_citations": [],
+        "allowed_citations": ["EV-SPEC-SAMPLE-MODE"],
+        "require_chinese": true,
+        "minimum_answer_characters": 8,
+        "maximum_answer_characters": 140
+      }
+    },
+    {
+      "identifier": "complex-reasoning-routing-policy-01",
+      "task_class": "complex_reasoning",
+      "instruction": "Explain the routing policy and why a cheaper aggregate score cannot bypass eligibility.",
+      "context": [
+        {
+          "identifier": "EV-SPEC-MODEL-POLICY",
+          "source_url": "https://github.com/Ev3rGan/ai-ledger/issues/1",
+          "text": "Keep task routes evaluation-driven. DeepSeek is the economical default candidate family; Kimi remains a quality and cross-provider challenger."
+        },
+        {
+          "identifier": "EV-ISSUE-5-GATE",
+          "source_url": "https://github.com/Ev3rGan/ai-ledger/issues/5",
+          "text": "Run one standalone evaluation command and report critical gates, quality, latency, and cost for classification, Chinese summarization, Claim verification, simple questions, and complex reasoning, selecting only candidates that pass every critical gate."
+        }
+      ],
+      "question": "How should a route be selected when a cheap candidate fails a critical gate but a more expensive candidate passes?",
+      "critical_gates": ["structure", "factual", "citation", "abstention"],
+      "gold": {
+        "expected_label": null,
+        "expected_verdict": "supported",
+        "expected_abstained": false,
+        "expected_facts": {
+          "deepseek_role": "economical default candidate family",
+          "kimi_role": "quality and cross-provider challenger",
+          "route_basis": "evaluation-driven",
+          "eligibility_rule": "pass every critical gate"
+        },
+        "required_fact_groups": [],
+        "rejection_patterns": [
+          "(?<!不)(?<!未)(?<!不得)(?<!不能)(?<!不应)(?<!不可)(?<!不要)(?<!禁止)(?<!并非)(?<!绝非)(?:只|仅).{0,4}(?:按|依据).{0,8}(?:价格|成本)",
+          "(?:失败|未通过).{0,8}(?:仍可|仍然可以|也可以).{0,8}(?:入选|选择)"
+        ],
+        "required_citations": ["EV-SPEC-MODEL-POLICY", "EV-ISSUE-5-GATE"],
+        "allowed_citations": ["EV-SPEC-MODEL-POLICY", "EV-ISSUE-5-GATE"],
+        "require_chinese": true,
+        "minimum_answer_characters": 45,
+        "maximum_answer_characters": 320
+      }
+    }
+  ]
+}
