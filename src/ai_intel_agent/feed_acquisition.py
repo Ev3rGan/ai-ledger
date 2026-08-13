@@ -31,6 +31,7 @@ ALLOWED_FEED_MIME_TYPES = frozenset(
     }
 )
 REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
+BLOCKED_CONTENT_TAGS = frozenset({"iframe", "math", "object", "script", "style", "svg"})
 FEED_PUBLISHERS = {
     "Google AI": "Google",
     "Hugging Face Blog": "Hugging Face",
@@ -213,11 +214,9 @@ class SampleFeedFetcher:
 
 
 class _SummaryTextExtractor(HTMLParser):
-    _blocked_tags = frozenset({"iframe", "math", "object", "script", "style", "svg"})
-
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
-        self._blocked_depth = 0
+        self._blocked_tags: list[str] = []
         self._parts: list[str] = []
 
     def handle_starttag(
@@ -225,8 +224,9 @@ class _SummaryTextExtractor(HTMLParser):
         tag: str,
         attrs: list[tuple[str, str | None]],
     ) -> None:
-        if self._blocked_depth or tag.casefold() in self._blocked_tags:
-            self._blocked_depth += 1
+        normalized_tag = tag.casefold()
+        if normalized_tag in BLOCKED_CONTENT_TAGS:
+            self._blocked_tags.append(normalized_tag)
 
     def handle_startendtag(
         self,
@@ -236,11 +236,11 @@ class _SummaryTextExtractor(HTMLParser):
         return
 
     def handle_endtag(self, tag: str) -> None:
-        if self._blocked_depth:
-            self._blocked_depth -= 1
+        if self._blocked_tags and tag.casefold() == self._blocked_tags[-1]:
+            self._blocked_tags.pop()
 
     def handle_data(self, data: str) -> None:
-        if not self._blocked_depth:
+        if not self._blocked_tags:
             self._parts.append(data)
 
     def text(self) -> str:
@@ -315,10 +315,10 @@ def _parse_rss(root: ElementTree.Element) -> tuple[FeedEntry, ...]:
         )
         entries.append(
             _feed_entry(
-                title=_child_text(item, "title"),
+                title=_child_plain_text(item, "title"),
                 canonical_url=_child_text(item, "link"),
-                summary=_child_text(item, "description")
-                or _child_text(item, "encoded"),
+                summary=_child_plain_text(item, "description")
+                or _child_plain_text(item, "encoded"),
                 published_at=published_at,
                 published_at_raw=published_at_raw,
                 updated_at=None,
@@ -348,9 +348,10 @@ def _parse_atom(root: ElementTree.Element) -> tuple[FeedEntry, ...]:
         )
         entries.append(
             _feed_entry(
-                title=_child_text(item, "title"),
+                title=_child_plain_text(item, "title"),
                 canonical_url=link,
-                summary=_child_text(item, "summary") or _child_text(item, "content"),
+                summary=_child_plain_text(item, "summary")
+                or _child_plain_text(item, "content"),
                 published_at=published_at,
                 published_at_raw=published_at_raw,
                 updated_at=updated_at,
@@ -370,13 +371,14 @@ def _feed_entry(
     updated_at: datetime | None,
     updated_at_raw: str | None,
 ) -> FeedEntry:
-    if not title:
+    sanitized_title = _plain_text(title)
+    if not sanitized_title:
         raise FeedFormatError("Feed entry has no title")
     parsed_url = urlparse(canonical_url)
     if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
         raise FeedFormatError("Feed entry has no canonical HTTP URL")
     return FeedEntry(
-        title=" ".join(title.split()),
+        title=sanitized_title,
         canonical_url=canonical_url,
         summary=_plain_text(summary),
         published_at=published_at,
@@ -428,3 +430,19 @@ def _child_text(element: ElementTree.Element, name: str) -> str:
     if child is None:
         return ""
     return " ".join(part.strip() for part in child.itertext() if part.strip())
+
+
+def _child_plain_text(element: ElementTree.Element, name: str) -> str:
+    child = _first_child(element, name)
+    if child is None:
+        return ""
+    return _plain_text(_element_text_without_blocked_content(child))
+
+
+def _element_text_without_blocked_content(element: ElementTree.Element) -> str:
+    parts = [element.text or ""]
+    for child in element:
+        if _local_name(child.tag).casefold() not in BLOCKED_CONTENT_TAGS:
+            parts.append(_element_text_without_blocked_content(child))
+        parts.append(child.tail or "")
+    return "".join(parts)

@@ -47,7 +47,7 @@ def collect_feed_source_definitions(
     clock: Clock,
     retry_of_run_id: UUID | None = None,
 ) -> CollectionRun:
-    """Run one immutable Collection over approved RSS and Atom definitions."""
+    """Create one immutable Collection Run over approved RSS and Atom definitions."""
     if not source_definitions:
         raise ValueError("A Collection Run requires at least one Feed Source Definition")
     approved_definitions = set(load_approved_feed_source_definitions())

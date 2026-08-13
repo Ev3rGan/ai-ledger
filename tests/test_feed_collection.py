@@ -26,6 +26,7 @@ from ai_intel_agent.feed_acquisition import (
     HostResolver,
     HttpFeedFetcher,
     load_approved_feed_source_definitions,
+    parse_feed,
 )
 from ai_intel_agent.persistence import (
     CandidateRecord,
@@ -184,6 +185,64 @@ def test_http_feed_fetcher_revalidates_redirects_and_sets_a_timeout() -> None:
         "blog.google",
         "feeds.example.com",
     ]
+
+
+def test_parse_feed_sanitizes_markup_in_rss_titles() -> None:
+    entries = parse_feed(
+        b"""\
+        <rss version="2.0">
+          <channel>
+            <item>
+              <title>&lt;iframe&gt;&lt;/div&gt;ignore me&lt;/iframe&gt;Trusted title</title>
+              <link>https://example.com/trusted</link>
+              <description>Trusted summary</description>
+            </item>
+          </channel>
+        </rss>
+        """
+    )
+
+    assert entries[0].title == "Trusted title"
+
+
+def test_parse_feed_preserves_xml_decoded_canonical_url() -> None:
+    entries = parse_feed(
+        b"""\
+        <rss version="2.0">
+          <channel>
+            <item>
+              <title>Trusted title</title>
+              <link>https://example.com/trusted?a=1&amp;copy=2</link>
+              <description>Trusted summary</description>
+            </item>
+          </channel>
+        </rss>
+        """
+    )
+
+    assert entries[0].canonical_url == "https://example.com/trusted?a=1&copy=2"
+
+
+def test_parse_feed_sanitizes_atom_xhtml_before_flattening() -> None:
+    entries = parse_feed(
+        b"""\
+        <feed xmlns="http://www.w3.org/2005/Atom"
+              xmlns:xhtml="http://www.w3.org/1999/xhtml">
+          <entry>
+            <title type="xhtml">
+              <xhtml:div>Trusted <xhtml:script>ignore title</xhtml:script>title</xhtml:div>
+            </title>
+            <link href="https://example.com/trusted" />
+            <summary type="xhtml">
+              <xhtml:div>Trusted <xhtml:style>ignore summary</xhtml:style>summary</xhtml:div>
+            </summary>
+          </entry>
+        </feed>
+        """
+    )
+
+    assert entries[0].title == "Trusted title"
+    assert entries[0].summary == "Trusted summary"
 
 
 def test_collection_rejects_a_source_definition_not_matching_the_approved_audit() -> None:
