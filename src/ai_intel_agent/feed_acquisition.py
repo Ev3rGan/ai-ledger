@@ -8,7 +8,7 @@ from html.parser import HTMLParser
 from importlib.resources import files
 from ipaddress import IPv4Address, IPv6Address, ip_address
 from typing import Protocol
-from urllib.parse import urljoin, urlparse
+from urllib.parse import ParseResult, urljoin, urlparse
 from uuid import NAMESPACE_URL, uuid5
 from xml.etree import ElementTree
 
@@ -42,6 +42,10 @@ SAMPLE_FEED_FILES = {
     "Google AI": "google-ai.rss",
     "Hugging Face Blog": "hugging-face.atom",
     "GitHub AI and ML": "malformed.xml",
+}
+COLLECTION_SCHEDULE = "06:00 and 18:00 Asia/Shanghai"
+FEED_CANONICAL_URL_PREFIXES = {
+    "Google AI": ("https://blog.google/innovation-and-ai/technology/ai/",),
 }
 
 
@@ -89,6 +93,18 @@ class FeedSourceDefinitionConfigurationError(ValueError):
     pass
 
 
+class _RejectingFeedTreeBuilder(ElementTree.TreeBuilder):
+    def doctype(
+        self,
+        _name: str,
+        _pubid: str | None,
+        _system: str | None,
+    ) -> None:
+        raise FeedFormatError(
+            "Feed XML cannot contain document type or entity declarations"
+        )
+
+
 class SystemHostResolver:
     def resolve(self, hostname: str) -> tuple[IPAddress, ...]:
         try:
@@ -124,17 +140,28 @@ class HttpFeedFetcher:
     def fetch(self, source_definition: ApprovedFeedSourceDefinition) -> bytes:
         location = source_definition.entry_point
         for redirect_count in range(self._max_redirects + 1):
-            self._validate_public_https_location(location)
+            parsed_location, addresses = self._validate_public_https_location(location)
+            pinned_location = httpx.URL(location).copy_with(
+                host=str(
+                    min(
+                        addresses,
+                        key=lambda address: (address.version, int(address)),
+                    )
+                )
+            )
             try:
                 with self._client.stream(
                     "GET",
-                    location,
+                    pinned_location,
                     follow_redirects=False,
                     timeout=self._timeout_seconds,
                     headers={
                         "accept": ", ".join(sorted(ALLOWED_FEED_MIME_TYPES)),
+                        "connection": "close",
+                        "host": parsed_location.netloc,
                         "user-agent": "ai-intel-agent/0.1 feed-collector",
                     },
+                    extensions={"sni_hostname": parsed_location.hostname},
                 ) as response:
                     if response.status_code in REDIRECT_STATUS_CODES:
                         if redirect_count == self._max_redirects:
@@ -142,7 +169,7 @@ class HttpFeedFetcher:
                         redirect_location = response.headers.get("location")
                         if not redirect_location:
                             raise FeedFetchError("Feed redirect has no Location header")
-                        location = urljoin(str(response.url), redirect_location)
+                        location = urljoin(location, redirect_location)
                         continue
                     if not response.is_success:
                         raise FeedFetchError(
@@ -156,7 +183,10 @@ class HttpFeedFetcher:
                 raise FeedFetchError("Feed request failed") from error
         raise FeedFetchError("Feed redirect limit exceeded")
 
-    def _validate_public_https_location(self, location: str) -> None:
+    def _validate_public_https_location(
+        self,
+        location: str,
+    ) -> tuple[ParseResult, tuple[IPAddress, ...]]:
         parsed = urlparse(location)
         if parsed.scheme != "https":
             raise FeedSecurityError("Feed location must use HTTPS")
@@ -174,6 +204,7 @@ class HttpFeedFetcher:
             raise FeedFetchError("Feed hostname could not be resolved") from error
         if not addresses or any(not address.is_global for address in addresses):
             raise FeedSecurityError("Feed location must resolve only to the public network")
+        return parsed, addresses
 
     @staticmethod
     def _validate_mime_type(response: httpx.Response) -> None:
@@ -273,7 +304,33 @@ def load_approved_feed_source_definitions() -> tuple[ApprovedFeedSourceDefinitio
                 publisher=publisher,
                 entry_point=source_definition.entry_point,
                 audit_version=audit.version,
+                collection_schedule=COLLECTION_SCHEDULE,
+                discovery_method=source_definition.discovery_method,
+                language=source_definition.language,
+                topic_scope=source_definition.topic_scope,
+                access_constraints=(
+                    (
+                        f"robots: {source_definition.robots_findings} "
+                        f"({source_definition.robots_url})"
+                    ),
+                    (
+                        f"terms: {source_definition.terms_findings} "
+                        f"({source_definition.terms_url})"
+                    ),
+                ),
+                extraction_adapter=source_definition.extraction_adapter,
+                health_policy=source_definition.health_policy,
+                cursor=source_definition.cursor,
                 storage_policy=source_definition.storage_policy,
+                public_excerpt_policy=source_definition.public_excerpt_policy,
+                public_excerpt_max_characters=(
+                    source_definition.public_excerpt_max_characters
+                ),
+                pause_conditions=source_definition.pause_conditions,
+                canonical_url_prefixes=FEED_CANONICAL_URL_PREFIXES.get(
+                    source_definition.name,
+                    (),
+                ),
             )
         )
     return tuple(definitions)
@@ -288,11 +345,11 @@ def load_sample_feed_source_definitions() -> tuple[ApprovedFeedSourceDefinition,
 
 
 def parse_feed(payload: bytes) -> tuple[FeedEntry, ...]:
-    lowered_prefix = payload[:4096].lower()
-    if b"<!doctype" in lowered_prefix or b"<!entity" in lowered_prefix:
-        raise FeedFormatError("Feed XML cannot contain document type or entity declarations")
     try:
-        root = ElementTree.fromstring(payload)
+        root = ElementTree.fromstring(
+            payload,
+            parser=ElementTree.XMLParser(target=_RejectingFeedTreeBuilder()),
+        )
     except ElementTree.ParseError as error:
         raise FeedFormatError(f"Feed XML is malformed: {error}") from error
 
@@ -374,8 +431,18 @@ def _feed_entry(
     sanitized_title = _plain_text(title)
     if not sanitized_title:
         raise FeedFormatError("Feed entry has no title")
-    parsed_url = urlparse(canonical_url)
-    if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+    try:
+        parsed_url = urlparse(canonical_url)
+        parsed_port = parsed_url.port
+    except ValueError as error:
+        raise FeedFormatError("Feed entry has an invalid canonical HTTP URL") from error
+    if (
+        parsed_url.scheme not in {"http", "https"}
+        or not parsed_url.hostname
+        or parsed_url.username
+        or parsed_url.password
+        or parsed_port == 0
+    ):
         raise FeedFormatError("Feed entry has no canonical HTTP URL")
     return FeedEntry(
         title=sanitized_title,

@@ -182,6 +182,10 @@ class SourceDefinitionRecord(Base):
             "activation_conclusion = 'approved'",
             name="ck_source_definitions_approved",
         ),
+        CheckConstraint(
+            "public_excerpt_max_characters BETWEEN 0 AND 1000",
+            name="ck_source_definitions_excerpt_limit",
+        ),
         UniqueConstraint("audit_version", "entry_point"),
     )
 
@@ -191,19 +195,33 @@ class SourceDefinitionRecord(Base):
     entry_point: Mapped[str] = mapped_column(String(2048))
     audit_version: Mapped[str] = mapped_column(String(255))
     activation_conclusion: Mapped[str] = mapped_column(String(32))
+    collection_schedule: Mapped[str] = mapped_column(String(255))
+    discovery_method: Mapped[str] = mapped_column(Text)
+    language: Mapped[str] = mapped_column(String(255))
+    topic_scope: Mapped[list[str]] = mapped_column(JSON)
+    access_constraints: Mapped[list[str]] = mapped_column(JSON)
+    extraction_adapter: Mapped[str] = mapped_column(Text)
+    health_policy: Mapped[str] = mapped_column(Text)
+    cursor: Mapped[str] = mapped_column(Text)
     storage_policy: Mapped[str] = mapped_column(Text)
+    public_excerpt_policy: Mapped[str] = mapped_column(Text)
+    public_excerpt_max_characters: Mapped[int] = mapped_column(Integer)
+    pause_conditions: Mapped[list[str]] = mapped_column(JSON)
+    canonical_url_prefixes: Mapped[list[str]] = mapped_column(JSON)
 
 
 class CollectionRunRecord(Base):
     __tablename__ = "collection_runs"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('complete', 'partial', 'failed')",
+            "status IN ('running', 'complete', 'partial', 'failed')",
             name="ck_collection_runs_status",
         ),
         CheckConstraint(
-            "completed_at >= started_at",
-            name="ck_collection_runs_time_order",
+            "(status = 'running' AND completed_at IS NULL) OR "
+            "(status IN ('complete', 'partial', 'failed') "
+            "AND completed_at >= started_at)",
+            name="ck_collection_runs_lifecycle",
         ),
     )
 
@@ -213,7 +231,7 @@ class CollectionRunRecord(Base):
     )
     status: Mapped[str] = mapped_column(String(32))
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class SourceDefinitionCollectionResultRecord(Base):
@@ -357,15 +375,15 @@ class FeedCollectionRepository:
             for source_definition in source_definitions:
                 _persist_source_definition(session, source_definition)
 
-            session.add(
-                CollectionRunRecord(
-                    id=run.id,
-                    retry_of_run_id=run.retry_of_run_id,
-                    status=run.status.value,
-                    started_at=run.started_at,
-                    completed_at=run.completed_at,
-                )
+            run_record = CollectionRunRecord(
+                id=run.id,
+                retry_of_run_id=run.retry_of_run_id,
+                status="running",
+                started_at=run.started_at,
+                completed_at=None,
             )
+            session.add(run_record)
+            session.flush()
             for result in run.source_definition_results:
                 source_definition = definitions_by_id[result.source_definition_id]
                 session.add(
@@ -380,6 +398,9 @@ class FeedCollectionRepository:
                 )
                 for discovery in discoveries_by_definition[source_definition.id]:
                     _persist_collection_discovery(session, run.id, discovery)
+            session.flush()
+            run_record.status = run.status.value
+            run_record.completed_at = run.completed_at
 
 
 def _persist_source_definition(
@@ -393,7 +414,21 @@ def _persist_source_definition(
         "entry_point": source_definition.entry_point,
         "audit_version": source_definition.audit_version,
         "activation_conclusion": "approved",
+        "collection_schedule": source_definition.collection_schedule,
+        "discovery_method": source_definition.discovery_method,
+        "language": source_definition.language,
+        "topic_scope": [topic.value for topic in source_definition.topic_scope],
+        "access_constraints": list(source_definition.access_constraints),
+        "extraction_adapter": source_definition.extraction_adapter,
+        "health_policy": source_definition.health_policy,
+        "cursor": source_definition.cursor,
         "storage_policy": source_definition.storage_policy,
+        "public_excerpt_policy": source_definition.public_excerpt_policy,
+        "public_excerpt_max_characters": (
+            source_definition.public_excerpt_max_characters
+        ),
+        "pause_conditions": list(source_definition.pause_conditions),
+        "canonical_url_prefixes": list(source_definition.canonical_url_prefixes),
     }
     existing = session.get(SourceDefinitionRecord, source_definition.id)
     if existing is None:

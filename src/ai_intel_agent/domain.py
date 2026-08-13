@@ -91,7 +91,19 @@ class ApprovedFeedSourceDefinition:
     publisher: str
     entry_point: str
     audit_version: str
+    collection_schedule: str
+    discovery_method: str
+    language: str
+    topic_scope: tuple[Topic, ...]
+    access_constraints: tuple[str, ...]
+    extraction_adapter: str
+    health_policy: str
+    cursor: str
     storage_policy: str
+    public_excerpt_policy: str
+    public_excerpt_max_characters: int
+    pause_conditions: tuple[str, ...]
+    canonical_url_prefixes: tuple[str, ...]
 
 
 @dataclass(frozen=True)

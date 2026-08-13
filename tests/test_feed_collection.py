@@ -9,8 +9,8 @@ from uuid import uuid4
 import httpx
 import pytest
 from pg0 import Pg0
-from sqlalchemy import func, select, update
-from sqlalchemy.exc import ProgrammingError
+from sqlalchemy import func, insert, select, text, update
+from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.orm import Session
 from typer.testing import CliRunner
 
@@ -22,10 +22,13 @@ from ai_intel_agent.collection import (
 from ai_intel_agent.domain import ApprovedFeedSourceDefinition
 from ai_intel_agent.feed_acquisition import (
     FeedFetchError,
+    FeedFormatError,
     FeedSecurityError,
     HostResolver,
     HttpFeedFetcher,
+    SampleFeedFetcher,
     load_approved_feed_source_definitions,
+    load_sample_feed_source_definitions,
     parse_feed,
 )
 from ai_intel_agent.persistence import (
@@ -157,6 +160,10 @@ def test_http_feed_fetcher_revalidates_redirects_and_sets_a_timeout() -> None:
     def redirect_then_feed(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         assert request.extensions["timeout"]["read"] == 3.0
+        assert request.extensions["sni_hostname"] in {
+            "blog.google",
+            "feeds.example.com",
+        }
         if len(requests) == 1:
             return httpx.Response(
                 302,
@@ -181,9 +188,13 @@ def test_http_feed_fetcher_revalidates_redirects_and_sets_a_timeout() -> None:
         client.close()
 
     assert result == feed_payload
-    assert [request.url.host for request in requests] == [
+    assert [request.headers["host"] for request in requests] == [
         "blog.google",
         "feeds.example.com",
+    ]
+    assert [request.url.host for request in requests] == [
+        str(PUBLIC_ADDRESS),
+        str(PUBLIC_ADDRESS),
     ]
 
 
@@ -245,6 +256,24 @@ def test_parse_feed_sanitizes_atom_xhtml_before_flattening() -> None:
     assert entries[0].summary == "Trusted summary"
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"<!--" + (b"padding" * 700) + b"--><!DOCTYPE rss><rss><channel /></rss>",
+        (
+            '<?xml version="1.0" encoding="utf-16"?>'
+            "<!DOCTYPE rss><rss><channel /></rss>"
+        ).encode("utf-16"),
+    ],
+    ids=("late-declaration", "utf-16"),
+)
+def test_parse_feed_rejects_dtd_regardless_of_position_or_encoding(
+    payload: bytes,
+) -> None:
+    with pytest.raises(FeedFormatError, match="document type or entity"):
+        parse_feed(payload)
+
+
 def test_collection_rejects_a_source_definition_not_matching_the_approved_audit() -> None:
     approved = load_approved_feed_source_definitions()[0]
     unapproved = replace(
@@ -261,6 +290,91 @@ def test_collection_rejects_a_source_definition_not_matching_the_approved_audit(
         )
 
 
+def test_approved_feed_source_definition_retains_its_audited_operating_policy() -> None:
+    google_ai = next(
+        definition
+        for definition in load_approved_feed_source_definitions()
+        if definition.name == "Google AI"
+    )
+
+    assert google_ai.collection_schedule == "06:00 and 18:00 Asia/Shanghai"
+    assert google_ai.discovery_method.startswith("Official RSS filtered to")
+    assert google_ai.language == "English with localized variants possible"
+    assert google_ai.topic_scope
+    assert google_ai.access_constraints
+    assert "AI-section filter" in google_ai.extraction_adapter
+    assert google_ai.health_policy
+    assert google_ai.cursor
+    assert google_ai.public_excerpt_max_characters == 280
+    assert google_ai.pause_conditions
+    assert google_ai.canonical_url_prefixes == (
+        "https://blog.google/innovation-and-ai/technology/ai/",
+    )
+
+
+@pytest.mark.postgres
+def test_malformed_entry_is_isolated_to_its_source_definition(
+    collection_database_url: str,
+) -> None:
+    google_ai, hugging_face, _github = load_sample_feed_source_definitions()
+    malformed_google_feed = b"""\
+        <rss version="2.0">
+          <channel>
+            <item>
+              <title>Malformed port</title>
+              <link>https://blog.google:bad/innovation-and-ai/technology/ai/x</link>
+              <description>This Source Definition must fail in isolation.</description>
+            </item>
+          </channel>
+        </rss>
+    """
+    valid_hugging_face_feed = FIXTURES.joinpath("hugging-face.atom").read_bytes()
+
+    class FixtureFetcher:
+        def fetch(self, source_definition: ApprovedFeedSourceDefinition) -> bytes:
+            if source_definition.id == google_ai.id:
+                return malformed_google_feed
+            return valid_hugging_face_feed
+
+    run = collect_feed_source_definitions(
+        collection_database_url,
+        source_definitions=(google_ai, hugging_face),
+        fetcher=FixtureFetcher(),
+        clock=FixedClock(),
+    )
+
+    engine = create_database_engine(collection_database_url)
+    try:
+        with Session(engine) as session:
+            persisted_status = session.scalar(
+                select(CollectionRunRecord.status).where(CollectionRunRecord.id == run.id)
+            )
+            persisted_results = session.execute(
+                select(
+                    SourceDefinitionRecord.name,
+                    SourceDefinitionCollectionResultRecord.status,
+                    SourceDefinitionCollectionResultRecord.error_code,
+                )
+                .join(
+                    SourceDefinitionRecord,
+                    SourceDefinitionRecord.id
+                    == SourceDefinitionCollectionResultRecord.source_definition_id,
+                )
+                .where(
+                    SourceDefinitionCollectionResultRecord.collection_run_id == run.id
+                )
+                .order_by(SourceDefinitionRecord.name)
+            ).all()
+    finally:
+        engine.dispose()
+
+    assert persisted_status == "partial"
+    assert persisted_results == [
+        ("Google AI", "failed", "invalid_feed"),
+        ("Hugging Face Blog", "succeeded", None),
+    ]
+
+
 @pytest.fixture
 def collection_database_url() -> str:
     server = Pg0(name=f"ai_intel_feed_collection_{uuid4().hex}")
@@ -270,6 +384,79 @@ def collection_database_url() -> str:
         yield server.uri
     finally:
         server.drop()
+
+
+@pytest.mark.postgres
+def test_child_insert_locks_running_run_until_the_child_commits(
+    collection_database_url: str,
+) -> None:
+    source_definitions = load_sample_feed_source_definitions()
+    collect_feed_source_definitions(
+        collection_database_url,
+        source_definitions=source_definitions,
+        fetcher=SampleFeedFetcher(),
+        clock=FixedClock(),
+    )
+    running_run_id = uuid4()
+    google_ai = source_definitions[0]
+    engine = create_database_engine(collection_database_url)
+    child_connection = engine.connect()
+    child_transaction = None
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                insert(CollectionRunRecord).values(
+                    id=running_run_id,
+                    retry_of_run_id=None,
+                    status="running",
+                    started_at=FIXED_NOW,
+                    completed_at=None,
+                )
+            )
+
+        child_transaction = child_connection.begin()
+        child_connection.execute(
+            insert(SourceDefinitionCollectionResultRecord).values(
+                collection_run_id=running_run_id,
+                source_definition_id=google_ai.id,
+                status="succeeded",
+                candidate_count=0,
+                error_code=None,
+                error_message=None,
+            )
+        )
+
+        completion_was_blocked = False
+        with engine.connect() as completion_connection:
+            completion_transaction = completion_connection.begin()
+            try:
+                completion_connection.execute(text("SET LOCAL lock_timeout = '250ms'"))
+                completion_connection.execute(
+                    update(CollectionRunRecord)
+                    .where(CollectionRunRecord.id == running_run_id)
+                    .values(status="complete", completed_at=FIXED_NOW)
+                )
+            except OperationalError as error:
+                assert getattr(error.orig, "sqlstate", None) == "55P03"
+                completion_was_blocked = True
+            finally:
+                completion_transaction.rollback()
+
+        child_transaction.commit()
+        child_transaction = None
+        assert completion_was_blocked
+
+        with engine.begin() as connection:
+            connection.execute(
+                update(CollectionRunRecord)
+                .where(CollectionRunRecord.id == running_run_id)
+                .values(status="complete", completed_at=FIXED_NOW)
+            )
+    finally:
+        if child_transaction is not None:
+            child_transaction.rollback()
+        child_connection.close()
+        engine.dispose()
 
 
 @pytest.mark.postgres
@@ -346,10 +533,52 @@ def test_sample_collection_cli_persists_rss_and_atom_while_failure_stays_partial
                     DocumentVersionRecord.candidate_id == CandidateRecord.id,
                 )
             ).all()
+            google_source_definition_id = session.scalar(
+                select(SourceDefinitionRecord.id).where(
+                    SourceDefinitionRecord.name == "Google AI"
+                )
+            )
+            google_operating_policy = session.execute(
+                select(
+                    SourceDefinitionRecord.collection_schedule,
+                    SourceDefinitionRecord.discovery_method,
+                    SourceDefinitionRecord.topic_scope,
+                    SourceDefinitionRecord.canonical_url_prefixes,
+                ).where(SourceDefinitionRecord.name == "Google AI")
+            ).one()
+            document_identities = {
+                canonical_url: (candidate_id, document_version_id)
+                for canonical_url, candidate_id, document_version_id in session.execute(
+                    select(
+                        CandidateRecord.canonical_url,
+                        CandidateRecord.id,
+                        DocumentVersionRecord.id,
+                    ).join(
+                        DocumentVersionRecord,
+                        DocumentVersionRecord.candidate_id == CandidateRecord.id,
+                    )
+                )
+            }
     finally:
         engine.dispose()
 
     assert first_run_id is not None
+    assert google_source_definition_id is not None
+    assert google_operating_policy == (
+        "06:00 and 18:00 Asia/Shanghai",
+        (
+            "Official RSS filtered to "
+            "https://blog.google/innovation-and-ai/technology/ai/."
+        ),
+        [
+            "Models",
+            "Research",
+            "Products and Tools",
+            "Applications",
+            "Policy and Safety",
+        ],
+        ["https://blog.google/innovation-and-ai/technology/ai/"],
+    )
     assert len(runs) == 2
     assert runs[0] == (first_run_id, None, "partial")
     assert runs[1].retry_of_run_id == first_run_id
@@ -369,7 +598,7 @@ def test_sample_collection_cli_persists_rss_and_atom_while_failure_stays_partial
     }
     assert set(persisted_documents) == {
         (
-            "https://example.com/ai/gemini-agent-traces",
+            "https://blog.google/innovation-and-ai/technology/ai/gemini-agent-traces/",
             "Google",
             "https://blog.google/rss/",
             "Gemini agents add reproducible task traces",
@@ -402,6 +631,49 @@ def test_sample_collection_cli_persists_rss_and_atom_while_failure_stays_partial
                 update(CollectionRunRecord)
                 .where(CollectionRunRecord.id == first_run_id)
                 .values(status="complete")
+            )
+
+        hugging_face_candidate_id, hugging_face_document_version_id = (
+            document_identities["https://example.com/ai/open-model-evaluation"]
+        )
+        with Session(immutability_engine) as session, pytest.raises(
+            ProgrammingError,
+            match="Collection Run result is immutable",
+        ):
+            session.add(
+                SourceDefinitionCollectionResultRecord(
+                    collection_run_id=first_run_id,
+                    source_definition_id=google_source_definition_id,
+                    status="succeeded",
+                    candidate_count=0,
+                    error_code=None,
+                    error_message=None,
+                )
+            )
+            session.flush()
+
+        with Session(immutability_engine) as session, pytest.raises(
+            ProgrammingError,
+            match="Collection Run discovery is immutable",
+        ):
+            session.add(
+                CollectionDiscoveryRecord(
+                    collection_run_id=first_run_id,
+                    source_definition_id=google_source_definition_id,
+                    candidate_id=hugging_face_candidate_id,
+                    document_version_id=hugging_face_document_version_id,
+                )
+            )
+            session.flush()
+
+        with Session(immutability_engine) as session, pytest.raises(
+            ProgrammingError,
+            match="Document Version is immutable",
+        ):
+            session.execute(
+                update(DocumentVersionRecord)
+                .where(DocumentVersionRecord.id == hugging_face_document_version_id)
+                .values(title="silently rewritten")
             )
     finally:
         immutability_engine.dispose()

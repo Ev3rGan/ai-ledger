@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import posixpath
 from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Protocol
+from urllib.parse import unquote, urlparse
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from ai_intel_agent.domain import (
@@ -20,6 +22,7 @@ from ai_intel_agent.feed_acquisition import (
     FeedAcquisitionError,
     FeedEntry,
     FeedFetcher,
+    FeedFormatError,
     load_approved_feed_source_definitions,
     parse_feed,
 )
@@ -72,6 +75,16 @@ def collect_feed_source_definitions(
     for source_definition in source_definitions:
         try:
             entries = parse_feed(fetcher.fetch(source_definition))
+            in_scope_entries = tuple(
+                entry
+                for entry in entries
+                if _canonical_url_is_in_scope(source_definition, entry.canonical_url)
+            )
+            definition_discoveries = _build_discoveries(
+                source_definition,
+                in_scope_entries,
+                observed_at=clock.now(),
+            )
         except FeedAcquisitionError as error:
             results.append(
                 SourceDefinitionCollectionResult(
@@ -84,11 +97,6 @@ def collect_feed_source_definitions(
             )
             continue
 
-        definition_discoveries = _build_discoveries(
-            source_definition,
-            entries,
-            observed_at=clock.now(),
-        )
         discoveries.extend(definition_discoveries)
         results.append(
             SourceDefinitionCollectionResult(
@@ -129,6 +137,32 @@ def collect_feed_source_definitions(
     finally:
         engine.dispose()
     return run
+
+
+def _canonical_url_is_in_scope(
+    source_definition: ApprovedFeedSourceDefinition,
+    canonical_url: str,
+) -> bool:
+    if not source_definition.canonical_url_prefixes:
+        return True
+    try:
+        candidate = urlparse(canonical_url)
+        candidate_hostname = candidate.hostname
+        candidate_port = candidate.port
+        candidate_path = posixpath.normpath(unquote(candidate.path))
+        for prefix in source_definition.canonical_url_prefixes:
+            allowed = urlparse(prefix)
+            allowed_path = posixpath.normpath(unquote(allowed.path)).rstrip("/") + "/"
+            if (
+                candidate.scheme.casefold() == allowed.scheme.casefold()
+                and candidate_hostname == allowed.hostname
+                and candidate_port == allowed.port
+                and candidate_path.startswith(allowed_path)
+            ):
+                return True
+    except ValueError as error:
+        raise FeedFormatError("Feed entry has an invalid canonical HTTP URL") from error
+    return False
 
 
 def _build_discoveries(

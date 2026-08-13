@@ -5,14 +5,21 @@
     <link>https://blog.google/technology/ai/</link>
     <description>Google AI updates</description>
     <item>
-      <guid isPermaLink="true">https://example.com/ai/gemini-agent-traces</guid>
+      <guid isPermaLink="true">https://blog.google/innovation-and-ai/technology/ai/gemini-agent-traces/</guid>
       <title>Gemini agents add reproducible task traces</title>
-      <link>https://example.com/ai/gemini-agent-traces</link>
+      <link>https://blog.google/innovation-and-ai/technology/ai/gemini-agent-traces/</link>
       <pubDate>Wed, 12 Aug 2026 02:00:00 GMT</pubDate>
       <description><![CDATA[
         <p>Gemini agents now attach <strong>reproducible task traces</strong> to results.</p>
         <script>untrusted-script-must-not-survive</script>
       ]]></description>
+    </item>
+    <item>
+      <guid isPermaLink="true">https://blog.google/products/search/unrelated-release/</guid>
+      <title>An unrelated Google product release</title>
+      <link>https://blog.google/products/search/unrelated-release/</link>
+      <pubDate>Wed, 12 Aug 2026 02:30:00 GMT</pubDate>
+      <description>This entry is outside the approved Google AI section.</description>
     </item>
   </channel>
 </rss>
