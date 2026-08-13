@@ -13,6 +13,7 @@ from typer.testing import CliRunner
 from ai_intel_agent import cli
 from ai_intel_agent.runtime_benchmark import (
     HttpRuntimeProbeClient,
+    PricingObservation,
     RuntimeBenchmarkConfigurationError,
     compare_hong_kong_runtime_results,
     load_runtime_benchmark_configuration,
@@ -63,6 +64,21 @@ def _workload_transport(request: httpx.Request) -> httpx.Response:
                 "database_dump_ms": 40,
                 "database_restore_ms": 55,
                 "database_rows_restored": 10000,
+                "pressure_mode": "concurrent-web-worker-database",
+                "node_identity": {
+                    "candidate_identifier": (
+                        "tencent-lighthouse-hk"
+                        if request.url.host == "benchmark.example"
+                        else request.url.host.removesuffix(".example")
+                    ),
+                    "region": {
+                        "benchmark": "ap-hongkong",
+                        "tencent-lighthouse-hk": "ap-hongkong",
+                        "aws-lightsail-hk": "ap-east-1",
+                        "alibaba-swas-hk": "cn-hongkong",
+                    }[request.url.host.removesuffix(".example")],
+                    "node_id": f"node-{request.url.host}",
+                },
             },
         )
     raise AssertionError(f"unexpected workload request: {request.url}")
@@ -79,9 +95,11 @@ def test_probe_records_every_fixed_dimension_without_model_credentials(
             candidate_identifier="tencent-lighthouse-hk",
             target_url="https://benchmark.example",
             observer="fixed-mainland-observer",
-            monthly_cost_usd=Decimal("13.20"),
-            price_observed_at=date(2026, 8, 13),
-            price_source="https://cloud.tencent.com/document/product/1207/73452/",
+            pricing=PricingObservation(
+                monthly_cost_usd=Decimal("13.20"),
+                observed_at=date(2026, 8, 13),
+                source="https://cloud.tencent.com/document/product/1207/73452/",
+            ),
             workload_image_sha256="a" * 64,
             database_image_sha256="b" * 64,
             client=HttpRuntimeProbeClient(
@@ -139,9 +157,11 @@ def _write_candidate_result(
             candidate_identifier=candidate_identifier,
             target_url=f"https://{candidate_identifier}.example",
             observer="fixed-mainland-observer",
-            monthly_cost_usd=Decimal(monthly_cost),
-            price_observed_at=date(2026, 8, 13),
-            price_source=configuration.candidate(candidate_identifier).pricing_sources[0],
+            pricing=PricingObservation(
+                monthly_cost_usd=Decimal(monthly_cost),
+                observed_at=date(2026, 8, 13),
+                source=configuration.candidate(candidate_identifier).pricing_sources[0],
+            ),
             workload_image_sha256="a" * 64,
             database_image_sha256="b" * 64,
             client=HttpRuntimeProbeClient(
@@ -248,6 +268,9 @@ def test_compare_rejects_substituted_probes_nodes_windows_and_stale_prices(
     inputs[1] = _write_candidate_result(tmp_path, "aws-lightsail-hk", "24.00", 120)
     late = json.loads(inputs[2].read_text(encoding="utf-8"))
     late["run_at"] = "2026-08-14T08:00:00+00:00"
+    next(
+        item for item in late["measurements"] if item["category"] == "cost"
+    )["price_age_days"] = 1
     inputs[2].write_text(
         json.dumps(late, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -266,6 +289,17 @@ def test_compare_rejects_substituted_probes_nodes_windows_and_stale_prices(
             now=lambda: datetime(2026, 9, 20, tzinfo=UTC),
         )
 
+    contradictory = json.loads(inputs[0].read_text(encoding="utf-8"))
+    cost = next(
+        item for item in contradictory["measurements"] if item["category"] == "cost"
+    )
+    cost["monthly_cost_usd"] = "0.01"
+    inputs[0].write_text(
+        json.dumps(contradictory, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    with pytest.raises(RuntimeBenchmarkConfigurationError, match="contradicts"):
+        compare_hong_kong_runtime_results(inputs, tmp_path / "contradictory-cost.md")
+
 
 def test_probe_requires_candidate_official_price_evidence(tmp_path: Path) -> None:
     configuration = load_runtime_benchmark_configuration()
@@ -281,9 +315,11 @@ def test_probe_requires_candidate_official_price_evidence(tmp_path: Path) -> Non
                 candidate_identifier="tencent-lighthouse-hk",
                 target_url="https://benchmark.example",
                 observer="fixed-mainland-observer",
-                monthly_cost_usd=Decimal("13.20"),
-                price_observed_at=date(2026, 8, 13),
-                price_source="https://example.com/pricing",
+                pricing=PricingObservation(
+                    monthly_cost_usd=Decimal("13.20"),
+                    observed_at=date(2026, 8, 13),
+                    source="https://example.com/pricing",
+                ),
                 workload_image_sha256="a" * 64,
                 database_image_sha256="b" * 64,
                 client=client,
@@ -384,6 +420,11 @@ def test_representative_workload_http_boundary_is_fixed_and_token_protected() ->
             "database_restore_ms": 55,
             "database_rows_restored": 10000,
         },
+        node_identity_probe=lambda: {
+            "candidate_identifier": "tencent-lighthouse-hk",
+            "region": "ap-hongkong",
+            "node_id": "lhins-test",
+        },
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -415,6 +456,12 @@ def test_representative_workload_http_boundary_is_fixed_and_token_protected() ->
         assert resource_payload["database_dump_ms"] == 40
         assert resource_payload["database_restore_ms"] == 55
         assert resource_payload["database_rows_restored"] == 10000
+        assert resource_payload["pressure_mode"] == "concurrent-web-worker-database"
+        assert resource_payload["node_identity"] == {
+            "candidate_identifier": "tencent-lighthouse-hk",
+            "region": "ap-hongkong",
+            "node_id": "lhins-test",
+        }
         assert unknown.status_code == 404
     finally:
         server.shutdown()

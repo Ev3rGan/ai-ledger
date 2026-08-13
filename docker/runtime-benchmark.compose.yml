@@ -10,8 +10,8 @@ services:
       interval: 2s
       timeout: 2s
       retries: 15
-    tmpfs:
-      - /var/lib/postgresql/data:size=768m
+    volumes:
+      - runtime-benchmark-postgres:/var/lib/postgresql/data
 
   workload:
     image: ai-ledger-runtime-benchmark:2026-08-13-v1
@@ -23,6 +23,10 @@ services:
         condition: service_healthy
     environment:
       RUNTIME_BENCHMARK_TOKEN: ${RUNTIME_BENCHMARK_TOKEN:?required}
+      RUNTIME_BENCHMARK_CANDIDATE: ${RUNTIME_BENCHMARK_CANDIDATE:?required}
       RUNTIME_BENCHMARK_DATABASE_URL: postgresql://runtime_benchmark:${RUNTIME_BENCHMARK_DATABASE_PASSWORD}@postgres:5432/runtime_benchmark
     ports:
       - 127.0.0.1:8080:8080
+
+volumes:
+  runtime-benchmark-postgres:

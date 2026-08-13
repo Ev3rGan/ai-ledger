@@ -30,6 +30,7 @@ class RuntimeCandidate:
     identifier: str
     provider: str
     region: str
+    metadata_region: str
     minimum_vcpus: int
     minimum_memory_gib: int
     pricing_sources: tuple[str, ...]
@@ -106,6 +107,7 @@ def load_runtime_benchmark_configuration(
                 identifier=item["identifier"],
                 provider=item["provider"],
                 region=item["region"],
+                metadata_region=item["metadata_region"],
                 minimum_vcpus=int(item["minimum_vcpus"]),
                 minimum_memory_gib=int(item["minimum_memory_gib"]),
                 pricing_sources=tuple(item["pricing_sources"]),
@@ -318,6 +320,11 @@ class HttpRuntimeProbeClient:
                 and float(payload["database_dump_ms"]) > 0
                 and float(payload["database_restore_ms"]) > 0
                 and int(payload["database_rows_restored"]) == 10000
+                and payload["pressure_mode"] == "concurrent-web-worker-database"
+                and payload["node_identity"]["candidate_identifier"]
+                == candidate.identifier
+                and payload["node_identity"]["region"] == candidate.metadata_region
+                and bool(payload["node_identity"]["node_id"])
             )
             return {
                 "category": "resource",
@@ -334,6 +341,14 @@ class HttpRuntimeProbeClient:
                 "database_dump_ms": float(payload["database_dump_ms"]),
                 "database_restore_ms": float(payload["database_restore_ms"]),
                 "database_rows_restored": int(payload["database_rows_restored"]),
+                "pressure_mode": str(payload["pressure_mode"]),
+                "node_identity": {
+                    "candidate_identifier": str(
+                        payload["node_identity"]["candidate_identifier"]
+                    ),
+                    "region": str(payload["node_identity"]["region"]),
+                    "node_id": str(payload["node_identity"]["node_id"]),
+                },
                 "error": None if passed else "candidate does not satisfy the fixed resource gate",
             }
         except (httpx.HTTPError, KeyError, TypeError, ValueError) as error:
@@ -353,9 +368,7 @@ def run_hong_kong_runtime_probe(
     candidate_identifier: str,
     target_url: str,
     observer: str,
-    monthly_cost_usd: Decimal,
-    price_observed_at: date,
-    price_source: str,
+    pricing: PricingObservation,
     workload_image_sha256: str,
     database_image_sha256: str,
     client: HttpRuntimeProbeClient,
@@ -377,7 +390,6 @@ def run_hong_kong_runtime_probe(
     normalized_database_image_sha256 = _normalize_image_sha256(
         database_image_sha256, "database"
     )
-    pricing = PricingObservation(monthly_cost_usd, price_observed_at, price_source)
     pricing_age_days = pricing.validate(
         candidate=candidate,
         observed_by=run_at,
@@ -510,6 +522,14 @@ def _require_complete_result(
     try:
         run_at = datetime.fromisoformat(str(result["run_at"])).astimezone(UTC)
         candidate_identifier = str(result["candidate"]["identifier"])
+        candidate = configuration.candidate(candidate_identifier)
+        if (
+            result["candidate"]["provider"] != candidate.provider
+            or result["candidate"]["region"] != candidate.region
+        ):
+            raise RuntimeBenchmarkConfigurationError(
+                "runtime result candidate metadata does not match the protocol"
+            )
         pricing_payload = result["pricing"]
         pricing = PricingObservation(
             monthly_cost_usd=Decimal(str(pricing_payload["monthly_cost_usd"])),
@@ -523,16 +543,30 @@ def _require_complete_result(
     if run_at > comparison_at:
         raise RuntimeBenchmarkConfigurationError("runtime result was captured in the future")
     pricing.validate(
-        candidate=configuration.candidate(candidate_identifier),
+        candidate=candidate,
         observed_by=run_at,
         configuration=configuration,
     )
     pricing_age_days = pricing.validate(
-        candidate=configuration.candidate(candidate_identifier),
+        candidate=candidate,
         observed_by=comparison_at,
         configuration=configuration,
     )
     cost = _measurements_for(result, "cost")[0]
+    try:
+        measured_cost = Decimal(str(cost["monthly_cost_usd"]))
+        measured_price_age_days = int(cost["price_age_days"])
+    except (KeyError, ValueError, InvalidOperation) as error:
+        raise RuntimeBenchmarkConfigurationError(
+            "runtime result cost measurement is invalid"
+        ) from error
+    if (
+        measured_cost != pricing.monthly_cost_usd
+        or measured_price_age_days != (run_at.date() - pricing.observed_at).days
+    ):
+        raise RuntimeBenchmarkConfigurationError(
+            "runtime result cost measurement contradicts its pricing evidence"
+        )
     cost_should_pass = (
         pricing.monthly_cost_usd <= configuration.maximum_monthly_cost_usd
         and pricing_age_days <= configuration.maximum_pricing_age_days
@@ -540,6 +574,22 @@ def _require_complete_result(
     if bool(cost.get("passed")) != cost_should_pass:
         raise RuntimeBenchmarkConfigurationError(
             "runtime result cost gate does not match current price evidence"
+        )
+    resource = _measurements_for(result, "resource")[0]
+    try:
+        node_identity = resource["node_identity"]
+        identity_matches = (
+            node_identity["candidate_identifier"] == candidate.identifier
+            and node_identity["region"] == candidate.metadata_region
+            and bool(node_identity["node_id"])
+        )
+    except (KeyError, TypeError) as error:
+        raise RuntimeBenchmarkConfigurationError(
+            "runtime result has invalid provider node identity evidence"
+        ) from error
+    if not identity_matches:
+        raise RuntimeBenchmarkConfigurationError(
+            "runtime result provider node identity does not match its candidate"
         )
     return run_at
 
@@ -597,6 +647,14 @@ def compare_hong_kong_runtime_results(
         raise RuntimeBenchmarkConfigurationError(
             "comparison results must come from distinct candidate target origins"
         )
+    node_ids = {
+        str(_measurements_for(result, "resource")[0]["node_identity"]["node_id"])
+        for result in results
+    }
+    if len(node_ids) != len(results):
+        raise RuntimeBenchmarkConfigurationError(
+            "comparison results must come from distinct provider node identities"
+        )
     observation_window_hours = (
         max(run_times) - min(run_times)
     ).total_seconds() / 3600
@@ -623,7 +681,6 @@ def compare_hong_kong_runtime_results(
         model = _measurements_for(result, "model API")
         oauth = _measurements_for(result, "OAuth")
         resource = _measurements_for(result, "resource")[0]
-        cost = _measurements_for(result, "cost")[0]
         all_measurements = result["measurements"]
         summary = {
             "identifier": result["candidate"]["identifier"],
@@ -660,7 +717,11 @@ def compare_hong_kong_runtime_results(
             "disk_read_mib_per_second": resource.get("disk_read_mib_per_second"),
             "database_restore_ms": resource.get("database_restore_ms"),
             "database_rows_restored": resource.get("database_rows_restored"),
-            "monthly_cost_usd": Decimal(str(cost["monthly_cost_usd"])),
+            "metadata_region": resource["node_identity"]["region"],
+            "node_id": resource["node_identity"]["node_id"],
+            "monthly_cost_usd": Decimal(
+                str(result["pricing"]["monthly_cost_usd"])
+            ),
             "pricing": result["pricing"],
             "evidence_path": result["_evidence_path"],
             "target_origin": result["target_origin"],
@@ -759,7 +820,8 @@ def compare_hong_kong_runtime_results(
         lines.append(
             f"- `{item['identifier']}`: target `{item['target_origin']}`; artifact "
             f"`{item['evidence_path']}`; price observed {pricing['observed_at']} from "
-            f"[{pricing['source']}]({pricing['source']})."
+            f"[{pricing['source']}]({pricing['source']}); provider metadata "
+            f"`{item['metadata_region']}/{item['node_id']}`."
         )
 
     output.parent.mkdir(parents=True, exist_ok=True)

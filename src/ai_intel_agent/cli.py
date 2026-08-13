@@ -26,6 +26,7 @@ from ai_intel_agent.persistence import database_url_from_environment
 from ai_intel_agent.pipeline import persist_sample_story
 from ai_intel_agent.runtime_benchmark import (
     HttpRuntimeProbeClient,
+    PricingObservation,
     RuntimeBenchmarkConfigurationError,
     compare_hong_kong_runtime_results,
     load_runtime_benchmark_configuration,
@@ -212,8 +213,11 @@ def probe_hong_kong_runtime(
 ) -> None:
     """Capture the fixed probe set for one Hong Kong candidate."""
     try:
-        cost = Decimal(monthly_cost_usd)
-        observed_at = date.fromisoformat(price_observed_at)
+        pricing = PricingObservation(
+            monthly_cost_usd=Decimal(monthly_cost_usd),
+            observed_at=date.fromisoformat(price_observed_at),
+            source=price_source,
+        )
         configuration = load_runtime_benchmark_configuration()
         load_dotenv()
         workload_token = os.environ.get("RUNTIME_BENCHMARK_TOKEN", "")
@@ -232,9 +236,7 @@ def probe_hong_kong_runtime(
                 candidate_identifier=candidate,
                 target_url=target_url,
                 observer=observer,
-                monthly_cost_usd=cost,
-                price_observed_at=observed_at,
-                price_source=price_source,
+                pricing=pricing,
                 workload_image_sha256=workload_image_sha256,
                 database_image_sha256=database_image_sha256,
                 client=client,

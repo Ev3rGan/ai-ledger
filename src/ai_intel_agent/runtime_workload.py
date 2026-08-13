@@ -9,13 +9,14 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlsplit, urlunsplit
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 WORKLOAD_VERSION = "hong-kong-runtime-workload-2026-08-13.v1"
 USER_AGENT = "ai-ledger-hong-kong-runtime-workload/0.1"
@@ -24,6 +25,11 @@ SSE_INTERVAL_SECONDS = 0.05
 CPU_ITERATIONS = 100_000
 DISK_PROBE_MIB = 16
 MEMORY_PROBE_MIB = 128
+HONG_KONG_METADATA_REGIONS = {
+    "tencent-lighthouse-hk": "ap-hongkong",
+    "aws-lightsail-hk": "ap-east-1",
+    "alibaba-swas-hk": "cn-hongkong",
+}
 
 
 @dataclass(frozen=True)
@@ -251,6 +257,80 @@ def run_database_restore_probe(database_url: str) -> dict[str, int | float]:
         raise OSError("PostgreSQL dump/restore probe failed") from error
 
 
+def _metadata_request(
+    url: str,
+    *,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+) -> str:
+    opener = build_opener(ProxyHandler({}))
+    request = Request(url, method=method, headers=headers or {})
+    try:
+        with opener.open(request, timeout=2) as response:
+            return response.read(64_000).decode("utf-8").strip()
+    except (HTTPError, URLError, TimeoutError, OSError) as error:
+        raise OSError("cloud instance metadata is unavailable") from error
+
+
+def _metadata_json(url: str, *, headers: dict[str, str]) -> dict[str, object]:
+    try:
+        payload = json.loads(_metadata_request(url, headers=headers))
+    except (json.JSONDecodeError, TypeError) as error:
+        raise OSError("cloud instance identity document is invalid") from error
+    if not isinstance(payload, dict):
+        raise OSError("cloud instance identity document is invalid")
+    return payload
+
+
+def run_node_identity_probe(candidate_identifier: str) -> dict[str, str]:
+    if candidate_identifier == "tencent-lighthouse-hk":
+        base = "http://metadata.tencentyun.com/latest/meta-data"
+        node_id = _metadata_request(f"{base}/instance-id")
+        region = _metadata_request(f"{base}/placement/region")
+    elif candidate_identifier == "aws-lightsail-hk":
+        base = "http://169.254.169.254/latest"
+        token = _metadata_request(
+            f"{base}/api/token",
+            method="PUT",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"},
+        )
+        document = _metadata_json(
+            f"{base}/dynamic/instance-identity/document",
+            headers={"X-aws-ec2-metadata-token": token},
+        )
+        try:
+            node_id = str(document["instanceId"])
+            region = str(document["region"])
+        except KeyError as error:
+            raise OSError("AWS instance identity document is incomplete") from error
+    elif candidate_identifier == "alibaba-swas-hk":
+        base = "http://100.100.100.200/latest"
+        token = _metadata_request(
+            f"{base}/api/token",
+            method="PUT",
+            headers={"X-aliyun-ecs-metadata-token-ttl-seconds": "60"},
+        )
+        document = _metadata_json(
+            f"{base}/dynamic/instance-identity/document",
+            headers={"X-aliyun-ecs-metadata-token": token},
+        )
+        try:
+            node_id = str(document["instance-id"])
+            region = str(document["region-id"])
+        except KeyError as error:
+            raise OSError("Alibaba instance identity document is incomplete") from error
+    else:
+        raise OSError("unknown configured runtime candidate")
+
+    if region != HONG_KONG_METADATA_REGIONS[candidate_identifier] or not node_id:
+        raise OSError("node metadata does not identify the configured Hong Kong region")
+    return {
+        "candidate_identifier": candidate_identifier,
+        "region": region,
+        "node_id": node_id,
+    }
+
+
 def run_egress_probe(identifier: str) -> tuple[int, dict[str, object]]:
     target = EGRESS_TARGETS.get(identifier)
     if target is None:
@@ -296,6 +376,10 @@ class RuntimeWorkloadHandler(BaseHTTPRequestHandler):
     def database_probe(self) -> Callable[[], dict[str, int | float]]:
         return self.server.database_probe  # type: ignore[attr-defined]
 
+    @property
+    def node_identity_probe(self) -> Callable[[], dict[str, str]]:
+        return self.server.node_identity_probe  # type: ignore[attr-defined]
+
     def log_message(self, format: str, *args: object) -> None:
         return
 
@@ -339,8 +423,13 @@ class RuntimeWorkloadHandler(BaseHTTPRequestHandler):
             return
         if path == "/resource":
             try:
-                payload = run_resource_probe()
-                payload.update(self.database_probe())
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    resource_future = executor.submit(run_resource_probe)
+                    database_future = executor.submit(self.database_probe)
+                    payload = resource_future.result()
+                    payload.update(database_future.result())
+                payload["pressure_mode"] = "concurrent-web-worker-database"
+                payload["node_identity"] = self.node_identity_probe()
             except OSError as error:
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -359,6 +448,7 @@ class RuntimeWorkloadHandler(BaseHTTPRequestHandler):
 class RuntimeWorkloadServer(ThreadingHTTPServer):
     benchmark_token: str
     database_probe: Callable[[], dict[str, int | float]]
+    node_identity_probe: Callable[[], dict[str, str]]
 
 
 def create_runtime_workload_server(
@@ -367,6 +457,7 @@ def create_runtime_workload_server(
     *,
     token: str,
     database_probe: Callable[[], dict[str, int | float]] | None = None,
+    node_identity_probe: Callable[[], dict[str, str]] | None = None,
 ) -> RuntimeWorkloadServer:
     if not token:
         raise ValueError("runtime benchmark token is required")
@@ -378,6 +469,13 @@ def create_runtime_workload_server(
         raise ValueError("RUNTIME_BENCHMARK_DATABASE_URL is required")
     server.database_probe = database_probe or (
         lambda: run_database_restore_probe(database_url)
+    )
+    candidate_identifier = os.environ.get("RUNTIME_BENCHMARK_CANDIDATE", "")
+    if node_identity_probe is None and candidate_identifier not in HONG_KONG_METADATA_REGIONS:
+        server.server_close()
+        raise ValueError("RUNTIME_BENCHMARK_CANDIDATE is required")
+    server.node_identity_probe = node_identity_probe or (
+        lambda: run_node_identity_probe(candidate_identifier)
     )
     return server
 

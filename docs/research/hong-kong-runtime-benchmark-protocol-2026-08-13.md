@@ -22,6 +22,8 @@ window.
 - Resource: one fixed 100,000-round SHA-256 loop, a touched 128 MiB allocation, a synced
   16 MiB write/read, and a 10,000-row PostgreSQL logical dump/drop/restore verification inside
   the representative Web/worker/database stack.
+- Node identity: fixed provider metadata endpoints must identify the expected Hong Kong region
+  and a distinct instance ID for each candidate. Caller-provided provider labels are insufficient.
 - Cost: a dated USD-normalized price observation with an official source. It expires after the
   configured evidence window and is not a permanent fact.
 
@@ -64,6 +66,7 @@ Terminate TLS in front of port 8080 and expose only the fixed observer to the wo
 ```bash
 export RUNTIME_BENCHMARK_TOKEN='<temporary-random-token>'
 export RUNTIME_BENCHMARK_DATABASE_PASSWORD='<temporary-random-password>'
+export RUNTIME_BENCHMARK_CANDIDATE='tencent-lighthouse-hk'
 
 docker compose --file docker/runtime-benchmark.compose.yml up --detach --no-build
 ```
@@ -94,6 +97,14 @@ uv run ai-intel-agent benchmark-runtime probe `
 ```
 
 Repeat with the candidate identifiers, URLs, and current price evidence for AWS and Alibaba.
+Set `RUNTIME_BENCHMARK_CANDIDATE` to the same candidate identifier on its node. The workload
+queries AWS IMDSv2, Tencent instance metadata, or Alibaba security-hardened instance metadata
+and fails unless it observes `ap-east-1`, `ap-hongkong`, or `cn-hongkong`, respectively.
+Use the providers' documented metadata controls: [AWS instance identity](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/retrieve-iid.html),
+[Tencent instance metadata](https://cloud.tencent.com/document/product/213/4934), and
+[Alibaba instance identity](https://www.alibabacloud.com/help/en/ecs/user-guide/use-instance-identities).
+For AWS, allow the containerized workload to receive IMDSv2 responses (for example, an
+appropriate metadata response hop limit) without enabling IMDSv1.
 JSON result artifacts are deployment evidence and should be retained with the generated report.
 
 ## Compare
@@ -120,3 +131,9 @@ workload latency, monthly cost, and stable identifier. No opaque aggregate score
 - The OAuth probe tests endpoint reachability, not callback correctness or administrator access.
 - The model probes test egress only, not model quality, latency, price, or availability under load.
 - This protocol does not run acquisition, Research, production OAuth, or database migrations.
+
+After collecting the result, remove the benchmark stack and its disposable database volume:
+
+```bash
+docker compose --file docker/runtime-benchmark.compose.yml down --volumes
+```

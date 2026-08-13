@@ -12,6 +12,7 @@
       "identifier": "tencent-lighthouse-hk",
       "provider": "Tencent Cloud Lighthouse",
       "region": "China (Hong Kong)",
+      "metadata_region": "ap-hongkong",
       "minimum_vcpus": 2,
       "minimum_memory_gib": 4,
       "pricing_sources": [
@@ -22,6 +23,7 @@
       "identifier": "aws-lightsail-hk",
       "provider": "Amazon Lightsail",
       "region": "Asia Pacific (Hong Kong), ap-east-1",
+      "metadata_region": "ap-east-1",
       "minimum_vcpus": 2,
       "minimum_memory_gib": 4,
       "pricing_sources": [
@@ -32,6 +34,7 @@
       "identifier": "alibaba-swas-hk",
       "provider": "Alibaba Cloud Simple Application Server",
       "region": "China (Hong Kong)",
+      "metadata_region": "cn-hongkong",
       "minimum_vcpus": 2,
       "minimum_memory_gib": 4,
       "pricing_sources": [
