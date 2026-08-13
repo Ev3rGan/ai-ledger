@@ -1,8 +1,8 @@
 # AI Intelligence Agent
 
-The first vertical slice of a traceable AI intelligence application. Its deterministic sample
-workflow persists one Candidate, immutable Document Version, Story, atomic Claim, anchored
-Evidence Span, and Structured Trace in PostgreSQL/pgvector.
+The deterministic sample workflow persists three traceable Stories in PostgreSQL/pgvector. A
+Fake administrator accepts one Story, rejects one, leaves one unreviewed, and publishes one
+stably identified Digest containing only the accepted Story with a complete audit trail.
 
 ## Quick start
 
@@ -21,7 +21,8 @@ uv run ai-intel-agent run --sample
 ```
 
 The sample uses a fixed Asia/Shanghai clock, fixed source data, and deterministic identifiers.
-Running it again leaves exactly one corresponding set of records and writes the same report.
+Running it again leaves one corresponding set of records, one Digest, four audit events, and the
+same report.
 
 Audit the versioned first-wave Source Definitions without network access or production
 credentials:
@@ -94,14 +95,16 @@ Run `benchmark-extraction` separately when a live, credit-consuming benchmark re
 intended. Run `evaluate-model-routes` separately when a live, token-billed model evaluation
 refresh is intended.
 
-The sample slice intentionally does not include Web pages, administrator review, real sources,
-production model-provider integration, or placeholder tables for later work.
+The sample slice intentionally does not include Web pages, RSS, real GitHub OAuth, real sources,
+post-publication revisions, production model-provider integration, or placeholder tables for
+later work.
 
 ## Repository layout
 
 ```text
 src/ai_intel_agent/
   domain.py       # persistence-independent domain records
+  editorial.py    # deterministic Story review and Digest publication workflow
   sample.py       # fixed clock, fake source adapter, and sample data
   persistence.py  # SQLAlchemy mappings and idempotent repository
   pipeline.py     # application operation

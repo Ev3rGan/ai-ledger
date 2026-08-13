@@ -19,7 +19,7 @@ from ai_intel_agent.model_routing_evaluation import (
     run_model_routing_evaluation,
 )
 from ai_intel_agent.persistence import database_url_from_environment
-from ai_intel_agent.pipeline import persist_sample_story
+from ai_intel_agent.pipeline import publish_sample_digest
 from ai_intel_agent.source_audit import run_source_definition_activation_audit
 
 app = typer.Typer(help="Run the deterministic AI intelligence workflow.")
@@ -48,12 +48,12 @@ def run_pipeline(
     except ValueError as error:
         raise typer.BadParameter(str(error)) from error
 
-    sample_story = persist_sample_story(database_url)
+    publication = publish_sample_digest(database_url)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(sample_story.to_markdown(), encoding="utf-8")
+    output.write_text(publication.to_markdown(), encoding="utf-8")
     console.print(
-        "[green]Persisted sample Story:[/] "
-        f"{sample_story.story.id} (Evidence Span {sample_story.evidence_span.id})"
+        "[green]Reviewed sample Stories and published Digest:[/] "
+        f"{publication.digest.id} ({len(publication.digest.story_ids)} accepted Story)"
     )
     console.print(f"[green]Wrote sample report:[/] {output}")
 
