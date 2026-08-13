@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 from typing import Any
 from uuid import UUID
@@ -13,6 +13,29 @@ class EvidenceRole(StrEnum):
     INDEPENDENT = "independent"
     SECONDARY = "secondary"
     COMMUNITY = "community"
+
+
+class StoryReviewState(StrEnum):
+    UNREVIEWED = "unreviewed"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+
+
+class DigestState(StrEnum):
+    DRAFT = "draft"
+    PUBLISHED = "published"
+
+
+class AuditAction(StrEnum):
+    STORY_ACCEPTED = "story.accepted"
+    STORY_REJECTED = "story.rejected"
+    DIGEST_COMPOSED = "digest.composed"
+    DIGEST_PUBLISHED = "digest.published"
+
+
+class AuditSubjectType(StrEnum):
+    STORY = "story"
+    DIGEST = "digest"
 
 
 class Topic(StrEnum):
@@ -53,6 +76,7 @@ class Story:
     stable_key: str
     headline: str
     occurred_at: datetime
+    review_state: StoryReviewState
 
 
 @dataclass(frozen=True)
@@ -85,6 +109,29 @@ class StructuredTrace:
 
 
 @dataclass(frozen=True)
+class Digest:
+    id: UUID
+    stable_key: str
+    publication_date: date
+    state: DigestState
+    published_at: datetime | None
+    story_ids: tuple[UUID, ...]
+
+
+@dataclass(frozen=True)
+class AuditEvent:
+    id: UUID
+    operation_key: str
+    actor_identifier: str
+    action: AuditAction
+    subject_type: AuditSubjectType
+    subject_id: UUID
+    occurred_at: datetime
+    sequence: int
+    attributes: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
 class SampleStory:
     candidate: Candidate
     document_version: DocumentVersion
@@ -102,4 +149,31 @@ class SampleStory:
             f"> {self.evidence_span.exact_text}\n\n"
             f"Source: {self.document_version.source_url}\n\n"
             f"Trace: {self.trace.id} -> Evidence Span {self.evidence_span.id}\n"
+        )
+
+
+@dataclass(frozen=True)
+class SampleDigestPublication:
+    stories: tuple[SampleStory, ...]
+    digest: Digest
+    audit_events: tuple[AuditEvent, ...]
+
+    def to_markdown(self) -> str:
+        stories_by_id = {sample.story.id: sample for sample in self.stories}
+        story_sections = "\n".join(
+            (
+                f"## Story: {stories_by_id[story_id].story.headline}\n\n"
+                f"Claim: {stories_by_id[story_id].claim.text}\n\n"
+                f"> {stories_by_id[story_id].evidence_span.exact_text}\n\n"
+                f"Source: {stories_by_id[story_id].document_version.source_url}\n\n"
+                f"Trace: {stories_by_id[story_id].trace.id} -> Evidence Span "
+                f"{stories_by_id[story_id].evidence_span.id}\n"
+            )
+            for story_id in self.digest.story_ids
+        )
+        return (
+            "# AI Intelligence Sample Digest\n\n"
+            f"Publication date: {self.digest.publication_date.isoformat()}\n\n"
+            f"Digest: {self.digest.id}\n\n"
+            f"{story_sections}"
         )
