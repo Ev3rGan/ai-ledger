@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Google AI</title>
+    <link>https://blog.google/technology/ai/</link>
+    <description>Google AI updates</description>
+    <item>
+      <guid isPermaLink="true">https://example.com/ai/gemini-agent-traces</guid>
+      <title>Gemini agents add reproducible task traces</title>
+      <link>https://example.com/ai/gemini-agent-traces</link>
+      <pubDate>Wed, 12 Aug 2026 02:00:00 GMT</pubDate>
+      <description><![CDATA[
+        <p>Gemini agents now attach <strong>reproducible task traces</strong> to results.</p>
+      ]]></description>
+    </item>
+  </channel>
+</rss>

@@ -168,6 +168,92 @@ class AuditEventRecord(Base):
     attributes: Mapped[dict[str, Any]] = mapped_column(JSON)
 
 
+class SourceDefinitionRecord(Base):
+    __tablename__ = "source_definitions"
+    __table_args__ = (
+        CheckConstraint(
+            "activation_conclusion = 'approved'",
+            name="ck_source_definitions_approved",
+        ),
+        UniqueConstraint("audit_version", "entry_point"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    name: Mapped[str] = mapped_column(String(255))
+    entry_point: Mapped[str] = mapped_column(String(2048))
+    audit_version: Mapped[str] = mapped_column(String(255))
+    activation_conclusion: Mapped[str] = mapped_column(String(32))
+    storage_policy: Mapped[str] = mapped_column(Text)
+
+
+class CollectionRunRecord(Base):
+    __tablename__ = "collection_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('complete', 'partial', 'failed')",
+            name="ck_collection_runs_status",
+        ),
+        CheckConstraint(
+            "completed_at >= started_at",
+            name="ck_collection_runs_time_order",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    retry_of_run_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("collection_runs.id")
+    )
+    status: Mapped[str] = mapped_column(String(32))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class CollectionSourceResultRecord(Base):
+    __tablename__ = "collection_source_results"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('succeeded', 'failed')",
+            name="ck_collection_source_results_status",
+        ),
+        CheckConstraint(
+            "candidate_count >= 0",
+            name="ck_collection_source_results_candidate_count",
+        ),
+        CheckConstraint(
+            "(status = 'succeeded' AND error_code IS NULL AND error_message IS NULL) "
+            "OR (status = 'failed' AND error_code IS NOT NULL "
+            "AND error_message IS NOT NULL)",
+            name="ck_collection_source_results_error_shape",
+        ),
+    )
+
+    collection_run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("collection_runs.id"), primary_key=True
+    )
+    source_definition_id: Mapped[UUID] = mapped_column(
+        ForeignKey("source_definitions.id"), primary_key=True
+    )
+    status: Mapped[str] = mapped_column(String(32))
+    candidate_count: Mapped[int] = mapped_column(Integer)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    error_message: Mapped[str | None] = mapped_column(Text)
+
+
+class CollectionDiscoveryRecord(Base):
+    __tablename__ = "collection_discoveries"
+
+    collection_run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("collection_runs.id"), primary_key=True
+    )
+    source_definition_id: Mapped[UUID] = mapped_column(
+        ForeignKey("source_definitions.id"), primary_key=True
+    )
+    document_version_id: Mapped[UUID] = mapped_column(
+        ForeignKey("document_versions.id"), primary_key=True
+    )
+    candidate_id: Mapped[UUID] = mapped_column(ForeignKey("candidates.id"))
+
+
 def normalize_database_url(database_url: str) -> str:
     if database_url.startswith("postgresql://"):
         return database_url.replace("postgresql://", "postgresql+psycopg://", 1)
