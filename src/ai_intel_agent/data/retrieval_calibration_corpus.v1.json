@@ -1,0 +1,216 @@
+{
+  "schema_version": "retrieval-calibration-corpus.v1",
+  "corpus_version": "retrieval-calibration-2026-08-13.v1",
+  "description": "Synthetic bilingual retrieval fixtures for project-specific CPU calibration; no statement is production news.",
+  "documents": [
+    {
+      "document_version_id": "dv-postgres-hybrid-en-v1",
+      "document_type": "story",
+      "language": "en",
+      "entities": [
+        {"canonical_name": "PostgreSQL", "aliases": ["Postgres"]},
+        {"canonical_name": "pgvector", "aliases": ["pg_vector"]}
+      ],
+      "text": "Calibration fixture, not production news. A small editorial service needs reproducible search without another stateful platform. The design stores accepted Stories, Claims, and immutable source references in one relational system. Operational filters run before ranking so rejected or private material cannot leak into results. The calibration fixture keeps dense vectors in pgvector and lexical terms in PostgreSQL full-text search, then combines their ranked lists deterministically. Exact Entity matches remain a separate signal rather than being hidden inside one similarity score. Retrieved Chunks point back to a single Document Version and can be rebuilt when a profile changes.",
+      "evidence_spans": [
+        {
+          "evidence_span_id": "es-postgres-hybrid",
+          "text": "The calibration fixture keeps dense vectors in pgvector and lexical terms in PostgreSQL full-text search, then combines their ranked lists deterministically."
+        }
+      ]
+    },
+    {
+      "document_version_id": "dv-deepseek-v32-zh-v1",
+      "document_type": "release",
+      "language": "zh",
+      "entities": [
+        {"canonical_name": "DeepSeek-V3.2", "aliases": ["DeepSeek V3.2"]},
+        {"canonical_name": "Mixture of Experts", "aliases": ["MoE", "混合专家"]}
+      ],
+      "text": "这是用于检索校准的合成发布说明，不代表真实产品新闻。版本标识为 DeepSeek-V3.2，不能与 DeepSeek-V3 或其他相近名称混为一谈。文档先说明兼容性边界，再描述推理资源假设与回退路径。该版本采用混合专家路由，每个请求只激活参数总量中的一部分，同时保留明确的版本追踪信息。校准语料故意把关键结论放在较长上下文中，用来检查跨语言查询能否定位对应文档，也用来检查较小 Chunk 是否会切断完整 Evidence Span。任何基准结果都只属于这个固定语料和当前候选组合。",
+      "evidence_spans": [
+        {
+          "evidence_span_id": "es-deepseek-v32-identity",
+          "text": "版本标识为 DeepSeek-V3.2，不能与 DeepSeek-V3 或其他相近名称混为一谈。"
+        },
+        {
+          "evidence_span_id": "es-deepseek-moe",
+          "text": "该版本采用混合专家路由，每个请求只激活参数总量中的一部分，同时保留明确的版本追踪信息。"
+        }
+      ]
+    },
+    {
+      "document_version_id": "dv-mcp-2025-06-18-en-v1",
+      "document_type": "documentation",
+      "language": "en",
+      "entities": [
+        {"canonical_name": "MCP 2025-06-18", "aliases": ["Model Context Protocol 2025-06-18"]},
+        {"canonical_name": "OAuth", "aliases": ["OAuth 2.1"]}
+      ],
+      "text": "Synthetic protocol fixture for retrieval calibration. MCP 2025-06-18 is the exact revision label used by this case; older and newer labels are deliberate distractors. The surrounding material describes capability negotiation, tool metadata, and transport-independent error handling. In this fixture, clients validate the resource indicator before sending an OAuth token to a protected resource, preventing a token intended for one audience from being reused elsewhere. The sentence is intentionally surrounded by related security terms so exact technical-entity retrieval and semantic retrieval can be measured independently. The fixture does not claim to replace the normative protocol text.",
+      "evidence_spans": [
+        {
+          "evidence_span_id": "es-mcp-revision-identity",
+          "text": "MCP 2025-06-18 is the exact revision label used by this case; older and newer labels are deliberate distractors."
+        },
+        {
+          "evidence_span_id": "es-mcp-resource-indicator",
+          "text": "In this fixture, clients validate the resource indicator before sending an OAuth token to a protected resource, preventing a token intended for one audience from being reused elsewhere."
+        }
+      ]
+    },
+    {
+      "document_version_id": "dv-chunk-evidence-zh-v1",
+      "document_type": "paper",
+      "language": "zh",
+      "entities": [
+        {"canonical_name": "Evidence Span", "aliases": ["证据片段"]},
+        {"canonical_name": "Document Version", "aliases": ["文档版本"]},
+        {"canonical_name": "Chunk", "aliases": ["检索块"]}
+      ],
+      "text": "这是合成的检索评测论文片段。实验把文档按类型切分，并记录每个窗口在不可变文档版本中的起止位置。窗口可以重建，窗口边界也会随着 Retrieval Profile 改变，因此不能把窗口本身当作永久出处。检索 Chunk 只是定位潜在相关材料的可重建窗口，只有与不可变 Document Version 中精确原文和偏移绑定的 Evidence Span 才能支持 Claim。评测同时记录查询召回、证据覆盖和延迟，避免只看一个聚合排名分数。较长窗口可能提升完整证据覆盖，但也会增加编码和重排成本；较短窗口可能更精确，却更容易把完整证据句切开。所有临时数值都保留在版本化配置中。",
+      "evidence_spans": [
+        {
+          "evidence_span_id": "es-chunk-is-not-evidence",
+          "text": "检索 Chunk 只是定位潜在相关材料的可重建窗口，只有与不可变 Document Version 中精确原文和偏移绑定的 Evidence Span 才能支持 Claim。"
+        }
+      ]
+    },
+    {
+      "document_version_id": "dv-qwen3-coder-480-en-v1",
+      "document_type": "release",
+      "language": "en",
+      "entities": [
+        {"canonical_name": "Qwen3-Coder-480B-A35B-Instruct", "aliases": ["Qwen3 Coder 480B A35B Instruct"]}
+      ],
+      "text": "Synthetic model-card fixture. The exact artifact under test is Qwen3-Coder-480B-A35B-Instruct. Similar family names appear elsewhere in the corpus so a retriever cannot pass by matching only Qwen3 or Coder. The fixture describes a large total parameter count with a smaller active subset and a code-oriented instruction interface. It also mentions repository navigation, tool use, and long-context software tasks as surrounding topics. The required retrieval result is this Document Version, not a family overview and not the smaller 30B artifact. Exact Entity retrieval should preserve punctuation, digits, and the A35B qualifier before fusion.",
+      "evidence_spans": [
+        {
+          "evidence_span_id": "es-qwen3-coder-480-identity",
+          "text": "The exact artifact under test is Qwen3-Coder-480B-A35B-Instruct."
+        }
+      ]
+    },
+    {
+      "document_version_id": "dv-qwen3-coder-30-zh-v1",
+      "document_type": "release",
+      "language": "zh",
+      "entities": [
+        {"canonical_name": "Qwen3-Coder-30B-A3B-Instruct", "aliases": ["Qwen3 Coder 30B A3B Instruct"]}
+      ],
+      "text": "这是合成的模型卡干扰项。当前文档对应 Qwen3-Coder-30B-A3B-Instruct，而不是名称相近的 480B A35B 版本。内容同样讨论代码生成、仓库理解、工具调用和长上下文，因此仅靠普通关键词可能把两个版本混排。精确技术实体通道必须保留数字、连字符与激活参数限定符，再由融合阶段与语义候选共同排序。文档还说明这些型号只用于固定校准语料，不构成产品推荐，也不把当前模型名称固化成永久架构。",
+      "evidence_spans": [
+        {
+          "evidence_span_id": "es-qwen3-coder-30-identity",
+          "text": "当前文档对应 Qwen3-Coder-30B-A3B-Instruct，而不是名称相近的 480B A35B 版本。"
+        }
+      ]
+    },
+    {
+      "document_version_id": "dv-bge-reranker-v2-m3-zh-v1",
+      "document_type": "story",
+      "language": "zh",
+      "entities": [
+        {"canonical_name": "bge-reranker-v2-m3", "aliases": ["BGE reranker v2 m3"]},
+        {"canonical_name": "bge-m3", "aliases": ["BGE M3"]}
+      ],
+      "text": "这是合成的候选说明，用于区分 Embedding 与 Reranker。bge-m3 在本段中只是相近名称的 Embedding 干扰项，真正需要精确检索的技术实体是 bge-reranker-v2-m3。后者接收查询与候选文本对并输出相关性分数，适合在第一阶段召回之后进行较小深度的本地重排。校准必须分别记录模型体积、CPU 内存与查询延迟，不能因为召回变好就忽略资源成本。候选结论只对固定语料有效，未来可以替换模型或重新运行 Profile，而无需改写领域记录。",
+      "evidence_spans": [
+        {
+          "evidence_span_id": "es-bge-reranker-identity",
+          "text": "bge-m3 在本段中只是相近名称的 Embedding 干扰项，真正需要精确检索的技术实体是 bge-reranker-v2-m3。"
+        },
+        {
+          "evidence_span_id": "es-bge-reranker-role",
+          "text": "后者接收查询与候选文本对并输出相关性分数，适合在第一阶段召回之后进行较小深度的本地重排。"
+        }
+      ]
+    },
+    {
+      "document_version_id": "dv-external-vector-store-en-v1",
+      "document_type": "story",
+      "language": "en",
+      "entities": [
+        {"canonical_name": "External Vector Store", "aliases": ["separate vector database"]},
+        {"canonical_name": "BM25", "aliases": ["Okapi BM25"]}
+      ],
+      "text": "Synthetic distractor for architecture retrieval. This alternative sends embeddings to a separate vector database and keeps BM25 in another search service. It discusses dual writes, asynchronous replication, and independent backup schedules. Those properties deliberately conflict with the single-PostgreSQL fixture, although both documents contain words such as vector, lexical, fusion, and ranking. A multilingual retriever should distinguish the operational constraint in the query instead of returning this document merely because it repeats generic retrieval vocabulary. No part of this distractor is a recommendation for the application.",
+      "evidence_spans": [
+        {
+          "evidence_span_id": "es-external-vector-store",
+          "text": "This alternative sends embeddings to a separate vector database and keeps BM25 in another search service."
+        }
+      ]
+    }
+  ],
+  "queries": [
+    {
+      "query_id": "cross-zh-postgres-hybrid",
+      "text": "哪个方案把向量检索与全文检索保留在同一个关系数据库中，并确定性地融合排序？",
+      "language": "zh",
+      "metric_groups": ["cross_language", "evidence_span"],
+      "expected_document_version_id": "dv-postgres-hybrid-en-v1",
+      "expected_evidence_span_ids": ["es-postgres-hybrid"]
+    },
+    {
+      "query_id": "cross-en-deepseek-moe",
+      "text": "Which release uses mixture-of-experts routing while activating only part of the total parameters?",
+      "language": "en",
+      "metric_groups": ["cross_language", "evidence_span"],
+      "expected_document_version_id": "dv-deepseek-v32-zh-v1",
+      "expected_evidence_span_ids": ["es-deepseek-moe"]
+    },
+    {
+      "query_id": "cross-zh-oauth-resource",
+      "text": "哪项协议修订要求客户端先校验资源指示符，再把 OAuth 令牌发送给受保护资源？",
+      "language": "zh",
+      "metric_groups": ["cross_language", "evidence_span"],
+      "expected_document_version_id": "dv-mcp-2025-06-18-en-v1",
+      "expected_evidence_span_ids": ["es-mcp-resource-indicator"]
+    },
+    {
+      "query_id": "cross-en-chunk-evidence",
+      "text": "Which benchmark says a rebuildable retrieval chunk is not evidence unless exact source text is anchored to an immutable document version?",
+      "language": "en",
+      "metric_groups": ["cross_language", "evidence_span"],
+      "expected_document_version_id": "dv-chunk-evidence-zh-v1",
+      "expected_evidence_span_ids": ["es-chunk-is-not-evidence"]
+    },
+    {
+      "query_id": "entity-qwen3-coder-480",
+      "text": "Find the exact Qwen3-Coder-480B-A35B-Instruct artifact, not another Qwen3 Coder size.",
+      "language": "en",
+      "metric_groups": ["exact_entity", "evidence_span"],
+      "expected_document_version_id": "dv-qwen3-coder-480-en-v1",
+      "expected_evidence_span_ids": ["es-qwen3-coder-480-identity"],
+      "expected_entity": "Qwen3-Coder-480B-A35B-Instruct"
+    },
+    {
+      "query_id": "entity-deepseek-v32",
+      "text": "定位 DeepSeek-V3.2 的精确版本说明，不要返回 DeepSeek-V3。",
+      "language": "zh",
+      "metric_groups": ["exact_entity", "evidence_span"],
+      "expected_document_version_id": "dv-deepseek-v32-zh-v1",
+      "expected_evidence_span_ids": ["es-deepseek-v32-identity"],
+      "expected_entity": "DeepSeek-V3.2"
+    },
+    {
+      "query_id": "entity-mcp-revision",
+      "text": "Retrieve MCP 2025-06-18 exactly.",
+      "language": "en",
+      "metric_groups": ["exact_entity", "evidence_span"],
+      "expected_document_version_id": "dv-mcp-2025-06-18-en-v1",
+      "expected_evidence_span_ids": ["es-mcp-revision-identity"],
+      "expected_entity": "MCP 2025-06-18"
+    },
+    {
+      "query_id": "entity-bge-reranker-v2-m3",
+      "text": "查找 bge-reranker-v2-m3，而不是 bge-m3 Embedding。",
+      "language": "zh",
+      "metric_groups": ["exact_entity", "evidence_span"],
+      "expected_document_version_id": "dv-bge-reranker-v2-m3-zh-v1",
+      "expected_evidence_span_ids": ["es-bge-reranker-identity"],
+      "expected_entity": "bge-reranker-v2-m3"
+    }
+  ]
+}

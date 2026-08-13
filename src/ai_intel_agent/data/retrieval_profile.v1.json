@@ -1,0 +1,96 @@
+{
+  "calibration": {
+    "candidate_configuration_sha256": "ff52a214bd875adc843c9537ada72bb88e45456c1f0dfd785f127a07ee830b5f",
+    "candidate_configuration_version": "retrieval-candidates-2026-08-13.v1",
+    "configured_threads": 4,
+    "corpus_sha256": "280aa6eee581e331bd624c38312fb281c70dc41557b87cde087ec221128084ce",
+    "corpus_version": "retrieval-calibration-2026-08-13.v1",
+    "declared_model_size_gb": 1.26,
+    "generated_at": "2026-08-13T04:02:45.433214+00:00",
+    "index_throughput_chunks_per_second": 48.13186091372189,
+    "logical_cpu_count": 24,
+    "median_query_latency_ms": 678.8394500017603,
+    "metrics": {
+      "cross_language_recall_at_k": 1.0,
+      "evidence_span_recall_at_k": 0.875,
+      "exact_entity_recall_at_k": 1.0
+    },
+    "p95_query_latency_ms": 757.610399996338,
+    "peak_rss_mb": 2211.18359375,
+    "runtime": "fastembed-0.8.0-onnx-cpu"
+  },
+  "chunking": {
+    "document_types": {
+      "documentation": {
+        "max_characters": 360,
+        "overlap_characters": 96
+      },
+      "paper": {
+        "max_characters": 400,
+        "overlap_characters": 112
+      },
+      "release": {
+        "max_characters": 320,
+        "overlap_characters": 80
+      },
+      "story": {
+        "max_characters": 320,
+        "overlap_characters": 80
+      }
+    },
+    "profile_id": "evidence-windows",
+    "strategy": "type-aware-character-window"
+  },
+  "embedding": {
+    "candidate_id": "multilingual-minilm-l12-v2",
+    "dimensions": 384,
+    "model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    "pooling": "mean",
+    "provider": "fastembed",
+    "source_url": "https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+  },
+  "fusion": {
+    "method": "weighted-reciprocal-rank-fusion",
+    "profile_id": "semantic-heavy-rrf",
+    "rrf_k": 60,
+    "weights": {
+      "exact_entity": 0.2,
+      "lexical": 0.2,
+      "semantic": 0.6
+    }
+  },
+  "profile_id": "retrieval-profile-2026-08-13.v1-cb8758f22d7c",
+  "reranker": {
+    "candidate_id": "bge-reranker-base",
+    "model_id": "BAAI/bge-reranker-base",
+    "provider": "fastembed",
+    "source_url": "https://huggingface.co/BAAI/bge-reranker-base"
+  },
+  "retrieval": {
+    "exact_entity_candidate_count": 8,
+    "final_top_k": 5,
+    "fused_candidate_count": 10,
+    "lexical_candidate_count": 12,
+    "rerank_depth": 8,
+    "semantic_candidate_count": 12
+  },
+  "schema_version": "retrieval-profile.v1",
+  "selection_policy": {
+    "cross_language_recall_at_k_minimum": 0.75,
+    "evidence_span_recall_at_k_minimum": 0.75,
+    "exact_entity_recall_at_k_minimum": 1.0,
+    "ranking_order": [
+      "worst_recall_desc",
+      "mean_recall_desc",
+      "evidence_span_recall_desc",
+      "cross_language_recall_desc",
+      "declared_model_size_gb_asc",
+      "index_throughput_desc",
+      "median_query_latency_ms_asc",
+      "p95_query_latency_ms_asc",
+      "peak_rss_mb_asc",
+      "stable_candidate_id_asc"
+    ]
+  },
+  "temporary_calibration_values": true
+}
