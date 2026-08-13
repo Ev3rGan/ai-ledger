@@ -1,0 +1,275 @@
+{
+  "benchmark_version": "hong-kong-runtime-benchmark-2026-08-13.v1",
+  "candidate": {
+    "identifier": "tencent-lighthouse-hk",
+    "minimum_memory_gib": 4,
+    "minimum_vcpus": 2,
+    "pricing_sources": [
+      "https://cloud.tencent.com/document/product/1207/73452/"
+    ],
+    "provider": "Tencent Cloud Lighthouse",
+    "region": "China (Hong Kong)"
+  },
+  "database_image_sha256": "38471f330eb885e04de130b768d6db4e10469e2311879c7e5c699f6d2d8a1c74",
+  "measurements": [
+    {
+      "attempt": 1,
+      "category": "network",
+      "error": null,
+      "latency_ms": 140.311,
+      "passed": true,
+      "probe": "public-workload-health",
+      "status_code": 200,
+      "workload_version": "hong-kong-runtime-workload-2026-08-13.v1"
+    },
+    {
+      "attempt": 1,
+      "category": "SSE",
+      "completion_ms": 193.424,
+      "error": null,
+      "events_received": 3,
+      "first_event_ms": 42.654,
+      "passed": true,
+      "probe": "public-event-stream",
+      "status_code": 200
+    },
+    {
+      "attempt": 2,
+      "category": "network",
+      "error": null,
+      "latency_ms": 42.738,
+      "passed": true,
+      "probe": "public-workload-health",
+      "status_code": 200,
+      "workload_version": "hong-kong-runtime-workload-2026-08-13.v1"
+    },
+    {
+      "attempt": 2,
+      "category": "SSE",
+      "completion_ms": 194.897,
+      "error": null,
+      "events_received": 3,
+      "first_event_ms": 42.623,
+      "passed": true,
+      "probe": "public-event-stream",
+      "status_code": 200
+    },
+    {
+      "attempt": 3,
+      "category": "network",
+      "error": null,
+      "latency_ms": 43.376,
+      "passed": true,
+      "probe": "public-workload-health",
+      "status_code": 200,
+      "workload_version": "hong-kong-runtime-workload-2026-08-13.v1"
+    },
+    {
+      "attempt": 3,
+      "category": "SSE",
+      "completion_ms": 193.744,
+      "error": null,
+      "events_received": 3,
+      "first_event_ms": 43.394,
+      "passed": true,
+      "probe": "public-event-stream",
+      "status_code": 200
+    },
+    {
+      "attempt": 1,
+      "category": "source egress",
+      "controller_latency_ms": 512.871,
+      "error": null,
+      "node_egress_latency_ms": 468.849,
+      "passed": true,
+      "probe": "source-github-releases",
+      "status_code": 200,
+      "target_origin": "https://api.github.com"
+    },
+    {
+      "attempt": 2,
+      "category": "source egress",
+      "controller_latency_ms": 157.479,
+      "error": null,
+      "node_egress_latency_ms": 111.901,
+      "passed": true,
+      "probe": "source-github-releases",
+      "status_code": 200,
+      "target_origin": "https://api.github.com"
+    },
+    {
+      "attempt": 3,
+      "category": "source egress",
+      "controller_latency_ms": 151.544,
+      "error": null,
+      "node_egress_latency_ms": 108.361,
+      "passed": true,
+      "probe": "source-github-releases",
+      "status_code": 200,
+      "target_origin": "https://api.github.com"
+    },
+    {
+      "attempt": 1,
+      "category": "source egress",
+      "controller_latency_ms": 160.048,
+      "error": null,
+      "node_egress_latency_ms": 116.935,
+      "passed": true,
+      "probe": "source-arxiv-api",
+      "status_code": 200,
+      "target_origin": "https://export.arxiv.org"
+    },
+    {
+      "attempt": 2,
+      "category": "source egress",
+      "controller_latency_ms": 211.11,
+      "error": null,
+      "node_egress_latency_ms": 167.582,
+      "passed": true,
+      "probe": "source-arxiv-api",
+      "status_code": 200,
+      "target_origin": "https://export.arxiv.org"
+    },
+    {
+      "attempt": 3,
+      "category": "source egress",
+      "controller_latency_ms": 163.12,
+      "error": null,
+      "node_egress_latency_ms": 118.603,
+      "passed": true,
+      "probe": "source-arxiv-api",
+      "status_code": 200,
+      "target_origin": "https://export.arxiv.org"
+    },
+    {
+      "attempt": 1,
+      "category": "model API",
+      "controller_latency_ms": 178.681,
+      "error": null,
+      "node_egress_latency_ms": 134.48,
+      "passed": true,
+      "probe": "model-deepseek-api",
+      "status_code": 401,
+      "target_origin": "https://api.deepseek.com"
+    },
+    {
+      "attempt": 2,
+      "category": "model API",
+      "controller_latency_ms": 183.313,
+      "error": null,
+      "node_egress_latency_ms": 138.775,
+      "passed": true,
+      "probe": "model-deepseek-api",
+      "status_code": 401,
+      "target_origin": "https://api.deepseek.com"
+    },
+    {
+      "attempt": 3,
+      "category": "model API",
+      "controller_latency_ms": 179.927,
+      "error": null,
+      "node_egress_latency_ms": 135.584,
+      "passed": true,
+      "probe": "model-deepseek-api",
+      "status_code": 401,
+      "target_origin": "https://api.deepseek.com"
+    },
+    {
+      "attempt": 1,
+      "category": "model API",
+      "controller_latency_ms": 289.466,
+      "error": null,
+      "node_egress_latency_ms": 245.964,
+      "passed": true,
+      "probe": "model-kimi-api",
+      "status_code": 401,
+      "target_origin": "https://api.moonshot.cn"
+    },
+    {
+      "attempt": 2,
+      "category": "model API",
+      "controller_latency_ms": 315.265,
+      "error": null,
+      "node_egress_latency_ms": 272.8,
+      "passed": true,
+      "probe": "model-kimi-api",
+      "status_code": 401,
+      "target_origin": "https://api.moonshot.cn"
+    },
+    {
+      "attempt": 3,
+      "category": "model API",
+      "controller_latency_ms": 297.579,
+      "error": null,
+      "node_egress_latency_ms": 254.514,
+      "passed": true,
+      "probe": "model-kimi-api",
+      "status_code": 401,
+      "target_origin": "https://api.moonshot.cn"
+    },
+    {
+      "attempt": 1,
+      "category": "OAuth",
+      "controller_latency_ms": 786.898,
+      "error": null,
+      "node_egress_latency_ms": 744.288,
+      "passed": true,
+      "probe": "oauth-github",
+      "status_code": 200,
+      "target_origin": "https://github.com"
+    },
+    {
+      "attempt": 2,
+      "category": "OAuth",
+      "controller_latency_ms": 598.849,
+      "error": null,
+      "node_egress_latency_ms": 479.872,
+      "passed": true,
+      "probe": "oauth-github",
+      "status_code": 200,
+      "target_origin": "https://github.com"
+    },
+    {
+      "attempt": 3,
+      "category": "OAuth",
+      "controller_latency_ms": 523.62,
+      "error": null,
+      "node_egress_latency_ms": 479.028,
+      "passed": true,
+      "probe": "oauth-github",
+      "status_code": 200,
+      "target_origin": "https://github.com"
+    },
+    {
+      "attempt": 1,
+      "category": "resource",
+      "controller_latency_ms": 689.754,
+      "error": "KeyError",
+      "passed": false,
+      "probe": "representative-container-workload"
+    },
+    {
+      "attempt": 1,
+      "category": "cost",
+      "error": null,
+      "maximum_monthly_cost_usd": "30.00",
+      "monthly_cost_usd": "13.20",
+      "passed": true,
+      "price_age_days": 0,
+      "probe": "observed-monthly-price"
+    }
+  ],
+  "observer": "mainland-direct-59-64-129-184-01",
+  "passed": false,
+  "pricing": {
+    "monthly_cost_usd": "13.20",
+    "observed_at": "2026-08-13",
+    "source": "https://cloud.tencent.com/document/product/1207/73452/",
+    "warning": "Observed comparison input; cloud prices are not permanent facts."
+  },
+  "protocol_sha256": "fbb6f2ba5c65602e5d47335aef746e10c9705174b50cd6156287879e4cc4031a",
+  "run_at": "2026-08-13T14:01:15.321495+00:00",
+  "target_origin": "https://bench-tencent-hk.ai-ledger.cn",
+  "workload_image_sha256": "6869cc26a3630df8069b88e2b3942a493189f2e0e362d61bd1057d240cc626db",
+  "workload_version": "hong-kong-runtime-workload-2026-08-13.v1"
+}

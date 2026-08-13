@@ -78,6 +78,48 @@ complex-reasoning case measures application of the approved routing policy; it d
 general complex-reasoning ability. Treat recommendations as project-specific starting routes,
 not broad model-capability conclusions.
 
+Benchmark the three Hong Kong runtime candidates with the same representative container and
+fixed mainland observer. Build and run the workload using
+`docker/runtime-benchmark.Dockerfile`, then capture one versioned JSON artifact per candidate:
+
+```powershell
+uv run ai-intel-agent benchmark-runtime probe --help
+uv run ai-intel-agent benchmark-runtime compare --help
+```
+
+The probe covers public HTTPS and SSE, node-side source, model API, and OAuth egress, a bounded
+CPU/memory/disk and PostgreSQL dump/restore workload, and dated cost evidence. It sends no model credentials or
+billed model requests. The comparator requires all three configured candidates to use the same
+protocol, workload and database image SHA-256 values, and observer before it emits a report or recommendation. See
+[`docs/research/hong-kong-runtime-benchmark-protocol-2026-08-13.md`](docs/research/hong-kong-runtime-benchmark-protocol-2026-08-13.md)
+for the complete reproducible procedure.
+Run the standalone CPU calibration over the fixed synthetic bilingual retrieval corpus and
+export a loadable, versioned Retrieval Profile:
+
+```powershell
+uv run --extra retrieval ai-intel-agent calibrate-retrieval `
+  --output reports\retrieval-calibration.md `
+  --profile-output src\ai_intel_agent\data\retrieval_profile.v1.json
+```
+
+The first run downloads the versioned FastEmbed 0.8 ONNX candidates. The calibration compares
+two multilingual Embeddings, a Chinese/English BGE Reranker plus a no-Reranker control, two
+type-aware Chunk profiles, and two weighted reciprocal-rank fusion profiles. It reports
+cross-language Recall@5, exact technical-Entity Recall@5, exact anchored Evidence Span
+Recall@5, offline index-preparation throughput, concurrent three-channel query latency, model
+load time, logical CPU count, configured threads, and calibration-process RSS. Every recall
+threshold must pass before quality, latency, or resource measurements can select a candidate;
+process RSS is run-level diagnostic data and is not used as a candidate-comparable score.
+
+The packaged v1 corpus is a small-scale, project-specific smoke-calibration set approved by the
+administrator over its exact fixtures SHA-256. The command fails before loading models when the
+approval metadata is absent or does not match the current Documents, Evidence Spans, and query
+gold labels.
+
+The packaged v1 Profile is a replaceable calibration result, not a permanent architecture
+decision. It does not change Browse or Research behavior, touch the application database, or
+add a vector database. Chunks remain rebuildable retrieval artifacts and never become Evidence.
+
 ## Verification
 
 The dev environment bundles an isolated PostgreSQL/pgvector test server. The acceptance test
@@ -93,7 +135,8 @@ uv run ai-intel-agent audit-sources --output reports\source-activation-audit.md
 
 Run `benchmark-extraction` separately when a live, credit-consuming benchmark refresh is
 intended. Run `evaluate-model-routes` separately when a live, token-billed model evaluation
-refresh is intended.
+refresh is intended. Run `calibrate-retrieval` separately when a CPU/model-cache-specific
+Retrieval Profile refresh is intended.
 
 The sample slice intentionally does not include Web pages, RSS, real GitHub OAuth, real sources,
 post-publication revisions, production model-provider integration, or placeholder tables for
@@ -112,12 +155,20 @@ src/ai_intel_agent/
   extraction_corpus.py # fixed 60-URL benchmark corpus
   extraction_benchmark.py # fixed-corpus Document extraction benchmark
   model_routing_evaluation.py # frozen-corpus DeepSeek/Kimi route evaluation
+  runtime_benchmark.py # fixed Hong Kong node probes and comparison
+  runtime_workload.py # token-protected representative container workload
   data/model_routing_evaluation.v1.json # human-approved gold cases and gates
   data/model_routing_candidates.v1.json # versioned models, endpoints, and prices
   data/model_routing_protocol.v1.json # versioned prompt, schema, retries, and budgets
+  data/retrieval_calibration_corpus.v1.json # fixed bilingual retrieval corpus
+  data/retrieval_candidates.v1.json # versioned CPU candidate matrix and thresholds
+  data/retrieval_profile.v1.json # selected loadable Retrieval Profile
+  retrieval_calibration.py # fixed-corpus Retrieval Profile calibration
   cli.py          # supported CLI transport
 alembic/          # clean PostgreSQL/pgvector baseline migration
 tests/            # CLI-to-database acceptance test
+docker/runtime-benchmark.Dockerfile # benchmark-only workload image
+docker/runtime-benchmark.compose.yml # representative workload plus PostgreSQL
 ```
 
 ## License
