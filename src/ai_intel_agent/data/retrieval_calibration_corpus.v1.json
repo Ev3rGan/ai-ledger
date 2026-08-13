@@ -1,11 +1,18 @@
 {
   "schema_version": "retrieval-calibration-corpus.v1",
   "corpus_version": "retrieval-calibration-2026-08-13.v1",
+  "review_state": "human-approved",
+  "approval_record": {
+    "approved_by": "Ev3rGan",
+    "approved_at": "2026-08-13T14:25:22+08:00",
+    "approved_fixtures_sha256": "f637f643f597509e756727dc542a84c1baffd8b8e691a91e4df661e187b2d3c9",
+    "method": "The administrator explicitly approved this Issue #6 v1 small-scale project-specific Retrieval Profile smoke-calibration corpus, including the exact versioned Documents, Evidence Spans, and query gold labels, by fixtures SHA-256."
+  },
   "description": "Synthetic bilingual retrieval fixtures for project-specific CPU calibration; no statement is production news.",
   "documents": [
     {
       "document_version_id": "dv-postgres-hybrid-en-v1",
-      "document_type": "story",
+      "document_type": "technical_note",
       "language": "en",
       "entities": [
         {"canonical_name": "PostgreSQL", "aliases": ["Postgres"]},
@@ -15,6 +22,10 @@
       "evidence_spans": [
         {
           "evidence_span_id": "es-postgres-hybrid",
+          "claim_id": "claim-postgres-hybrid",
+          "evidence_role": "Primary",
+          "exact_text_sha256": "6e91c10ca7f4516a98eb0062db2616cbff8597742402a88d26fcebb88876c2e0",
+          "locator": {"type": "character-offset", "start": 328, "end": 485},
           "text": "The calibration fixture keeps dense vectors in pgvector and lexical terms in PostgreSQL full-text search, then combines their ranked lists deterministically."
         }
       ]
@@ -31,10 +42,18 @@
       "evidence_spans": [
         {
           "evidence_span_id": "es-deepseek-v32-identity",
+          "claim_id": "claim-deepseek-v32-identity",
+          "evidence_role": "Primary",
+          "exact_text_sha256": "54450ab0b28a80a905f8246cdf67b41fd0dccda0d8de4432de470177f810669b",
+          "locator": {"type": "character-offset", "start": 26, "end": 74},
           "text": "版本标识为 DeepSeek-V3.2，不能与 DeepSeek-V3 或其他相近名称混为一谈。"
         },
         {
           "evidence_span_id": "es-deepseek-moe",
+          "claim_id": "claim-deepseek-moe",
+          "evidence_role": "Primary",
+          "exact_text_sha256": "635086eace75166e48caecaffc077488ca73aba1df9cd532a2813d9a0d8594c6",
+          "locator": {"type": "character-offset", "start": 100, "end": 143},
           "text": "该版本采用混合专家路由，每个请求只激活参数总量中的一部分，同时保留明确的版本追踪信息。"
         }
       ]
@@ -51,10 +70,18 @@
       "evidence_spans": [
         {
           "evidence_span_id": "es-mcp-revision-identity",
+          "claim_id": "claim-mcp-revision-identity",
+          "evidence_role": "Primary",
+          "exact_text_sha256": "216857d6fda36131e9541a27e6cfdc03fbb161dd624152492a4fb92085660715",
+          "locator": {"type": "character-offset", "start": 54, "end": 166},
           "text": "MCP 2025-06-18 is the exact revision label used by this case; older and newer labels are deliberate distractors."
         },
         {
           "evidence_span_id": "es-mcp-resource-indicator",
+          "claim_id": "claim-mcp-resource-indicator",
+          "evidence_role": "Primary",
+          "exact_text_sha256": "443ac9f66f0bf79a39e284612876d1a3a7948748c1135c823bf650f70cfb12c0",
+          "locator": {"type": "character-offset", "start": 283, "end": 468},
           "text": "In this fixture, clients validate the resource indicator before sending an OAuth token to a protected resource, preventing a token intended for one audience from being reused elsewhere."
         }
       ]
@@ -72,6 +99,10 @@
       "evidence_spans": [
         {
           "evidence_span_id": "es-chunk-is-not-evidence",
+          "claim_id": "claim-chunk-is-not-evidence",
+          "evidence_role": "Primary",
+          "exact_text_sha256": "f94ad84a2b2f4fc6072a53bc9b03128323404bbc6e930e3251d72d63a2a71245",
+          "locator": {"type": "character-offset", "start": 100, "end": 187},
           "text": "检索 Chunk 只是定位潜在相关材料的可重建窗口，只有与不可变 Document Version 中精确原文和偏移绑定的 Evidence Span 才能支持 Claim。"
         }
       ]
@@ -87,6 +118,10 @@
       "evidence_spans": [
         {
           "evidence_span_id": "es-qwen3-coder-480-identity",
+          "claim_id": "claim-qwen3-coder-480-identity",
+          "evidence_role": "Primary",
+          "exact_text_sha256": "452822924f986ecea641dc3852c0024fb832c1527a1bea17a334bcd0023b7dbf",
+          "locator": {"type": "character-offset", "start": 30, "end": 94},
           "text": "The exact artifact under test is Qwen3-Coder-480B-A35B-Instruct."
         }
       ]
@@ -102,13 +137,17 @@
       "evidence_spans": [
         {
           "evidence_span_id": "es-qwen3-coder-30-identity",
+          "claim_id": "claim-qwen3-coder-30-identity",
+          "evidence_role": "Primary",
+          "exact_text_sha256": "1443274660bc5f6dee7ab1689c96a7ed1ebee2861be2068d60cbbd422604b014",
+          "locator": {"type": "character-offset", "start": 12, "end": 70},
           "text": "当前文档对应 Qwen3-Coder-30B-A3B-Instruct，而不是名称相近的 480B A35B 版本。"
         }
       ]
     },
     {
       "document_version_id": "dv-bge-reranker-v2-m3-zh-v1",
-      "document_type": "story",
+      "document_type": "technical_note",
       "language": "zh",
       "entities": [
         {"canonical_name": "bge-reranker-v2-m3", "aliases": ["BGE reranker v2 m3"]},
@@ -118,17 +157,25 @@
       "evidence_spans": [
         {
           "evidence_span_id": "es-bge-reranker-identity",
+          "claim_id": "claim-bge-reranker-identity",
+          "evidence_role": "Primary",
+          "exact_text_sha256": "93fdfcb2527ce50e44b0ff514d5bbfa1864e77c4b6cde7015d9b745d236fa215",
+          "locator": {"type": "character-offset", "start": 36, "end": 103},
           "text": "bge-m3 在本段中只是相近名称的 Embedding 干扰项，真正需要精确检索的技术实体是 bge-reranker-v2-m3。"
         },
         {
           "evidence_span_id": "es-bge-reranker-role",
+          "claim_id": "claim-bge-reranker-role",
+          "evidence_role": "Primary",
+          "exact_text_sha256": "b73d15d611531ac810bdaa5d6b92458e4d48f5702befa82bce81cfe189d8e0a3",
+          "locator": {"type": "character-offset", "start": 103, "end": 147},
           "text": "后者接收查询与候选文本对并输出相关性分数，适合在第一阶段召回之后进行较小深度的本地重排。"
         }
       ]
     },
     {
       "document_version_id": "dv-external-vector-store-en-v1",
-      "document_type": "story",
+      "document_type": "technical_note",
       "language": "en",
       "entities": [
         {"canonical_name": "External Vector Store", "aliases": ["separate vector database"]},
@@ -138,6 +185,10 @@
       "evidence_spans": [
         {
           "evidence_span_id": "es-external-vector-store",
+          "claim_id": "claim-external-vector-store",
+          "evidence_role": "Primary",
+          "exact_text_sha256": "25d86b9ffdddb3d185f8dc8884c9239ff61cc50464628605a4e3b1b79ec686f9",
+          "locator": {"type": "character-offset", "start": 49, "end": 154},
           "text": "This alternative sends embeddings to a separate vector database and keeps BM25 in another search service."
         }
       ]

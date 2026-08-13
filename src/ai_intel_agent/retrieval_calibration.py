@@ -7,6 +7,7 @@ import os
 import re
 from collections import Counter
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -20,6 +21,7 @@ from typing import Any, Literal, Protocol
 
 MetricGroup = Literal["cross_language", "exact_entity", "evidence_span"]
 RerankerProvider = Literal["fastembed", "none"]
+EvidenceRole = Literal["Primary", "Independent", "Secondary", "Community"]
 
 CORPUS_RESOURCE = "retrieval_calibration_corpus.v1.json"
 CANDIDATE_RESOURCE = "retrieval_candidates.v1.json"
@@ -34,7 +36,6 @@ SELECTION_RANKING_ORDER = (
     "index_throughput_desc",
     "median_query_latency_ms_asc",
     "p95_query_latency_ms_asc",
-    "peak_rss_mb_asc",
     "stable_candidate_id_asc",
 )
 
@@ -46,9 +47,13 @@ class RetrievalCalibrationConfigurationError(ValueError):
 @dataclass(frozen=True)
 class EvidenceSpanFixture:
     identifier: str
+    claim_id: str
+    evidence_role: EvidenceRole
     text: str
     start: int
     end: int
+    exact_text_sha256: str
+    locator_type: str
 
 
 @dataclass(frozen=True)
@@ -82,7 +87,13 @@ class RetrievalQueryFixture:
 class RetrievalCalibrationCorpus:
     schema_version: str
     version: str
+    review_state: str
     description: str
+    approved_by: str | None
+    approved_at: datetime | None
+    approved_fixtures_sha256: str | None
+    approval_method: str
+    fixtures_sha256: str
     documents: tuple[RetrievalDocumentFixture, ...]
     queries: tuple[RetrievalQueryFixture, ...]
     sha256: str
@@ -117,6 +128,10 @@ class RerankerCandidate:
     model_size_gb: float
     license: str
     source_url: str | None
+
+    @property
+    def enabled(self) -> bool:
+        return self.provider != "none"
 
 
 @dataclass(frozen=True)
@@ -215,7 +230,6 @@ class CandidateMeasurement:
     index_throughput_chunks_per_second: float
     median_query_latency_ms: float
     p95_query_latency_ms: float
-    peak_rss_mb: float
 
 
 @dataclass(frozen=True)
@@ -225,7 +239,17 @@ class ModelResourceObservation:
     model_id: str
     declared_model_size_gb: float
     load_latency_ms: float
-    rss_after_load_mb: float
+    process_rss_after_load_mb: float
+
+
+@dataclass(frozen=True)
+class RetrievalProfileComparison:
+    left_profile_id: str
+    right_profile_id: str
+    changed_components: tuple[str, ...]
+    cross_language_recall_delta: float
+    exact_entity_recall_delta: float
+    evidence_span_recall_delta: float
 
 
 @dataclass(frozen=True)
@@ -241,9 +265,13 @@ class ProfileEmbedding:
 @dataclass(frozen=True)
 class ProfileReranker:
     candidate_id: str
-    provider: str
+    provider: RerankerProvider
     model_id: str | None
     source_url: str | None
+
+    @property
+    def enabled(self) -> bool:
+        return self.provider != "none"
 
 
 @dataclass(frozen=True)
@@ -276,6 +304,10 @@ class ProfileCalibration:
     generated_at: datetime
     corpus_version: str
     corpus_sha256: str
+    corpus_review_state: str
+    corpus_fixtures_sha256: str
+    corpus_approved_by: str | None
+    corpus_approved_at: datetime | None
     candidate_configuration_version: str
     candidate_configuration_sha256: str
     runtime: str
@@ -286,7 +318,7 @@ class ProfileCalibration:
     index_throughput_chunks_per_second: float
     median_query_latency_ms: float
     p95_query_latency_ms: float
-    peak_rss_mb: float
+    process_peak_rss_mb: float
 
 
 @dataclass(frozen=True)
@@ -310,8 +342,16 @@ class RetrievalCalibration:
     logical_cpu_count: int
     measurements: tuple[CandidateMeasurement, ...]
     resource_observations: tuple[ModelResourceObservation, ...]
+    process_peak_rss_mb: float
     selected: CandidateMeasurement
     profile: RetrievalProfile
+
+
+@dataclass(frozen=True)
+class _PreparedRetrievalIndex:
+    vectors: tuple[tuple[float, ...], ...]
+    chunk_terms: tuple[tuple[str, ...], ...]
+    entity_postings: tuple[tuple[tuple[str, ...], tuple[int, ...]], ...]
 
 
 class EmbeddingModel(Protocol):
@@ -437,12 +477,31 @@ def load_retrieval_corpus() -> RetrievalCalibrationCorpus:
         raise RetrievalCalibrationConfigurationError("Unsupported retrieval corpus schema")
 
     documents_raw = _required_list(raw, "documents")
+    queries_raw = _required_list(raw, "queries")
+    approval_raw = _required_dict(raw, "approval_record")
     documents = tuple(_parse_document(item) for item in documents_raw)
-    queries = tuple(_parse_query(item) for item in _required_list(raw, "queries"))
+    queries = tuple(_parse_query(item) for item in queries_raw)
+    fixtures_sha256 = _canonical_sha256(
+        {
+            "schema_version": raw["schema_version"],
+            "corpus_version": raw.get("corpus_version"),
+            "description": raw.get("description"),
+            "documents": documents_raw,
+            "queries": queries_raw,
+        }
+    )
     corpus = RetrievalCalibrationCorpus(
         schema_version=_required_text(raw, "schema_version"),
         version=_required_text(raw, "corpus_version"),
+        review_state=_required_text(raw, "review_state"),
         description=_required_text(raw, "description"),
+        approved_by=_optional_text(approval_raw, "approved_by"),
+        approved_at=_optional_datetime(approval_raw, "approved_at"),
+        approved_fixtures_sha256=_optional_sha256(
+            approval_raw, "approved_fixtures_sha256"
+        ),
+        approval_method=_required_text(approval_raw, "method"),
+        fixtures_sha256=fixtures_sha256,
         documents=documents,
         queries=queries,
         sha256=digest,
@@ -484,7 +543,6 @@ def load_retrieval_candidate_configuration() -> RetrievalCandidateConfiguration:
     fusion_profiles = tuple(
         _parse_fusion_profile(item) for item in _required_list(raw, "fusion_profiles")
     )
-    selection_raw = _required_dict(raw, "selection_policy")
     configuration = RetrievalCandidateConfiguration(
         schema_version=_required_text(raw, "schema_version"),
         version=_required_text(raw, "candidate_configuration_version"),
@@ -493,18 +551,7 @@ def load_retrieval_candidate_configuration() -> RetrievalCandidateConfiguration:
         reranker_candidates=rerankers,
         chunk_profiles=chunk_profiles,
         fusion_profiles=fusion_profiles,
-        selection_policy=RetrievalSelectionPolicy(
-            cross_language_recall_at_k_minimum=_required_float(
-                selection_raw, "cross_language_recall_at_k_minimum"
-            ),
-            exact_entity_recall_at_k_minimum=_required_float(
-                selection_raw, "exact_entity_recall_at_k_minimum"
-            ),
-            evidence_span_recall_at_k_minimum=_required_float(
-                selection_raw, "evidence_span_recall_at_k_minimum"
-            ),
-            ranking_order=tuple(_required_text_list(selection_raw, "ranking_order")),
-        ),
+        selection_policy=_parse_selection_policy(raw),
         sha256=digest,
     )
     _validate_candidate_configuration(configuration)
@@ -524,6 +571,7 @@ def run_retrieval_calibration(
     """Evaluate the fixed corpus and export a report plus one loadable Retrieval Profile."""
 
     corpus = corpus or load_retrieval_corpus()
+    require_human_approved_retrieval_corpus(corpus)
     configuration = configuration or load_retrieval_candidate_configuration()
     if runtime.threads != configuration.runtime.threads:
         raise RetrievalCalibrationConfigurationError(
@@ -538,7 +586,7 @@ def run_retrieval_calibration(
     peak_rss_bytes = runtime.rss_bytes()
     try:
         for candidate in configuration.reranker_candidates:
-            if candidate.provider == "none":
+            if not candidate.enabled:
                 continue
             started = perf_counter()
             model = runtime.create_reranker(candidate)
@@ -552,7 +600,7 @@ def run_retrieval_calibration(
                     model_id=candidate.model_id or "none",
                     declared_model_size_gb=candidate.model_size_gb,
                     load_latency_ms=load_latency_ms,
-                    rss_after_load_mb=runtime.rss_bytes() / (1024 * 1024),
+                    process_rss_after_load_mb=runtime.rss_bytes() / (1024 * 1024),
                 )
             )
 
@@ -576,7 +624,7 @@ def run_retrieval_calibration(
                     model_id=embedding_candidate.model_id,
                     declared_model_size_gb=embedding_candidate.model_size_gb,
                     load_latency_ms=load_latency_ms,
-                    rss_after_load_mb=runtime.rss_bytes() / (1024 * 1024),
+                    process_rss_after_load_mb=runtime.rss_bytes() / (1024 * 1024),
                 )
             )
             try:
@@ -588,23 +636,20 @@ def run_retrieval_calibration(
                 for chunk_profile in configuration.chunk_profiles:
                     chunks = chunk_sets[chunk_profile.identifier]
                     index_started = perf_counter()
-                    chunk_vectors = embedding_model.embed_passages(
-                        tuple(chunk.text for chunk in chunks)
+                    prepared_index = _prepare_retrieval_index(
+                        chunks,
+                        corpus.documents,
+                        embedding_model,
+                        embedding_candidate,
                     )
                     index_seconds = max(perf_counter() - index_started, 1e-9)
-                    _validate_vectors(
-                        chunk_vectors,
-                        expected_count=len(chunks),
-                        expected_dimensions=embedding_candidate.dimensions,
-                        label=embedding_candidate.identifier,
-                    )
                     throughput = len(chunks) / index_seconds
                     peak_rss_bytes = max(peak_rss_bytes, runtime.rss_bytes())
                     for fusion_profile in configuration.fusion_profiles:
                         base_results, base_latencies = _retrieve_without_reranking(
                             corpus,
                             chunks,
-                            chunk_vectors,
+                            prepared_index,
                             query_vectors,
                             query_embedding_latencies,
                             fusion_profile,
@@ -612,7 +657,7 @@ def run_retrieval_calibration(
                         for reranker_candidate in configuration.reranker_candidates:
                             results = base_results
                             latencies = base_latencies
-                            if reranker_candidate.provider != "none":
+                            if reranker_candidate.enabled:
                                 results, latencies = _rerank_results(
                                     corpus.queries,
                                     chunks,
@@ -622,7 +667,7 @@ def run_retrieval_calibration(
                                     reranker_models[reranker_candidate.identifier],
                                 )
                                 peak_rss_bytes = max(peak_rss_bytes, runtime.rss_bytes())
-                            metrics = _measure_recall(
+                            metrics = measure_retrieval_recall(
                                 corpus.queries,
                                 chunks,
                                 results,
@@ -651,7 +696,6 @@ def run_retrieval_calibration(
                                 index_throughput_chunks_per_second=throughput,
                                 median_query_latency_ms=median(latencies),
                                 p95_query_latency_ms=_percentile(latencies, 0.95),
-                                peak_rss_mb=peak_rss_bytes / (1024 * 1024),
                             )
                             measurements.append(measurement)
                             completed += 1
@@ -677,6 +721,7 @@ def run_retrieval_calibration(
         configuration=configuration,
         runtime=runtime,
         generated_at=generated_at,
+        process_peak_rss_mb=peak_rss_bytes / (1024 * 1024),
     )
     calibration = RetrievalCalibration(
         corpus=corpus,
@@ -685,6 +730,7 @@ def run_retrieval_calibration(
         logical_cpu_count=runtime.logical_cpu_count,
         measurements=tuple(measurements),
         resource_observations=tuple(resources),
+        process_peak_rss_mb=peak_rss_bytes / (1024 * 1024),
         selected=selected,
         profile=profile,
     )
@@ -726,7 +772,6 @@ def load_retrieval_profile(path: Path | None = None) -> RetrievalProfile:
     chunking_raw = _required_dict(raw, "chunking")
     retrieval_raw = _required_dict(raw, "retrieval")
     fusion_raw = _required_dict(raw, "fusion")
-    selection_raw = _required_dict(raw, "selection_policy")
     calibration_raw = _required_dict(raw, "calibration")
     metrics_raw = _required_dict(calibration_raw, "metrics")
     model_id = reranker_raw.get("model_id")
@@ -753,7 +798,7 @@ def load_retrieval_profile(path: Path | None = None) -> RetrievalProfile:
         ),
         reranker=ProfileReranker(
             candidate_id=_required_text(reranker_raw, "candidate_id"),
-            provider=_required_text(reranker_raw, "provider"),
+            provider=_parse_reranker_provider(reranker_raw),
             model_id=model_id,
             source_url=reranker_source_url,
         ),
@@ -781,22 +826,17 @@ def load_retrieval_profile(path: Path | None = None) -> RetrievalProfile:
                 for name, value in _required_dict(fusion_raw, "weights").items()
             },
         ),
-        selection_policy=RetrievalSelectionPolicy(
-            cross_language_recall_at_k_minimum=_required_float(
-                selection_raw, "cross_language_recall_at_k_minimum"
-            ),
-            exact_entity_recall_at_k_minimum=_required_float(
-                selection_raw, "exact_entity_recall_at_k_minimum"
-            ),
-            evidence_span_recall_at_k_minimum=_required_float(
-                selection_raw, "evidence_span_recall_at_k_minimum"
-            ),
-            ranking_order=tuple(_required_text_list(selection_raw, "ranking_order")),
-        ),
+        selection_policy=_parse_selection_policy(raw),
         calibration=ProfileCalibration(
             generated_at=_parse_datetime(_required_text(calibration_raw, "generated_at")),
             corpus_version=_required_text(calibration_raw, "corpus_version"),
             corpus_sha256=_required_sha256(calibration_raw, "corpus_sha256"),
+            corpus_review_state=_required_text(calibration_raw, "corpus_review_state"),
+            corpus_fixtures_sha256=_required_sha256(
+                calibration_raw, "corpus_fixtures_sha256"
+            ),
+            corpus_approved_by=_optional_text(calibration_raw, "corpus_approved_by"),
+            corpus_approved_at=_optional_datetime(calibration_raw, "corpus_approved_at"),
             candidate_configuration_version=_required_text(
                 calibration_raw, "candidate_configuration_version"
             ),
@@ -827,7 +867,9 @@ def load_retrieval_profile(path: Path | None = None) -> RetrievalProfile:
                 calibration_raw, "median_query_latency_ms"
             ),
             p95_query_latency_ms=_required_float(calibration_raw, "p95_query_latency_ms"),
-            peak_rss_mb=_required_float(calibration_raw, "peak_rss_mb"),
+            process_peak_rss_mb=_required_float(
+                calibration_raw, "process_peak_rss_mb"
+            ),
         ),
     )
     _validate_loaded_profile(profile)
@@ -907,7 +949,41 @@ def select_retrieval_profile_candidate(
             item.index_throughput_chunks_per_second,
             -item.median_query_latency_ms,
             -item.p95_query_latency_ms,
-            -item.peak_rss_mb,
+        ),
+    )
+
+
+def compare_retrieval_profiles(
+    left: RetrievalProfile,
+    right: RetrievalProfile,
+) -> RetrievalProfileComparison:
+    """Compare two already validated, loadable Retrieval Profiles."""
+
+    components = (
+        ("embedding", left.embedding, right.embedding),
+        ("reranker", left.reranker, right.reranker),
+        ("chunking", left.chunking, right.chunking),
+        ("retrieval", left.retrieval, right.retrieval),
+        ("fusion", left.fusion, right.fusion),
+        ("selection_policy", left.selection_policy, right.selection_policy),
+    )
+    return RetrievalProfileComparison(
+        left_profile_id=left.profile_id,
+        right_profile_id=right.profile_id,
+        changed_components=tuple(
+            name for name, left_value, right_value in components if left_value != right_value
+        ),
+        cross_language_recall_delta=(
+            right.calibration.metrics.cross_language_recall_at_k
+            - left.calibration.metrics.cross_language_recall_at_k
+        ),
+        exact_entity_recall_delta=(
+            right.calibration.metrics.exact_entity_recall_at_k
+            - left.calibration.metrics.exact_entity_recall_at_k
+        ),
+        evidence_span_recall_delta=(
+            right.calibration.metrics.evidence_span_recall_at_k
+            - left.calibration.metrics.evidence_span_recall_at_k
         ),
     )
 
@@ -922,6 +998,11 @@ def render_retrieval_calibration_report(calibration: RetrievalCalibration) -> st
         "- Implementation ticket: #6",
         f"- Corpus version: `{calibration.corpus.version}`",
         f"- Corpus SHA-256: `{calibration.corpus.sha256}`",
+        f"- Approved fixtures SHA-256: `{calibration.corpus.fixtures_sha256}`",
+        (
+            f"- Human approval: `{calibration.corpus.approved_by}` at "
+            f"`{calibration.corpus.approved_at.isoformat() if calibration.corpus.approved_at else 'n/a'}`"
+        ),
         f"- Candidate configuration: `{calibration.configuration.version}`",
         f"- Candidate configuration SHA-256: `{calibration.configuration.sha256}`",
         f"- Runtime: `{calibration.runtime_name}`",
@@ -951,24 +1032,28 @@ def render_retrieval_calibration_report(calibration: RetrievalCalibration) -> st
             f"{selected.metrics.evidence_span_recall_at_k:.1%}"
         ),
         f"- Declared model size: {selected.declared_model_size_gb:.2f} GiB",
-        f"- Index throughput: {selected.index_throughput_chunks_per_second:.1f} Chunks/s",
+        (
+            "- Index throughput (offline preparation): "
+            f"{selected.index_throughput_chunks_per_second:.1f} Chunks/s"
+        ),
         f"- Median query latency: {selected.median_query_latency_ms:.2f} ms",
         f"- P95 query latency: {selected.p95_query_latency_ms:.2f} ms",
-        f"- Peak process RSS: {selected.peak_rss_mb:.1f} MiB",
+        f"- Calibration-process peak RSS: {calibration.process_peak_rss_mb:.1f} MiB",
         "",
         (
             "Selection is fail-closed: each recall threshold must pass before worst-category and "
             "mean recall are compared. Quality ties prefer smaller declared model size, higher "
-            "index throughput, lower median and P95 query latency, lower RSS, then stable ID."
+            "offline index-preparation throughput, lower median and P95 query latency, then "
+            "stable ID. Process RSS is a run-level diagnostic and is not used to compare candidates."
         ),
         "",
         "## Candidate results",
         "",
         (
             "| Candidate | Cross-language | Exact Entity | Evidence Span | Gates | Model GiB | "
-            "Chunks/s | P50 ms | P95 ms | RSS MiB |"
+            "Index-prep Chunks/s | P50 ms | P95 ms |"
         ),
-        "| --- | ---: | ---: | ---: | :---: | ---: | ---: | ---: | ---: | ---: |",
+        "| --- | ---: | ---: | ---: | :---: | ---: | ---: | ---: | ---: |",
     ]
     for item in calibration.measurements:
         lines.append(
@@ -978,8 +1063,7 @@ def render_retrieval_calibration_report(calibration: RetrievalCalibration) -> st
             f"{'PASS' if item.passed_selection_gates else 'FAIL'} | "
             f"{item.declared_model_size_gb:.2f} | "
             f"{item.index_throughput_chunks_per_second:.1f} | "
-            f"{item.median_query_latency_ms:.2f} | {item.p95_query_latency_ms:.2f} | "
-            f"{item.peak_rss_mb:.1f} |"
+            f"{item.median_query_latency_ms:.2f} | {item.p95_query_latency_ms:.2f} |"
         )
     lines.extend(
         [
@@ -988,6 +1072,7 @@ def render_retrieval_calibration_report(calibration: RetrievalCalibration) -> st
             "",
             f"- Logical CPU count: {calibration.logical_cpu_count}",
             f"- Configured ONNX threads: {calibration.configuration.runtime.threads}",
+            f"- Calibration-process peak RSS: {calibration.process_peak_rss_mb:.1f} MiB",
             "",
             "| Role | Candidate | Model | Declared size GiB | Load ms | RSS after load MiB |",
             "| --- | --- | --- | ---: | ---: | ---: |",
@@ -997,15 +1082,16 @@ def render_retrieval_calibration_report(calibration: RetrievalCalibration) -> st
         lines.append(
             f"| {item.role} | `{item.candidate_id}` | `{item.model_id}` | "
             f"{item.declared_model_size_gb:.2f} | {item.load_latency_ms:.2f} | "
-            f"{item.rss_after_load_mb:.1f} |"
+            f"{item.process_rss_after_load_mb:.1f} |"
         )
     lines.extend(
         [
             "",
             (
-                "RSS values are calibration-process working sets. ONNX allocations can be retained "
-                "between candidate phases, so declared model size and an isolated deployment "
-                "measurement remain necessary for capacity planning."
+                "RSS values are calibration-process diagnostics. ONNX allocations can be retained "
+                "between candidate phases, so RSS is not treated as a candidate-comparable score. "
+                "Declared model sizes and an isolated deployment measurement remain necessary for "
+                "capacity planning."
             ),
             "",
             "## Versioned candidates",
@@ -1044,8 +1130,15 @@ def render_retrieval_calibration_report(calibration: RetrievalCalibration) -> st
                 "Evidence Span recall requires a retrieved Chunk to contain the exact anchored span."
             ),
             (
-                "- The command does not connect to the application database, Browse, or Research "
-                "behavior and does not introduce a vector database."
+                "- Offline index preparation includes passage embedding plus lexical-term and "
+                "exact-Entity posting construction. Query timing runs lexical, semantic, and "
+                "exact-Entity channels concurrently before deterministic fusion."
+            ),
+            (
+                "- Per Issue #6 non-goals, the command does not connect to the application "
+                "database or change Browse/Research. PostgreSQL FTS/pgvector persistence, "
+                "visibility filters, and production tracing belong to the later hybrid Browse "
+                "slice; this command does not introduce a vector database."
             ),
             (
                 "- Chunk sizes, candidate counts, fusion weights, reranking depth, and thresholds "
@@ -1078,38 +1171,96 @@ def _embed_queries(
     return tuple(vectors), tuple(latencies)
 
 
+def _prepare_retrieval_index(
+    chunks: tuple[RetrievalChunk, ...],
+    documents: Sequence[RetrievalDocumentFixture],
+    model: EmbeddingModel,
+    candidate: EmbeddingCandidate,
+) -> _PreparedRetrievalIndex:
+    vectors = model.embed_passages(tuple(chunk.text for chunk in chunks))
+    _validate_vectors(
+        vectors,
+        expected_count=len(chunks),
+        expected_dimensions=candidate.dimensions,
+        label=candidate.identifier,
+    )
+    chunk_terms = tuple(_retrieval_terms(chunk.text) for chunk in chunks)
+    entity_postings: list[tuple[tuple[str, ...], tuple[int, ...]]] = []
+    for document in documents:
+        document_chunk_indexes = tuple(
+            index
+            for index, chunk in enumerate(chunks)
+            if chunk.document_version_id == document.document_version_id
+        )
+        for entity in document.entities:
+            names = tuple(
+                _normalize_entity_text(name)
+                for name in (entity.canonical_name, *entity.aliases)
+            )
+            postings = tuple(
+                index
+                for index in document_chunk_indexes
+                if any(name in _normalize_entity_text(chunks[index].text) for name in names)
+            )
+            if postings:
+                entity_postings.append((names, postings))
+    return _PreparedRetrievalIndex(
+        vectors=vectors,
+        chunk_terms=chunk_terms,
+        entity_postings=tuple(entity_postings),
+    )
+
+
 def _retrieve_without_reranking(
     corpus: RetrievalCalibrationCorpus,
     chunks: tuple[RetrievalChunk, ...],
-    chunk_vectors: tuple[tuple[float, ...], ...],
+    prepared_index: _PreparedRetrievalIndex,
     query_vectors: tuple[tuple[float, ...], ...],
     query_embedding_latencies: tuple[float, ...],
     fusion: FusionProfile,
 ) -> tuple[tuple[tuple[int, ...], ...], tuple[float, ...]]:
     results: list[tuple[int, ...]] = []
     latencies: list[float] = []
-    for query, query_vector, embedding_latency in zip(
-        corpus.queries,
-        query_vectors,
-        query_embedding_latencies,
-        strict=True,
-    ):
-        started = perf_counter()
-        lexical = _lexical_ranking(query.text, chunks)[: fusion.lexical_candidate_count]
-        semantic = _semantic_ranking(query_vector, chunk_vectors)[: fusion.semantic_candidate_count]
-        exact_entity = _exact_entity_ranking(query.text, chunks, corpus.documents)[
-            : fusion.exact_entity_candidate_count
-        ]
-        fused = _weighted_reciprocal_rank_fusion(
-            {
-                "lexical": lexical,
-                "semantic": semantic,
-                "exact_entity": exact_entity,
-            },
-            fusion,
-        )[: fusion.fused_candidate_count]
-        latencies.append(embedding_latency + (perf_counter() - started) * 1000)
-        results.append(fused)
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="retrieval-channel") as executor:
+        for query, query_vector, embedding_latency in zip(
+            corpus.queries,
+            query_vectors,
+            query_embedding_latencies,
+            strict=True,
+        ):
+            started = perf_counter()
+            lexical_future = executor.submit(
+                _lexical_ranking,
+                query.text,
+                chunks,
+                prepared_index.chunk_terms,
+            )
+            semantic_future = executor.submit(
+                _semantic_ranking,
+                query_vector,
+                prepared_index.vectors,
+            )
+            exact_entity_future = executor.submit(
+                _exact_entity_ranking,
+                query.text,
+                chunks,
+                prepared_index.entity_postings,
+            )
+            lexical = lexical_future.result()[: fusion.lexical_candidate_count]
+            semantic = semantic_future.result()[: fusion.semantic_candidate_count]
+            exact_entity = exact_entity_future.result()[
+                : fusion.exact_entity_candidate_count
+            ]
+            fused = _weighted_reciprocal_rank_fusion(
+                {
+                    "lexical": lexical,
+                    "semantic": semantic,
+                    "exact_entity": exact_entity,
+                },
+                fusion,
+            )[: fusion.fused_candidate_count]
+            latencies.append(embedding_latency + (perf_counter() - started) * 1000)
+            results.append(fused)
     return tuple(results), tuple(latencies)
 
 
@@ -1149,7 +1300,7 @@ def _rerank_results(
     return tuple(results), tuple(latencies)
 
 
-def _measure_recall(
+def measure_retrieval_recall(
     queries: Sequence[RetrievalQueryFixture],
     chunks: tuple[RetrievalChunk, ...],
     results: tuple[tuple[int, ...], ...],
@@ -1170,7 +1321,14 @@ def _measure_recall(
         if "cross_language" in query.metric_groups:
             group_hits["cross_language"].append(document_hit)
         if "exact_entity" in query.metric_groups:
-            group_hits["exact_entity"].append(document_hit)
+            expected_entity = _normalize_entity_text(query.expected_entity or "")
+            group_hits["exact_entity"].append(
+                any(
+                    chunk.document_version_id == query.expected_document_version_id
+                    and expected_entity in _normalize_entity_text(chunk.text)
+                    for chunk in retrieved
+                )
+            )
         if "evidence_span" in query.metric_groups:
             expected = set(query.expected_evidence_span_ids)
             group_hits["evidence_span"].append(
@@ -1185,9 +1343,13 @@ def _measure_recall(
     )
 
 
-def _lexical_ranking(query: str, chunks: Sequence[RetrievalChunk]) -> tuple[int, ...]:
+def _lexical_ranking(
+    query: str,
+    chunks: Sequence[RetrievalChunk],
+    prepared_chunk_terms: Sequence[tuple[str, ...]] | None = None,
+) -> tuple[int, ...]:
     query_terms = _retrieval_terms(query)
-    chunk_terms = tuple(_retrieval_terms(chunk.text) for chunk in chunks)
+    chunk_terms = tuple(prepared_chunk_terms or (_retrieval_terms(chunk.text) for chunk in chunks))
     if not query_terms:
         return ()
     document_frequency = Counter(
@@ -1234,25 +1396,17 @@ def _semantic_ranking(
 def _exact_entity_ranking(
     query: str,
     chunks: Sequence[RetrievalChunk],
-    documents: Sequence[RetrievalDocumentFixture],
+    entity_postings: Sequence[tuple[tuple[str, ...], tuple[int, ...]]],
 ) -> tuple[int, ...]:
     normalized_query = _normalize_entity_text(query)
-    matched: list[tuple[str, ...]] = []
-    for document in documents:
-        for entity in document.entities:
-            names = (entity.canonical_name, *entity.aliases)
-            if any(_normalize_entity_text(name) in normalized_query for name in names):
-                matched.append(tuple(_normalize_entity_text(name) for name in names))
-    scores: list[tuple[int, int]] = []
-    for index, chunk in enumerate(chunks):
-        normalized_chunk = _normalize_entity_text(chunk.text)
-        score = sum(any(name in normalized_chunk for name in names) for names in matched)
-        if score:
-            scores.append((index, score))
+    scores_by_index: Counter[int] = Counter()
+    for names, postings in entity_postings:
+        if any(name in normalized_query for name in names):
+            scores_by_index.update(postings)
     return tuple(
         index
-        for index, _ in sorted(
-            scores,
+        for index, _score in sorted(
+            scores_by_index.items(),
             key=lambda item: (-item[1], chunks[item[0]].identifier),
         )
     )
@@ -1277,6 +1431,7 @@ def _build_retrieval_profile(
     configuration: RetrievalCandidateConfiguration,
     runtime: CalibrationRuntime,
     generated_at: datetime,
+    process_peak_rss_mb: float,
 ) -> RetrievalProfile:
     embedding = next(
         item
@@ -1337,6 +1492,10 @@ def _build_retrieval_profile(
             generated_at=generated_at.astimezone(UTC),
             corpus_version=corpus.version,
             corpus_sha256=corpus.sha256,
+            corpus_review_state=corpus.review_state,
+            corpus_fixtures_sha256=corpus.fixtures_sha256,
+            corpus_approved_by=corpus.approved_by,
+            corpus_approved_at=corpus.approved_at,
             candidate_configuration_version=configuration.version,
             candidate_configuration_sha256=configuration.sha256,
             runtime=runtime.name,
@@ -1347,7 +1506,7 @@ def _build_retrieval_profile(
             index_throughput_chunks_per_second=selected.index_throughput_chunks_per_second,
             median_query_latency_ms=selected.median_query_latency_ms,
             p95_query_latency_ms=selected.p95_query_latency_ms,
-            peak_rss_mb=selected.peak_rss_mb,
+            process_peak_rss_mb=process_peak_rss_mb,
         ),
     )
 
@@ -1412,6 +1571,14 @@ def _profile_to_dict(profile: RetrievalProfile) -> dict[str, object]:
             "generated_at": profile.calibration.generated_at.isoformat(),
             "corpus_version": profile.calibration.corpus_version,
             "corpus_sha256": profile.calibration.corpus_sha256,
+            "corpus_review_state": profile.calibration.corpus_review_state,
+            "corpus_fixtures_sha256": profile.calibration.corpus_fixtures_sha256,
+            "corpus_approved_by": profile.calibration.corpus_approved_by,
+            "corpus_approved_at": (
+                profile.calibration.corpus_approved_at.isoformat()
+                if profile.calibration.corpus_approved_at is not None
+                else None
+            ),
             "candidate_configuration_version": (
                 profile.calibration.candidate_configuration_version
             ),
@@ -1438,13 +1605,16 @@ def _profile_to_dict(profile: RetrievalProfile) -> dict[str, object]:
             ),
             "median_query_latency_ms": profile.calibration.median_query_latency_ms,
             "p95_query_latency_ms": profile.calibration.p95_query_latency_ms,
-            "peak_rss_mb": profile.calibration.peak_rss_mb,
+            "process_peak_rss_mb": profile.calibration.process_peak_rss_mb,
         },
     }
 
 
 def _parse_profile_chunk_windows(raw: dict[str, object]) -> dict[str, ChunkWindow]:
-    document_types = _required_dict(raw, "document_types")
+    return _parse_chunk_windows(_required_dict(raw, "document_types"))
+
+
+def _parse_chunk_windows(document_types: dict[str, object]) -> dict[str, ChunkWindow]:
     return {
         document_type: ChunkWindow(
             max_characters=_required_int(window, "max_characters"),
@@ -1455,17 +1625,33 @@ def _parse_profile_chunk_windows(raw: dict[str, object]) -> dict[str, ChunkWindo
     }
 
 
+def _parse_selection_policy(raw: dict[str, object]) -> RetrievalSelectionPolicy:
+    selection = _required_dict(raw, "selection_policy")
+    return RetrievalSelectionPolicy(
+        cross_language_recall_at_k_minimum=_required_float(
+            selection, "cross_language_recall_at_k_minimum"
+        ),
+        exact_entity_recall_at_k_minimum=_required_float(
+            selection, "exact_entity_recall_at_k_minimum"
+        ),
+        evidence_span_recall_at_k_minimum=_required_float(
+            selection, "evidence_span_recall_at_k_minimum"
+        ),
+        ranking_order=tuple(_required_text_list(selection, "ranking_order")),
+    )
+
+
 def _validate_loaded_profile(profile: RetrievalProfile) -> None:
     if profile.embedding.dimensions < 1:
         raise RetrievalCalibrationConfigurationError("Profile Embedding dimensions must be positive")
     if profile.embedding.pooling not in {"mean", "cls"}:
         raise RetrievalCalibrationConfigurationError("Profile Embedding pooling is unsupported")
-    if profile.reranker.provider not in {"fastembed", "none"}:
-        raise RetrievalCalibrationConfigurationError("Profile has an unsupported Reranker provider")
-    if profile.reranker.provider == "fastembed" and not profile.reranker.model_id:
-        raise RetrievalCalibrationConfigurationError("Profile FastEmbed Reranker requires a model_id")
-    if profile.reranker.provider == "none" and profile.reranker.model_id is not None:
-        raise RetrievalCalibrationConfigurationError("Profile no-Reranker control cannot name a model")
+    _validate_reranker_identity(
+        profile.reranker.provider,
+        profile.reranker.model_id,
+        profile.reranker.source_url,
+        label="Profile Reranker",
+    )
     if set(profile.fusion.weights) != {"lexical", "semantic", "exact_entity"}:
         raise RetrievalCalibrationConfigurationError("Profile fusion weights are incomplete")
     if abs(sum(profile.fusion.weights.values()) - 1.0) > 1e-9:
@@ -1486,6 +1672,40 @@ def _validate_loaded_profile(profile: RetrievalProfile) -> None:
     if profile.calibration.declared_model_size_gb < 0:
         raise RetrievalCalibrationConfigurationError(
             "Profile declared model size cannot be negative"
+        )
+    approval_values = (
+        profile.calibration.corpus_approved_by,
+        profile.calibration.corpus_approved_at,
+    )
+    if profile.calibration.corpus_review_state == "human-approved" and any(
+        value is None for value in approval_values
+    ):
+        raise RetrievalCalibrationConfigurationError(
+            "Human-approved Profile must retain corpus approval metadata"
+        )
+    if profile.calibration.corpus_review_state == "awaiting-human-approval" and any(
+        value is not None for value in approval_values
+    ):
+        raise RetrievalCalibrationConfigurationError(
+            "Awaiting Profile cannot contain partial corpus approval metadata"
+        )
+    if profile.calibration.corpus_review_state not in {
+        "awaiting-human-approval",
+        "human-approved",
+    }:
+        raise RetrievalCalibrationConfigurationError(
+            "Profile has an unsupported corpus review state"
+        )
+
+
+def require_human_approved_retrieval_profile(profile: RetrievalProfile) -> None:
+    if (
+        profile.calibration.corpus_review_state != "human-approved"
+        or profile.calibration.corpus_approved_by is None
+        or profile.calibration.corpus_approved_at is None
+    ):
+        raise RetrievalCalibrationConfigurationError(
+            "Retrieval Profile was not calibrated from a human-approved corpus"
         )
 
 
@@ -1607,17 +1827,38 @@ def _parse_document(item: object) -> RetrievalDocumentFixture:
     for span_item in _required_list(raw, "evidence_spans"):
         span = _as_dict(span_item, "evidence span")
         span_text = _required_text(span, "text")
-        if text.count(span_text) != 1:
+        locator = _required_dict(span, "locator")
+        locator_type = _required_text(locator, "type")
+        start = _required_int(locator, "start")
+        end = _required_int(locator, "end")
+        exact_text_sha256 = _required_sha256(span, "exact_text_sha256")
+        evidence_role = _required_text(span, "evidence_role")
+        if evidence_role not in {"Primary", "Independent", "Secondary", "Community"}:
             raise RetrievalCalibrationConfigurationError(
-                "Evidence Span text must occur exactly once in its Document Version"
+                "Evidence Span has an unsupported Evidence Role"
             )
-        start = text.index(span_text)
+        if locator_type != "character-offset" or not 0 <= start < end <= len(text):
+            raise RetrievalCalibrationConfigurationError(
+                "Evidence Span needs valid character-offset locators"
+            )
+        if text.count(span_text) != 1 or text[start:end] != span_text:
+            raise RetrievalCalibrationConfigurationError(
+                "Evidence Span text and offsets must anchor exactly once in its Document Version"
+            )
+        if sha256(span_text.encode("utf-8")).hexdigest() != exact_text_sha256:
+            raise RetrievalCalibrationConfigurationError(
+                "Evidence Span exact-text SHA-256 does not match its text"
+            )
         spans.append(
             EvidenceSpanFixture(
                 identifier=_required_text(span, "evidence_span_id"),
+                claim_id=_required_text(span, "claim_id"),
+                evidence_role=evidence_role,  # type: ignore[arg-type]
                 text=span_text,
                 start=start,
-                end=start + len(span_text),
+                end=end,
+                exact_text_sha256=exact_text_sha256,
+                locator_type=locator_type,
             )
         )
     return RetrievalDocumentFixture(
@@ -1654,9 +1895,7 @@ def _parse_query(item: object) -> RetrievalQueryFixture:
 
 def _parse_reranker(item: object) -> RerankerCandidate:
     raw = _as_dict(item, "reranker candidate")
-    provider = _required_text(raw, "provider")
-    if provider not in {"fastembed", "none"}:
-        raise RetrievalCalibrationConfigurationError("Unsupported Reranker provider")
+    provider = _parse_reranker_provider(raw)
     model_id = raw.get("model_id")
     if model_id is not None and not isinstance(model_id, str):
         raise RetrievalCalibrationConfigurationError("Reranker model_id must be text or null")
@@ -1667,9 +1906,15 @@ def _parse_reranker(item: object) -> RerankerCandidate:
         raise RetrievalCalibrationConfigurationError(
             "Reranker source_url must be an HTTPS URL or null"
         )
+    _validate_reranker_identity(
+        provider,
+        model_id,
+        source_url,
+        label="Reranker candidate",
+    )
     return RerankerCandidate(
         identifier=_required_text(raw, "candidate_id"),
-        provider=provider,  # type: ignore[arg-type]
+        provider=provider,
         model_id=model_id,
         model_size_gb=_required_float(raw, "model_size_gb"),
         license=_required_text(raw, "license"),
@@ -1677,21 +1922,36 @@ def _parse_reranker(item: object) -> RerankerCandidate:
     )
 
 
+def _parse_reranker_provider(raw: dict[str, object]) -> RerankerProvider:
+    provider = _required_text(raw, "provider")
+    if provider not in {"fastembed", "none"}:
+        raise RetrievalCalibrationConfigurationError("Unsupported Reranker provider")
+    return provider  # type: ignore[return-value]
+
+
+def _validate_reranker_identity(
+    provider: RerankerProvider,
+    model_id: str | None,
+    source_url: str | None,
+    *,
+    label: str,
+) -> None:
+    if provider == "fastembed" and (not model_id or source_url is None):
+        raise RetrievalCalibrationConfigurationError(
+            f"{label} using FastEmbed requires model_id and source_url"
+        )
+    if provider == "none" and model_id is not None:
+        raise RetrievalCalibrationConfigurationError(
+            f"{label} no-Reranker control cannot name a model"
+        )
+
+
 def _parse_chunk_profile(item: object) -> ChunkProfile:
     raw = _as_dict(item, "Chunk profile")
-    document_types_raw = _required_dict(raw, "document_types")
-    document_types = {
-        document_type: ChunkWindow(
-            max_characters=_required_int(window, "max_characters"),
-            overlap_characters=_required_int(window, "overlap_characters"),
-        )
-        for document_type, value in document_types_raw.items()
-        for window in (_as_dict(value, f"Chunk window for {document_type}"),)
-    }
     return ChunkProfile(
         identifier=_required_text(raw, "profile_id"),
         strategy=_required_text(raw, "strategy"),
-        document_types=document_types,
+        document_types=_parse_chunk_windows(_required_dict(raw, "document_types")),
     )
 
 
@@ -1714,6 +1974,28 @@ def _parse_fusion_profile(item: object) -> FusionProfile:
 
 
 def _validate_corpus(corpus: RetrievalCalibrationCorpus) -> None:
+    if corpus.review_state not in {"awaiting-human-approval", "human-approved"}:
+        raise RetrievalCalibrationConfigurationError("Unsupported retrieval corpus review state")
+    if corpus.review_state == "human-approved" and (
+        not corpus.approved_by
+        or corpus.approved_at is None
+        or corpus.approved_fixtures_sha256 != corpus.fixtures_sha256
+    ):
+        raise RetrievalCalibrationConfigurationError(
+            "Human-approved retrieval corpus metadata must identify the approver, time, and "
+            "exact fixtures SHA-256"
+        )
+    if corpus.review_state == "awaiting-human-approval" and any(
+        value is not None
+        for value in (
+            corpus.approved_by,
+            corpus.approved_at,
+            corpus.approved_fixtures_sha256,
+        )
+    ):
+        raise RetrievalCalibrationConfigurationError(
+            "Awaiting retrieval corpus cannot contain partial approval metadata"
+        )
     document_ids = [item.document_version_id for item in corpus.documents]
     query_ids = [item.identifier for item in corpus.queries]
     span_owners = {
@@ -1741,6 +2023,33 @@ def _validate_corpus(corpus: RetrievalCalibrationCorpus) -> None:
             raise RetrievalCalibrationConfigurationError(
                 "Exact-Entity query must contain its gold Entity"
             )
+        if "exact_entity" in query.metric_groups:
+            document_entity_names = {
+                _normalize_entity_text(name)
+                for entity in document.entities
+                for name in (entity.canonical_name, *entity.aliases)
+            }
+            expected_entity = _normalize_entity_text(query.expected_entity or "")
+            if (
+                expected_entity not in document_entity_names
+                or expected_entity not in _normalize_entity_text(document.text)
+            ):
+                raise RetrievalCalibrationConfigurationError(
+                    "Exact-Entity gold must name an Entity anchored in its Document Version"
+                )
+
+
+def require_human_approved_retrieval_corpus(corpus: RetrievalCalibrationCorpus) -> None:
+    if (
+        corpus.review_state != "human-approved"
+        or not corpus.approved_by
+        or corpus.approved_at is None
+        or corpus.approved_fixtures_sha256 != corpus.fixtures_sha256
+    ):
+        raise RetrievalCalibrationConfigurationError(
+            "Retrieval calibration requires human approval of the exact frozen fixtures SHA-256 "
+            f"{corpus.fixtures_sha256}"
+        )
 
 
 def _validate_candidate_configuration(configuration: RetrievalCandidateConfiguration) -> None:
@@ -1764,12 +2073,12 @@ def _validate_candidate_configuration(configuration: RetrievalCandidateConfigura
         if candidate.pooling not in {"mean", "cls"}:
             raise RetrievalCalibrationConfigurationError("Embedding pooling is unsupported")
     for candidate in configuration.reranker_candidates:
-        if candidate.provider == "fastembed" and not candidate.model_id:
-            raise RetrievalCalibrationConfigurationError("FastEmbed Reranker requires a model_id")
-        if candidate.provider == "fastembed" and candidate.source_url is None:
-            raise RetrievalCalibrationConfigurationError("FastEmbed Reranker requires a source_url")
-        if candidate.provider == "none" and candidate.model_id is not None:
-            raise RetrievalCalibrationConfigurationError("No-Reranker control cannot name a model")
+        _validate_reranker_identity(
+            candidate.provider,
+            candidate.model_id,
+            candidate.source_url,
+            label="Reranker candidate",
+        )
     for profile in configuration.chunk_profiles:
         if profile.strategy != "type-aware-character-window" or not profile.document_types:
             raise RetrievalCalibrationConfigurationError("Unsupported or empty Chunk strategy")
@@ -1841,6 +2150,40 @@ def _required_text(mapping: dict[str, object], key: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise RetrievalCalibrationConfigurationError(f"{key} must be non-empty text")
     return value
+
+
+def _optional_text(mapping: dict[str, object], key: str) -> str | None:
+    value = mapping.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise RetrievalCalibrationConfigurationError(f"{key} must be non-empty text or null")
+    return value
+
+
+def _optional_datetime(mapping: dict[str, object], key: str) -> datetime | None:
+    value = _optional_text(mapping, key)
+    return _parse_datetime(value) if value is not None else None
+
+
+def _optional_sha256(mapping: dict[str, object], key: str) -> str | None:
+    value = mapping.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise RetrievalCalibrationConfigurationError(f"{key} must be a lowercase SHA-256 or null")
+    return value
+
+
+def _canonical_sha256(value: object) -> str:
+    return sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _required_https_url(mapping: dict[str, object], key: str) -> str:

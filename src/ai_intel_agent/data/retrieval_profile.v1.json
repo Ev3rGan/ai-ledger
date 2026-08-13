@@ -1,22 +1,26 @@
 {
   "calibration": {
-    "candidate_configuration_sha256": "ff52a214bd875adc843c9537ada72bb88e45456c1f0dfd785f127a07ee830b5f",
+    "candidate_configuration_sha256": "b398e2b656ca5ae9cecc493f33d5af87b3acb47434e38c113a404d38e8c054ec",
     "candidate_configuration_version": "retrieval-candidates-2026-08-13.v1",
     "configured_threads": 4,
-    "corpus_sha256": "280aa6eee581e331bd624c38312fb281c70dc41557b87cde087ec221128084ce",
+    "corpus_approved_at": "2026-08-13T14:25:22+08:00",
+    "corpus_approved_by": "Ev3rGan",
+    "corpus_fixtures_sha256": "f637f643f597509e756727dc542a84c1baffd8b8e691a91e4df661e187b2d3c9",
+    "corpus_review_state": "human-approved",
+    "corpus_sha256": "9141b3d0b2e9f6a8fd4124cd833b2ff06a7a21c5ce4dfdf737eb4eca9919898a",
     "corpus_version": "retrieval-calibration-2026-08-13.v1",
     "declared_model_size_gb": 1.26,
-    "generated_at": "2026-08-13T04:02:45.433214+00:00",
-    "index_throughput_chunks_per_second": 48.13186091372189,
+    "generated_at": "2026-08-13T06:26:50.078141+00:00",
+    "index_throughput_chunks_per_second": 43.69721633302028,
     "logical_cpu_count": 24,
-    "median_query_latency_ms": 678.8394500017603,
+    "median_query_latency_ms": 914.6056000026874,
     "metrics": {
       "cross_language_recall_at_k": 1.0,
       "evidence_span_recall_at_k": 0.875,
       "exact_entity_recall_at_k": 1.0
     },
-    "p95_query_latency_ms": 757.610399996338,
-    "peak_rss_mb": 2211.18359375,
+    "p95_query_latency_ms": 1001.9461999909254,
+    "process_peak_rss_mb": 3103.1015625,
     "runtime": "fastembed-0.8.0-onnx-cpu"
   },
   "chunking": {
@@ -33,7 +37,7 @@
         "max_characters": 320,
         "overlap_characters": 80
       },
-      "story": {
+      "technical_note": {
         "max_characters": 320,
         "overlap_characters": 80
       }
@@ -59,7 +63,7 @@
       "semantic": 0.6
     }
   },
-  "profile_id": "retrieval-profile-2026-08-13.v1-cb8758f22d7c",
+  "profile_id": "retrieval-profile-2026-08-13.v1-c607cdb27815",
   "reranker": {
     "candidate_id": "bge-reranker-base",
     "model_id": "BAAI/bge-reranker-base",
@@ -88,7 +92,6 @@
       "index_throughput_desc",
       "median_query_latency_ms_asc",
       "p95_query_latency_ms_asc",
-      "peak_rss_mb_asc",
       "stable_candidate_id_asc"
     ]
   },

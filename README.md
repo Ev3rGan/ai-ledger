@@ -90,9 +90,15 @@ The first run downloads the versioned FastEmbed 0.8 ONNX candidates. The calibra
 two multilingual Embeddings, a Chinese/English BGE Reranker plus a no-Reranker control, two
 type-aware Chunk profiles, and two weighted reciprocal-rank fusion profiles. It reports
 cross-language Recall@5, exact technical-Entity Recall@5, exact anchored Evidence Span
-Recall@5, index throughput, query latency, model load time, logical CPU count, configured
-threads, and process RSS. Every recall threshold must pass before quality, latency, or memory
-can select a candidate.
+Recall@5, offline index-preparation throughput, concurrent three-channel query latency, model
+load time, logical CPU count, configured threads, and calibration-process RSS. Every recall
+threshold must pass before quality, latency, or resource measurements can select a candidate;
+process RSS is run-level diagnostic data and is not used as a candidate-comparable score.
+
+The packaged v1 corpus is a small-scale, project-specific smoke-calibration set approved by the
+administrator over its exact fixtures SHA-256. The command fails before loading models when the
+approval metadata is absent or does not match the current Documents, Evidence Spans, and query
+gold labels.
 
 The packaged v1 Profile is a replaceable calibration result, not a permanent architecture
 decision. It does not change Browse or Research behavior, touch the application database, or

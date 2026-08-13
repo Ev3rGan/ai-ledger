@@ -53,7 +53,7 @@
       "profile_id": "compact-windows",
       "strategy": "type-aware-character-window",
       "document_types": {
-        "story": {"max_characters": 180, "overlap_characters": 40},
+        "technical_note": {"max_characters": 180, "overlap_characters": 40},
         "release": {"max_characters": 180, "overlap_characters": 40},
         "documentation": {"max_characters": 200, "overlap_characters": 48},
         "paper": {"max_characters": 220, "overlap_characters": 56}
@@ -63,7 +63,7 @@
       "profile_id": "evidence-windows",
       "strategy": "type-aware-character-window",
       "document_types": {
-        "story": {"max_characters": 320, "overlap_characters": 80},
+        "technical_note": {"max_characters": 320, "overlap_characters": 80},
         "release": {"max_characters": 320, "overlap_characters": 80},
         "documentation": {"max_characters": 360, "overlap_characters": 96},
         "paper": {"max_characters": 400, "overlap_characters": 112}
@@ -109,7 +109,6 @@
       "index_throughput_desc",
       "median_query_latency_ms_asc",
       "p95_query_latency_ms_asc",
-      "peak_rss_mb_asc",
       "stable_candidate_id_asc"
     ]
   }

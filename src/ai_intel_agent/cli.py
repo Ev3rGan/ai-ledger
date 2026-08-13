@@ -24,6 +24,8 @@ from ai_intel_agent.retrieval_calibration import (
     FastEmbedCalibrationRuntime,
     RetrievalCalibrationConfigurationError,
     load_retrieval_candidate_configuration,
+    load_retrieval_corpus,
+    require_human_approved_retrieval_corpus,
     run_retrieval_calibration,
 )
 from ai_intel_agent.source_audit import run_source_definition_activation_audit
@@ -180,11 +182,14 @@ def calibrate_retrieval(
         console.print(f"[cyan]Retrieval calibration:[/] {completed}/{total} ({label})")
 
     try:
+        corpus = load_retrieval_corpus()
+        require_human_approved_retrieval_corpus(corpus)
         configuration = load_retrieval_candidate_configuration()
         calibration = run_retrieval_calibration(
             output,
             profile_output,
             runtime=FastEmbedCalibrationRuntime(threads=configuration.runtime.threads),
+            corpus=corpus,
             configuration=configuration,
             progress=progress,
         )
