@@ -1,0 +1,72 @@
+{
+  "version": "hong-kong-runtime-benchmark-2026-08-13.v1",
+  "workload_version": "hong-kong-runtime-workload-2026-08-13.v1",
+  "attempts": 3,
+  "timeout_seconds": 20.0,
+  "sse_events": 3,
+  "maximum_monthly_cost_usd": "30.00",
+  "maximum_pricing_age_days": 31,
+  "maximum_observation_window_hours": 24,
+  "candidates": [
+    {
+      "identifier": "tencent-lighthouse-hk",
+      "provider": "Tencent Cloud Lighthouse",
+      "region": "China (Hong Kong)",
+      "metadata_region": "ap-hongkong",
+      "minimum_vcpus": 2,
+      "minimum_memory_gib": 4,
+      "pricing_sources": [
+        "https://cloud.tencent.com/document/product/1207/73452/"
+      ]
+    },
+    {
+      "identifier": "aws-lightsail-hk",
+      "provider": "Amazon Lightsail",
+      "region": "Asia Pacific (Hong Kong), ap-east-1",
+      "metadata_region": "ap-east-1",
+      "minimum_vcpus": 2,
+      "minimum_memory_gib": 4,
+      "pricing_sources": [
+        "https://docs.aws.amazon.com/lightsail/latest/userguide/amazon-lightsail-bundles.html"
+      ]
+    },
+    {
+      "identifier": "alibaba-swas-hk",
+      "provider": "Alibaba Cloud Simple Application Server",
+      "region": "China (Hong Kong)",
+      "metadata_region": "cn-hongkong",
+      "minimum_vcpus": 2,
+      "minimum_memory_gib": 4,
+      "pricing_sources": [
+        "https://www.alibabacloud.com/help/en/simple-application-server/product-overview/billing-faq"
+      ]
+    }
+  ],
+  "egress_probes": [
+    {
+      "identifier": "source-github-releases",
+      "category": "source egress",
+      "path": "/egress/source-github-releases"
+    },
+    {
+      "identifier": "source-arxiv-api",
+      "category": "source egress",
+      "path": "/egress/source-arxiv-api"
+    },
+    {
+      "identifier": "model-deepseek-api",
+      "category": "model API",
+      "path": "/egress/model-deepseek-api"
+    },
+    {
+      "identifier": "model-kimi-api",
+      "category": "model API",
+      "path": "/egress/model-kimi-api"
+    },
+    {
+      "identifier": "oauth-github",
+      "category": "OAuth",
+      "path": "/egress/oauth-github"
+    }
+  ]
+}

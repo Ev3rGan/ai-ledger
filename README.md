@@ -77,6 +77,21 @@ complex-reasoning case measures application of the approved routing policy; it d
 general complex-reasoning ability. Treat recommendations as project-specific starting routes,
 not broad model-capability conclusions.
 
+Benchmark the three Hong Kong runtime candidates with the same representative container and
+fixed mainland observer. Build and run the workload using
+`docker/runtime-benchmark.Dockerfile`, then capture one versioned JSON artifact per candidate:
+
+```powershell
+uv run ai-intel-agent benchmark-runtime probe --help
+uv run ai-intel-agent benchmark-runtime compare --help
+```
+
+The probe covers public HTTPS and SSE, node-side source, model API, and OAuth egress, a bounded
+CPU/memory/disk and PostgreSQL dump/restore workload, and dated cost evidence. It sends no model credentials or
+billed model requests. The comparator requires all three configured candidates to use the same
+protocol, workload and database image SHA-256 values, and observer before it emits a report or recommendation. See
+[`docs/research/hong-kong-runtime-benchmark-protocol-2026-08-13.md`](docs/research/hong-kong-runtime-benchmark-protocol-2026-08-13.md)
+for the complete reproducible procedure.
 Run the standalone CPU calibration over the fixed synthetic bilingual retrieval corpus and
 export a loadable, versioned Retrieval Profile:
 
@@ -137,6 +152,8 @@ src/ai_intel_agent/
   extraction_corpus.py # fixed 60-URL benchmark corpus
   extraction_benchmark.py # fixed-corpus Document extraction benchmark
   model_routing_evaluation.py # frozen-corpus DeepSeek/Kimi route evaluation
+  runtime_benchmark.py # fixed Hong Kong node probes and comparison
+  runtime_workload.py # token-protected representative container workload
   data/model_routing_evaluation.v1.json # human-approved gold cases and gates
   data/model_routing_candidates.v1.json # versioned models, endpoints, and prices
   data/model_routing_protocol.v1.json # versioned prompt, schema, retries, and budgets
@@ -147,6 +164,8 @@ src/ai_intel_agent/
   cli.py          # supported CLI transport
 alembic/          # clean PostgreSQL/pgvector baseline migration
 tests/            # CLI-to-database acceptance test
+docker/runtime-benchmark.Dockerfile # benchmark-only workload image
+docker/runtime-benchmark.compose.yml # representative workload plus PostgreSQL
 ```
 
 ## License
