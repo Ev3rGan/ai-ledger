@@ -5,14 +5,27 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Annotated
+from uuid import UUID
 
+import httpx
 import typer
 from dotenv import load_dotenv
 from rich.console import Console
 
+from ai_intel_agent.collection import (
+    SystemClock,
+    collect_feed_source_definitions,
+)
+from ai_intel_agent.domain import SourceDefinitionCollectionStatus
 from ai_intel_agent.extraction_benchmark import (
     BenchmarkConfigurationError,
     run_document_extraction_benchmark,
+)
+from ai_intel_agent.feed_acquisition import (
+    HttpFeedFetcher,
+    SampleFeedFetcher,
+    load_approved_feed_source_definitions,
+    load_sample_feed_source_definitions,
 )
 from ai_intel_agent.model_routing_evaluation import (
     HttpModelEvaluationClient,
@@ -24,15 +37,6 @@ from ai_intel_agent.model_routing_evaluation import (
 )
 from ai_intel_agent.persistence import database_url_from_environment
 from ai_intel_agent.pipeline import publish_sample_digest
-from ai_intel_agent.pipeline import persist_sample_story
-from ai_intel_agent.runtime_benchmark import (
-    HttpRuntimeProbeClient,
-    PricingObservation,
-    RuntimeBenchmarkConfigurationError,
-    compare_hong_kong_runtime_results,
-    load_runtime_benchmark_configuration,
-    run_hong_kong_runtime_probe,
-)
 from ai_intel_agent.retrieval_calibration import (
     FastEmbedCalibrationRuntime,
     RetrievalCalibrationConfigurationError,
@@ -41,6 +45,15 @@ from ai_intel_agent.retrieval_calibration import (
     require_human_approved_retrieval_corpus,
     run_retrieval_calibration,
 )
+from ai_intel_agent.runtime_benchmark import (
+    HttpRuntimeProbeClient,
+    PricingObservation,
+    RuntimeBenchmarkConfigurationError,
+    compare_hong_kong_runtime_results,
+    load_runtime_benchmark_configuration,
+    run_hong_kong_runtime_probe,
+)
+from ai_intel_agent.sample import FixedClock
 from ai_intel_agent.source_audit import run_source_definition_activation_audit
 
 app = typer.Typer(help="Run the deterministic AI intelligence workflow.")
@@ -84,6 +97,51 @@ def run_pipeline(
         f"{publication.digest.id} ({len(publication.digest.story_ids)} accepted Story)"
     )
     console.print(f"[green]Wrote sample report:[/] {output}")
+
+
+@app.command("collect-feeds")
+def collect_feeds(
+    sample: Annotated[
+        bool,
+        typer.Option("--sample", help="Use fixed RSS, Atom, and failing Feed fixtures."),
+    ] = False,
+    retry_of: Annotated[
+        UUID | None,
+        typer.Option("--retry-of", help="Link this retry to an existing Collection Run."),
+    ] = None,
+) -> None:
+    """Collect approved RSS and Atom Source Definitions."""
+    try:
+        database_url = database_url_from_environment()
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from error
+
+    if sample:
+        run = collect_feed_source_definitions(
+            database_url,
+            source_definitions=load_sample_feed_source_definitions(),
+            fetcher=SampleFeedFetcher(),
+            clock=FixedClock(),
+            retry_of_run_id=retry_of,
+        )
+    else:
+        with httpx.Client() as client:
+            run = collect_feed_source_definitions(
+                database_url,
+                source_definitions=load_approved_feed_source_definitions(),
+                fetcher=HttpFeedFetcher(client),
+                clock=SystemClock(),
+                retry_of_run_id=retry_of,
+            )
+
+    succeeded = sum(
+        result.status is SourceDefinitionCollectionStatus.SUCCEEDED
+        for result in run.source_definition_results
+    )
+    console.print(
+        f"[green]Completed Collection Run {run.id}:[/] {run.status.value}; "
+        f"{succeeded}/{len(run.source_definition_results)} Source Definitions succeeded"
+    )
 
 
 @app.command("audit-sources")

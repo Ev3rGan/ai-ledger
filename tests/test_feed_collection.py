@@ -1,39 +1,47 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import datetime
-from pathlib import Path
+from datetime import UTC, datetime
+from importlib.resources import files
+from ipaddress import IPv4Address
 from uuid import uuid4
 
 import httpx
 import pytest
 from pg0 import Pg0
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
+from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm import Session
+from typer.testing import CliRunner
 
+from ai_intel_agent.cli import app
 from ai_intel_agent.collection import (
-    ApprovedFeedSourceDefinition,
-    CollectionRunStatus,
-    FeedFetcher,
-    FeedFetchError,
-    HttpFeedFetcher,
     SourceDefinitionApprovalError,
-    collect_feed_sources,
+    collect_feed_source_definitions,
+)
+from ai_intel_agent.domain import ApprovedFeedSourceDefinition
+from ai_intel_agent.feed_acquisition import (
+    FeedFetchError,
+    FeedSecurityError,
+    HostResolver,
+    HttpFeedFetcher,
     load_approved_feed_source_definitions,
 )
 from ai_intel_agent.persistence import (
     CandidateRecord,
     CollectionDiscoveryRecord,
     CollectionRunRecord,
-    CollectionSourceResultRecord,
     DocumentVersionRecord,
+    SourceDefinitionCollectionResultRecord,
     SourceDefinitionRecord,
     create_database_engine,
     upgrade_database,
 )
 
-FIXTURES = Path(__file__).parent / "fixtures" / "feeds"
+FIXTURES = files("ai_intel_agent").joinpath("data/sample_feeds")
 FIXED_NOW = datetime.fromisoformat("2026-08-12T10:00:00+08:00")
+PUBLIC_ADDRESS = IPv4Address("93.184.216.34")
+runner = CliRunner()
 
 
 @dataclass(frozen=True)
@@ -44,37 +52,141 @@ class FixedClock:
         return self.current
 
 
-class FixtureFeedFetcher(FeedFetcher):
-    def __init__(self, fixtures_by_url: dict[str, Path]) -> None:
-        self._fixtures_by_url = fixtures_by_url
+@dataclass(frozen=True)
+class StaticResolver(HostResolver):
+    addresses: tuple[IPv4Address, ...] = (PUBLIC_ADDRESS,)
 
-    def fetch(self, source: ApprovedFeedSourceDefinition) -> bytes:
-        return self._fixtures_by_url[source.entry_point].read_bytes()
+    def resolve(self, hostname: str) -> tuple[IPv4Address, ...]:
+        return self.addresses
 
 
-class UnexpectedFeedFetcher(FeedFetcher):
-    def fetch(self, source: ApprovedFeedSourceDefinition) -> bytes:
-        raise AssertionError(f"Unapproved source was fetched: {source.entry_point}")
+class UnexpectedFeedFetcher:
+    def fetch(self, source_definition: ApprovedFeedSourceDefinition) -> bytes:
+        raise AssertionError(
+            f"Unapproved Source Definition was fetched: {source_definition.entry_point}"
+        )
 
 
 def test_http_feed_fetcher_turns_http_failure_into_a_bounded_adapter_error() -> None:
-    source = load_approved_feed_source_definitions()[0]
+    source_definition = load_approved_feed_source_definitions()[0]
     client = httpx.Client(
         transport=httpx.MockTransport(
             lambda request: httpx.Response(503, request=request, text="private upstream body")
         )
     )
     try:
-        fetcher = HttpFeedFetcher(client)
+        fetcher = HttpFeedFetcher(client, resolver=StaticResolver())
         with pytest.raises(FeedFetchError, match="HTTP 503") as caught:
-            fetcher.fetch(source)
+            fetcher.fetch(source_definition)
     finally:
         client.close()
 
     assert "private upstream body" not in str(caught.value)
 
 
-def test_collection_rejects_a_source_that_does_not_match_the_approved_audit() -> None:
+def test_http_feed_fetcher_rejects_insecure_and_private_locations_before_fetch() -> None:
+    source_definition = load_approved_feed_source_definitions()[0]
+    requests: list[httpx.Request] = []
+
+    def unexpected_request(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(unexpected_request))
+    try:
+        with pytest.raises(FeedSecurityError, match="HTTPS"):
+            HttpFeedFetcher(client, resolver=StaticResolver()).fetch(
+                replace(source_definition, entry_point="http://example.com/feed.xml")
+            )
+        with pytest.raises(FeedSecurityError, match="public network"):
+            HttpFeedFetcher(
+                client,
+                resolver=StaticResolver((IPv4Address("127.0.0.1"),)),
+            ).fetch(source_definition)
+    finally:
+        client.close()
+
+    assert requests == []
+
+
+@pytest.mark.parametrize(
+    ("headers", "body", "message"),
+    [
+        ({"content-type": "text/html"}, b"<html></html>", "MIME"),
+        (
+            {"content-type": "application/rss+xml", "content-length": "17"},
+            b"0123456789abcdefg",
+            "size limit",
+        ),
+    ],
+)
+def test_http_feed_fetcher_enforces_mime_and_response_size(
+    headers: dict[str, str],
+    body: bytes,
+    message: str,
+) -> None:
+    source_definition = load_approved_feed_source_definitions()[0]
+    client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                request=request,
+                headers=headers,
+                content=body,
+            )
+        )
+    )
+    try:
+        fetcher = HttpFeedFetcher(
+            client,
+            resolver=StaticResolver(),
+            max_response_bytes=16,
+        )
+        with pytest.raises(FeedFetchError, match=message):
+            fetcher.fetch(source_definition)
+    finally:
+        client.close()
+
+
+def test_http_feed_fetcher_revalidates_redirects_and_sets_a_timeout() -> None:
+    source_definition = load_approved_feed_source_definitions()[0]
+    feed_payload = FIXTURES.joinpath("google-ai.rss").read_bytes()
+    requests: list[httpx.Request] = []
+
+    def redirect_then_feed(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.extensions["timeout"]["read"] == 3.0
+        if len(requests) == 1:
+            return httpx.Response(
+                302,
+                request=request,
+                headers={"location": "https://feeds.example.com/google-ai.rss"},
+            )
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "application/rss+xml"},
+            content=feed_payload,
+        )
+
+    client = httpx.Client(transport=httpx.MockTransport(redirect_then_feed))
+    try:
+        result = HttpFeedFetcher(
+            client,
+            resolver=StaticResolver(),
+            timeout_seconds=3.0,
+        ).fetch(source_definition)
+    finally:
+        client.close()
+
+    assert result == feed_payload
+    assert [request.url.host for request in requests] == [
+        "blog.google",
+        "feeds.example.com",
+    ]
+
+
+def test_collection_rejects_a_source_definition_not_matching_the_approved_audit() -> None:
     approved = load_approved_feed_source_definitions()[0]
     unapproved = replace(
         approved,
@@ -82,9 +194,9 @@ def test_collection_rejects_a_source_that_does_not_match_the_approved_audit() ->
     )
 
     with pytest.raises(SourceDefinitionApprovalError, match="not approved"):
-        collect_feed_sources(
+        collect_feed_source_definitions(
             "database-must-not-be-opened",
-            sources=(unapproved,),
+            source_definitions=(unapproved,),
             fetcher=UnexpectedFeedFetcher(),
             clock=FixedClock(),
         )
@@ -102,53 +214,50 @@ def collection_database_url() -> str:
 
 
 @pytest.mark.postgres
-def test_collection_persists_rss_and_atom_while_feed_failure_stays_partial_and_retryable(
+def test_sample_collection_cli_persists_rss_and_atom_while_failure_stays_partial(
     collection_database_url: str,
 ) -> None:
-    approved = {
-        definition.name: definition
-        for definition in load_approved_feed_source_definitions()
-    }
-    sources = (
-        approved["Google AI"],
-        approved["Hugging Face Blog"],
-        approved["GitHub AI and ML"],
-    )
-    fetcher = FixtureFeedFetcher(
-        {
-            sources[0].entry_point: FIXTURES / "google-ai.rss",
-            sources[1].entry_point: FIXTURES / "hugging-face.atom",
-            sources[2].entry_point: FIXTURES / "malformed.xml",
-        }
-    )
-
-    first = collect_feed_sources(
-        collection_database_url,
-        sources=sources,
-        fetcher=fetcher,
-        clock=FixedClock(),
-    )
-    retry = collect_feed_sources(
-        collection_database_url,
-        sources=sources,
-        fetcher=fetcher,
-        clock=FixedClock(),
-        retry_of_run_id=first.id,
-    )
-
-    assert first.status is CollectionRunStatus.PARTIAL
-    assert retry.status is CollectionRunStatus.PARTIAL
-    assert retry.retry_of_run_id == first.id
-    assert [result.status.value for result in first.source_results] == [
-        "succeeded",
-        "succeeded",
-        "failed",
-    ]
-    assert first.source_results[-1].error_code == "invalid_feed"
+    environment = {"AI_INTEL_DATABASE_URL": collection_database_url}
+    first = runner.invoke(app, ["collect-feeds", "--sample"], env=environment)
+    assert first.exit_code == 0, first.output
 
     engine = create_database_engine(collection_database_url)
     try:
         with Session(engine) as session:
+            first_run_id = session.scalar(select(CollectionRunRecord.id))
+
+        retry = runner.invoke(
+            app,
+            ["collect-feeds", "--sample", "--retry-of", str(first_run_id)],
+            env=environment,
+        )
+        assert retry.exit_code == 0, retry.output
+
+        with Session(engine) as session:
+            runs = session.execute(
+                select(
+                    CollectionRunRecord.id,
+                    CollectionRunRecord.retry_of_run_id,
+                    CollectionRunRecord.status,
+                ).order_by(CollectionRunRecord.retry_of_run_id.nulls_first())
+            ).all()
+            first_results = session.execute(
+                select(
+                    SourceDefinitionRecord.name,
+                    SourceDefinitionCollectionResultRecord.status,
+                    SourceDefinitionCollectionResultRecord.error_code,
+                )
+                .join(
+                    SourceDefinitionRecord,
+                    SourceDefinitionRecord.id
+                    == SourceDefinitionCollectionResultRecord.source_definition_id,
+                )
+                .where(
+                    SourceDefinitionCollectionResultRecord.collection_run_id
+                    == first_run_id
+                )
+                .order_by(SourceDefinitionRecord.name)
+            ).all()
             counts = {
                 record_type.__tablename__: session.scalar(
                     select(func.count()).select_from(record_type)
@@ -156,7 +265,7 @@ def test_collection_persists_rss_and_atom_while_feed_failure_stays_partial_and_r
                 for record_type in (
                     SourceDefinitionRecord,
                     CollectionRunRecord,
-                    CollectionSourceResultRecord,
+                    SourceDefinitionCollectionResultRecord,
                     CollectionDiscoveryRecord,
                     CandidateRecord,
                     DocumentVersionRecord,
@@ -165,8 +274,14 @@ def test_collection_persists_rss_and_atom_while_feed_failure_stays_partial_and_r
             persisted_documents = session.execute(
                 select(
                     CandidateRecord.canonical_url,
+                    CandidateRecord.publisher,
+                    DocumentVersionRecord.source_url,
                     DocumentVersionRecord.title,
                     DocumentVersionRecord.body,
+                    DocumentVersionRecord.published_at,
+                    DocumentVersionRecord.published_at_raw,
+                    DocumentVersionRecord.updated_at,
+                    DocumentVersionRecord.updated_at_raw,
                 ).join(
                     DocumentVersionRecord,
                     DocumentVersionRecord.candidate_id == CandidateRecord.id,
@@ -175,10 +290,20 @@ def test_collection_persists_rss_and_atom_while_feed_failure_stays_partial_and_r
     finally:
         engine.dispose()
 
+    assert first_run_id is not None
+    assert len(runs) == 2
+    assert runs[0] == (first_run_id, None, "partial")
+    assert runs[1].retry_of_run_id == first_run_id
+    assert runs[1].status == "partial"
+    assert [(name, status, error_code) for name, status, error_code in first_results] == [
+        ("GitHub AI and ML", "failed", "invalid_feed"),
+        ("Google AI", "succeeded", None),
+        ("Hugging Face Blog", "succeeded", None),
+    ]
     assert counts == {
         "source_definitions": 3,
         "collection_runs": 2,
-        "collection_source_results": 6,
+        "source_definition_collection_results": 6,
         "collection_discoveries": 4,
         "candidates": 2,
         "document_versions": 2,
@@ -186,12 +311,38 @@ def test_collection_persists_rss_and_atom_while_feed_failure_stays_partial_and_r
     assert set(persisted_documents) == {
         (
             "https://example.com/ai/gemini-agent-traces",
+            "Google",
+            "https://blog.google/rss/",
             "Gemini agents add reproducible task traces",
             "Gemini agents now attach reproducible task traces to results.",
+            datetime(2026, 8, 12, 2, 0, tzinfo=UTC),
+            "Wed, 12 Aug 2026 02:00:00 GMT",
+            None,
+            None,
         ),
         (
             "https://example.com/ai/open-model-evaluation",
+            "Hugging Face",
+            "https://huggingface.co/blog/feed.xml",
             "Open model evaluation gains evidence links",
             "The evaluation report links every score to its source evidence.",
+            None,
+            None,
+            datetime(2026, 8, 12, 3, 0, tzinfo=UTC),
+            "2026-08-12T03:00:00Z",
         ),
     }
+
+    immutability_engine = create_database_engine(collection_database_url)
+    try:
+        with Session(immutability_engine) as session, pytest.raises(
+            ProgrammingError,
+            match="completed Collection Run is immutable",
+        ):
+            session.execute(
+                update(CollectionRunRecord)
+                .where(CollectionRunRecord.id == first_run_id)
+                .values(status="complete")
+            )
+    finally:
+        immutability_engine.dispose()

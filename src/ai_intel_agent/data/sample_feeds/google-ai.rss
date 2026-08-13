@@ -11,6 +11,7 @@
       <pubDate>Wed, 12 Aug 2026 02:00:00 GMT</pubDate>
       <description><![CDATA[
         <p>Gemini agents now attach <strong>reproducible task traces</strong> to results.</p>
+        <script>untrusted-script-must-not-survive</script>
       ]]></description>
     </item>
   </channel>
