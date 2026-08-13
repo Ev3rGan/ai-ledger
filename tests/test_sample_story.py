@@ -7,7 +7,7 @@ from uuid import uuid4
 
 import pytest
 from pg0 import Pg0
-from sqlalchemy import delete, func, insert, select, text, update
+from sqlalchemy import func, insert, select, text, update
 from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm import Session
 from typer.testing import CliRunner
@@ -64,8 +64,23 @@ def empty_database(postgres_url: str):
     upgrade_database(postgres_url)
     engine = create_database_engine(postgres_url)
     with Session(engine) as session:
-        for record_type in reversed(RECORD_TYPES):
-            session.execute(delete(record_type))
+        session.execute(
+            text(
+                """
+                TRUNCATE TABLE
+                    audit_events,
+                    digest_stories,
+                    digests,
+                    structured_traces,
+                    evidence_spans,
+                    claims,
+                    stories,
+                    document_versions,
+                    candidates
+                RESTART IDENTITY CASCADE
+                """
+            )
+        )
         session.commit()
     yield engine
     engine.dispose()
@@ -275,3 +290,40 @@ def test_sample_cli_twice_reviews_stories_and_publishes_one_digest(
             ProgrammingError, match="published Story content is immutable"
         ):
             session.execute(statement)
+
+
+@pytest.mark.postgres
+def test_published_digest_membership_cannot_move_to_a_draft_digest(
+    postgres_url: str, empty_database, tmp_path: Path
+) -> None:
+    output_path = tmp_path / "daily.md"
+    result = runner.invoke(
+        app,
+        ["run", "--sample", "--output", str(output_path)],
+        env={"AI_INTEL_DATABASE_URL": postgres_url},
+    )
+    assert result.exit_code == 0, result.output
+
+    draft_digest_id = uuid4()
+    with Session(empty_database) as session, session.begin():
+        published_digest = session.scalars(select(DigestRecord)).one()
+        published_digest_id = published_digest.id
+        session.add(
+            DigestRecord(
+                id=draft_digest_id,
+                stable_key=f"draft-digest:{draft_digest_id}",
+                publication_date=published_digest.publication_date,
+                state="draft",
+                published_at=None,
+            )
+        )
+
+    with Session(empty_database) as session, pytest.raises(
+        ProgrammingError,
+        match="published Digest membership is immutable",
+    ):
+        session.execute(
+            update(DigestStoryRecord)
+            .where(DigestStoryRecord.digest_id == published_digest_id)
+            .values(digest_id=draft_digest_id)
+        )

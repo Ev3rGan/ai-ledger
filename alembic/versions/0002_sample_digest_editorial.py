@@ -79,15 +79,21 @@ def upgrade() -> None:
         LANGUAGE plpgsql
         AS $$
         DECLARE
-            target_digest_id uuid;
+            old_digest_id uuid;
+            new_digest_id uuid;
             target_story_id uuid;
         BEGIN
-            target_digest_id := CASE WHEN TG_OP = 'DELETE' THEN OLD.digest_id ELSE NEW.digest_id END;
-            target_story_id := CASE WHEN TG_OP = 'DELETE' THEN OLD.story_id ELSE NEW.story_id END;
+            IF TG_OP <> 'INSERT' THEN
+                old_digest_id := OLD.digest_id;
+            END IF;
+            IF TG_OP <> 'DELETE' THEN
+                new_digest_id := NEW.digest_id;
+                target_story_id := NEW.story_id;
+            END IF;
 
             IF EXISTS (
                 SELECT 1 FROM digests
-                WHERE id = target_digest_id AND state = 'published'
+                WHERE id IN (old_digest_id, new_digest_id) AND state = 'published'
             ) THEN
                 RAISE EXCEPTION 'published Digest membership is immutable';
             END IF;
