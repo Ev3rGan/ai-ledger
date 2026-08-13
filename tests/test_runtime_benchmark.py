@@ -301,6 +301,22 @@ def test_compare_rejects_substituted_probes_nodes_windows_and_stale_prices(
         compare_hong_kong_runtime_results(inputs, tmp_path / "contradictory-cost.md")
 
 
+def test_compare_rejects_non_boolean_measurement_results(tmp_path: Path) -> None:
+    inputs = [
+        _write_candidate_result(tmp_path, "tencent-lighthouse-hk", "13.20", 80),
+        _write_candidate_result(tmp_path, "aws-lightsail-hk", "24.00", 120),
+        _write_candidate_result(tmp_path, "alibaba-swas-hk", "18.00", 90),
+    ]
+    malformed = json.loads(inputs[0].read_text(encoding="utf-8"))
+    malformed["measurements"][0]["passed"] = "false"
+    inputs[0].write_text(
+        json.dumps(malformed, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeBenchmarkConfigurationError, match="must be booleans"):
+        compare_hong_kong_runtime_results(inputs, tmp_path / "invalid-passed.md")
+
+
 def test_probe_requires_candidate_official_price_evidence(tmp_path: Path) -> None:
     configuration = load_runtime_benchmark_configuration()
     with httpx.Client(transport=httpx.MockTransport(_workload_transport)) as http_client:

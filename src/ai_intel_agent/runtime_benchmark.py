@@ -492,6 +492,10 @@ def _require_complete_result(
         isinstance(item, dict) for item in measurements
     ):
         raise RuntimeBenchmarkConfigurationError("runtime result has invalid measurements")
+    if not all(type(item.get("passed")) is bool for item in measurements):
+        raise RuntimeBenchmarkConfigurationError(
+            "runtime result measurement passed values must be booleans"
+        )
     expected_measurements = [
         ("network", "public-workload-health", attempt)
         for attempt in range(1, configuration.attempts + 1)
