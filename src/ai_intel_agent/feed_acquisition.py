@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import socket
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from email.utils import parsedate_to_datetime
@@ -115,7 +116,17 @@ class SystemHostResolver:
         return (direct_address,)
 
 
-class HttpFeedFetcher:
+class BoundedPublicHttpsError(ValueError):
+    pass
+
+
+class BoundedPublicHttpsSecurityError(BoundedPublicHttpsError):
+    pass
+
+
+class BoundedPublicHttpsFetcher:
+    """Fetch one bounded public HTTPS resource with every redirect revalidated."""
+
     def __init__(
         self,
         client: httpx.Client,
@@ -126,20 +137,28 @@ class HttpFeedFetcher:
         max_redirects: int = 3,
     ) -> None:
         if timeout_seconds <= 0:
-            raise ValueError("Feed timeout must be positive")
+            raise ValueError("HTTPS timeout must be positive")
         if max_response_bytes <= 0:
-            raise ValueError("Feed response-size limit must be positive")
+            raise ValueError("HTTPS response-size limit must be positive")
         if max_redirects < 0:
-            raise ValueError("Feed redirect limit cannot be negative")
+            raise ValueError("HTTPS redirect limit cannot be negative")
         self._client = client
         self._resolver = resolver or SystemHostResolver()
         self._timeout_seconds = timeout_seconds
         self._max_response_bytes = max_response_bytes
         self._max_redirects = max_redirects
 
-    def fetch(self, source_definition: ApprovedFeedSourceDefinition) -> bytes:
-        location = source_definition.entry_point
+    def fetch(
+        self,
+        location: str,
+        *,
+        allowed_mime_types: frozenset[str],
+        user_agent: str,
+        location_validator: Callable[[str], None] | None = None,
+    ) -> tuple[bytes, str]:
         for redirect_count in range(self._max_redirects + 1):
+            if location_validator is not None:
+                location_validator(location)
             parsed_location, addresses = self._validate_public_https_location(location)
             pinned_location = httpx.URL(location).copy_with(
                 host=str(
@@ -156,32 +175,34 @@ class HttpFeedFetcher:
                     follow_redirects=False,
                     timeout=self._timeout_seconds,
                     headers={
-                        "accept": ", ".join(sorted(ALLOWED_FEED_MIME_TYPES)),
+                        "accept": ", ".join(sorted(allowed_mime_types)),
                         "connection": "close",
                         "host": parsed_location.netloc,
-                        "user-agent": "ai-intel-agent/0.1 feed-collector",
+                        "user-agent": user_agent,
                     },
                     extensions={"sni_hostname": parsed_location.hostname},
                 ) as response:
                     if response.status_code in REDIRECT_STATUS_CODES:
                         if redirect_count == self._max_redirects:
-                            raise FeedFetchError("Feed redirect limit exceeded")
+                            raise BoundedPublicHttpsError("HTTPS redirect limit exceeded")
                         redirect_location = response.headers.get("location")
                         if not redirect_location:
-                            raise FeedFetchError("Feed redirect has no Location header")
+                            raise BoundedPublicHttpsError(
+                                "HTTPS redirect has no Location header"
+                            )
                         location = urljoin(location, redirect_location)
                         continue
                     if not response.is_success:
-                        raise FeedFetchError(
-                            f"Feed request returned HTTP {response.status_code}"
+                        raise BoundedPublicHttpsError(
+                            f"HTTPS request returned HTTP {response.status_code}"
                         )
-                    self._validate_mime_type(response)
-                    return self._read_bounded_body(response)
-            except FeedAcquisitionError:
+                    self._validate_mime_type(response, allowed_mime_types)
+                    return self._read_bounded_body(response), location
+            except BoundedPublicHttpsError:
                 raise
             except httpx.HTTPError as error:
-                raise FeedFetchError("Feed request failed") from error
-        raise FeedFetchError("Feed redirect limit exceeded")
+                raise BoundedPublicHttpsError("HTTPS request failed") from error
+        raise BoundedPublicHttpsError("HTTPS redirect limit exceeded")
 
     def _validate_public_https_location(
         self,
@@ -189,29 +210,44 @@ class HttpFeedFetcher:
     ) -> tuple[ParseResult, tuple[IPAddress, ...]]:
         parsed = urlparse(location)
         if parsed.scheme != "https":
-            raise FeedSecurityError("Feed location must use HTTPS")
+            raise BoundedPublicHttpsSecurityError("HTTPS location must use HTTPS")
         if not parsed.hostname or parsed.username or parsed.password:
-            raise FeedSecurityError("Feed location must be an absolute HTTPS URL")
+            raise BoundedPublicHttpsSecurityError(
+                "HTTPS location must be an absolute HTTPS URL"
+            )
         try:
             port = parsed.port
         except ValueError as error:
-            raise FeedSecurityError("Feed location has an invalid port") from error
+            raise BoundedPublicHttpsSecurityError(
+                "HTTPS location has an invalid port"
+            ) from error
         if port not in (None, 443):
-            raise FeedSecurityError("Feed location must use the standard HTTPS port")
+            raise BoundedPublicHttpsSecurityError(
+                "HTTPS location must use the standard HTTPS port"
+            )
         try:
             addresses = self._resolver.resolve(parsed.hostname)
         except OSError as error:
-            raise FeedFetchError("Feed hostname could not be resolved") from error
+            raise BoundedPublicHttpsError(
+                "HTTPS hostname could not be resolved"
+            ) from error
         if not addresses or any(not address.is_global for address in addresses):
-            raise FeedSecurityError("Feed location must resolve only to the public network")
+            raise BoundedPublicHttpsSecurityError(
+                "HTTPS location must resolve only to the public network"
+            )
         return parsed, addresses
 
     @staticmethod
-    def _validate_mime_type(response: httpx.Response) -> None:
+    def _validate_mime_type(
+        response: httpx.Response,
+        allowed_mime_types: frozenset[str],
+    ) -> None:
         content_type = response.headers.get("content-type", "")
         mime_type = content_type.partition(";")[0].strip().casefold()
-        if mime_type not in ALLOWED_FEED_MIME_TYPES:
-            raise FeedFetchError(f"Feed response has unsupported MIME type {mime_type!r}")
+        if mime_type not in allowed_mime_types:
+            raise BoundedPublicHttpsError(
+                f"HTTPS response has unsupported MIME type {mime_type!r}"
+            )
 
     def _read_bounded_body(self, response: httpx.Response) -> bytes:
         declared_length = response.headers.get("content-length")
@@ -219,18 +255,52 @@ class HttpFeedFetcher:
             try:
                 parsed_length = int(declared_length)
             except ValueError as error:
-                raise FeedFetchError("Feed response has an invalid Content-Length") from error
+                raise BoundedPublicHttpsError(
+                    "HTTPS response has an invalid Content-Length"
+                ) from error
             if parsed_length > self._max_response_bytes:
-                raise FeedFetchError("Feed response exceeds the size limit")
+                raise BoundedPublicHttpsError("HTTPS response exceeds the size limit")
 
         chunks: list[bytes] = []
         size = 0
         for chunk in response.iter_bytes():
             size += len(chunk)
             if size > self._max_response_bytes:
-                raise FeedFetchError("Feed response exceeds the size limit")
+                raise BoundedPublicHttpsError("HTTPS response exceeds the size limit")
             chunks.append(chunk)
         return b"".join(chunks)
+
+
+class HttpFeedFetcher:
+    def __init__(
+        self,
+        client: httpx.Client,
+        *,
+        resolver: HostResolver | None = None,
+        timeout_seconds: float = 10.0,
+        max_response_bytes: int = 2_000_000,
+        max_redirects: int = 3,
+    ) -> None:
+        self._fetcher = BoundedPublicHttpsFetcher(
+            client,
+            resolver=resolver,
+            timeout_seconds=timeout_seconds,
+            max_response_bytes=max_response_bytes,
+            max_redirects=max_redirects,
+        )
+
+    def fetch(self, source_definition: ApprovedFeedSourceDefinition) -> bytes:
+        try:
+            payload, _ = self._fetcher.fetch(
+                source_definition.entry_point,
+                allowed_mime_types=ALLOWED_FEED_MIME_TYPES,
+                user_agent="ai-intel-agent/0.1 feed-collector",
+            )
+            return payload
+        except BoundedPublicHttpsSecurityError as error:
+            raise FeedSecurityError(str(error).replace("HTTPS", "Feed", 1)) from error
+        except BoundedPublicHttpsError as error:
+            raise FeedFetchError(str(error).replace("HTTPS", "Feed", 1)) from error
 
 
 class SampleFeedFetcher:
