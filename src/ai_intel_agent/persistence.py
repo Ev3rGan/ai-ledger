@@ -106,6 +106,10 @@ class EvidenceSpanRecord(Base):
             "end_offset > start_offset",
             name="ck_evidence_spans_end_offset_after_start",
         ),
+        CheckConstraint(
+            "relation IN ('supports', 'contradicts')",
+            name="ck_evidence_spans_relation",
+        ),
         UniqueConstraint("claim_id", "document_version_id", "start_offset", "end_offset"),
     )
 
@@ -117,6 +121,7 @@ class EvidenceSpanRecord(Base):
     end_offset: Mapped[int] = mapped_column(Integer)
     text_hash: Mapped[str] = mapped_column(String(64))
     role: Mapped[str] = mapped_column(String(32))
+    relation: Mapped[str] = mapped_column(String(32))
 
 
 class TraceRecord(Base):
@@ -249,6 +254,7 @@ def _persist_sample_story(session: Session, sample: SampleStory) -> None:
             values["review_state"] = sample.story.review_state.value
         if record_type is EvidenceSpanRecord:
             values["role"] = values["role"].value
+            values["relation"] = values["relation"].value
         if record_type is TraceRecord:
             values["attributes"] = dict(values["attributes"])
         session.execute(insert(record_type).values(**values).on_conflict_do_nothing())

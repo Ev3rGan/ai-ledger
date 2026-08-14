@@ -50,6 +50,14 @@ _Avoid_: Chunk, citation, search result
 The relationship of an Evidence Span's source to a specific Claim: Primary, Independent, Secondary, or Community. A source can have different Evidence Roles for different Claims.
 _Avoid_: Authority, Support Strength, Publisher type
 
+**Evidence Relation**:
+The way an Evidence Span bears on its specific Claim: Supports or Contradicts. It is Claim-relative and separate from Evidence Role and Support Strength.
+_Avoid_: Evidence Role, polarity, stance
+
+**Evidence State**:
+A public qualitative summary of a Claim's available evidence: Single-source, Multi-source, Conflict, or Insufficient evidence. It is assessed per Claim rather than by counting all sources attached to a Story.
+_Avoid_: Confidence, source count, Story state
+
 **Chunk**:
 A rebuildable segment of a Document Version used to retrieve potentially relevant material. A Chunk is not evidence until selected as an Evidence Span.
 _Avoid_: Evidence, quote, claim

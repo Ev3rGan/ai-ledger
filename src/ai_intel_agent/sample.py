@@ -11,6 +11,7 @@ from ai_intel_agent.domain import (
     Candidate,
     Claim,
     DocumentVersion,
+    EvidenceRelation,
     EvidenceRole,
     EvidenceSpan,
     SampleStory,
@@ -165,6 +166,7 @@ def _assemble_sample_story(
         end_offset=start_offset + len(evidence_text),
         text_hash=_hash(evidence_text),
         role=EvidenceRole.PRIMARY,
+        relation=EvidenceRelation.SUPPORTS,
     )
     trace = StructuredTrace(
         id=_id("trace", version),
