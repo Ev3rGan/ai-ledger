@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -30,12 +31,14 @@ from ai_intel_agent.persistence import (
     DigestStoryRecord,
     DocumentVersionRecord,
     EvidenceSpanRecord,
+    SampleStoryRepository,
     StoryRecord,
     TraceRecord,
     create_database_engine,
     upgrade_database,
 )
 from ai_intel_agent.pipeline import persist_sample_story, publish_sample_digest
+from ai_intel_agent.sample import build_sample_story
 from ai_intel_agent.web import create_app
 
 runner = CliRunner()
@@ -496,39 +499,38 @@ def test_anonymous_visitor_reads_published_digest_through_web_and_rss(
 def test_public_surfaces_use_canonical_links_and_bounded_evidence_excerpts(
     postgres_url: str, empty_database
 ) -> None:
-    sample = persist_sample_story(postgres_url)
     canonical_url = "https://example.com/canonical-story"
     redirected_source_url = "https://cdn.example.com/redirected-copy"
     private_text = "证据" * 150 + "不得公开的原文结尾"
+    private_text_hash = sha256(private_text.encode("utf-8")).hexdigest()
     expected_excerpt = (
         private_text[: PUBLIC_EVIDENCE_EXCERPT_MAX_CHARACTERS - 1] + "…"
     )
 
+    original_sample = build_sample_story()
+    sample = replace(
+        original_sample,
+        candidate=replace(
+            original_sample.candidate,
+            canonical_url=canonical_url,
+        ),
+        document_version=replace(
+            original_sample.document_version,
+            source_url=redirected_source_url,
+            body=private_text,
+            content_hash=private_text_hash,
+        ),
+        evidence_span=replace(
+            original_sample.evidence_span,
+            exact_text=private_text,
+            start_offset=0,
+            end_offset=len(private_text),
+            text_hash=private_text_hash,
+        ),
+    )
+    SampleStoryRepository(empty_database).persist(sample)
+
     with Session(empty_database) as session:
-        session.execute(
-            update(CandidateRecord)
-            .where(CandidateRecord.id == sample.candidate.id)
-            .values(canonical_url=canonical_url)
-        )
-        session.execute(
-            update(DocumentVersionRecord)
-            .where(DocumentVersionRecord.id == sample.document_version.id)
-            .values(
-                source_url=redirected_source_url,
-                body=private_text,
-                content_hash=sha256(private_text.encode("utf-8")).hexdigest(),
-            )
-        )
-        session.execute(
-            update(EvidenceSpanRecord)
-            .where(EvidenceSpanRecord.id == sample.evidence_span.id)
-            .values(
-                exact_text=private_text,
-                start_offset=0,
-                end_offset=len(private_text),
-                text_hash=sha256(private_text.encode("utf-8")).hexdigest(),
-            )
-        )
         _publish_story_record(
             session,
             story_id=sample.story.id,
