@@ -51,13 +51,13 @@ class FirstWaveSourceDefinitionAudit:
 def run_source_definition_activation_audit(
     output_path: Path,
 ) -> FirstWaveSourceDefinitionAudit:
-    audit = _load_first_wave_audit()
+    audit = load_first_wave_source_definition_audit()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(_render_markdown(audit), encoding="utf-8")
     return audit
 
 
-def _load_first_wave_audit() -> FirstWaveSourceDefinitionAudit:
+def load_first_wave_source_definition_audit() -> FirstWaveSourceDefinitionAudit:
     resource = files("ai_intel_agent").joinpath("data/first_wave_source_audit.json")
     payload = json.loads(resource.read_text(encoding="utf-8"))
     source_definitions = tuple(

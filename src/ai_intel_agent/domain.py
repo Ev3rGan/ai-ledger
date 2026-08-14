@@ -38,6 +38,17 @@ class DigestState(StrEnum):
     PUBLISHED = "published"
 
 
+class CollectionRunStatus(StrEnum):
+    COMPLETE = "complete"
+    PARTIAL = "partial"
+    FAILED = "failed"
+
+
+class SourceDefinitionCollectionStatus(StrEnum):
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
 class AuditAction(StrEnum):
     STORY_ACCEPTED = "story.accepted"
     STORY_REJECTED = "story.rejected"
@@ -79,6 +90,58 @@ class DocumentVersion:
     body: str
     content_hash: str
     observed_at: datetime
+    published_at: datetime | None = None
+    published_at_raw: str | None = None
+    updated_at: datetime | None = None
+    updated_at_raw: str | None = None
+
+
+@dataclass(frozen=True)
+class ApprovedFeedSourceDefinition:
+    id: UUID
+    name: str
+    publisher: str
+    entry_point: str
+    audit_version: str
+    collection_schedule: str
+    discovery_method: str
+    language: str
+    topic_scope: tuple[Topic, ...]
+    access_constraints: tuple[str, ...]
+    extraction_adapter: str
+    health_policy: str
+    cursor: str
+    storage_policy: str
+    public_excerpt_policy: str
+    public_excerpt_max_characters: int
+    pause_conditions: tuple[str, ...]
+    canonical_url_prefixes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SourceDefinitionCollectionResult:
+    source_definition_id: UUID
+    status: SourceDefinitionCollectionStatus
+    candidate_count: int
+    error_code: str | None = None
+    error_message: str | None = None
+
+
+@dataclass(frozen=True)
+class CollectionRun:
+    id: UUID
+    retry_of_run_id: UUID | None
+    status: CollectionRunStatus
+    started_at: datetime
+    completed_at: datetime
+    source_definition_results: tuple[SourceDefinitionCollectionResult, ...]
+
+
+@dataclass(frozen=True)
+class CollectionDiscovery:
+    source_definition_id: UUID
+    candidate: Candidate
+    document_version: DocumentVersion
 
 
 @dataclass(frozen=True)

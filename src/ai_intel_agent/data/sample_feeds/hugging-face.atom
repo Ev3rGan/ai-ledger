@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <id>https://huggingface.co/blog/feed.xml</id>
+  <title>Hugging Face Blog</title>
+  <updated>2026-08-12T03:00:00Z</updated>
+  <entry>
+    <id>https://example.com/ai/open-model-evaluation</id>
+    <title>Open model evaluation gains evidence links</title>
+    <link rel="alternate" href="https://example.com/ai/open-model-evaluation" />
+    <updated>2026-08-12T03:00:00Z</updated>
+    <summary type="html">&lt;p&gt;The evaluation report links every score to its source evidence.&lt;/p&gt;</summary>
+  </entry>
+</feed>
