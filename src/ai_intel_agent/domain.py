@@ -15,6 +15,18 @@ class EvidenceRole(StrEnum):
     COMMUNITY = "community"
 
 
+class EvidenceRelation(StrEnum):
+    SUPPORTS = "supports"
+    CONTRADICTS = "contradicts"
+
+
+class EvidenceState(StrEnum):
+    SINGLE_SOURCE = "single-source"
+    MULTI_SOURCE = "multi-source"
+    CONFLICT = "conflict"
+    INSUFFICIENT_EVIDENCE = "insufficient-evidence"
+
+
 class StoryReviewState(StrEnum):
     UNREVIEWED = "unreviewed"
     ACCEPTED = "accepted"
@@ -97,6 +109,7 @@ class EvidenceSpan:
     end_offset: int
     text_hash: str
     role: EvidenceRole
+    relation: EvidenceRelation
 
 
 @dataclass(frozen=True)

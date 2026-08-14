@@ -2,35 +2,30 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date
 from email.utils import format_datetime
 from html import escape
 from urllib.parse import quote, urlsplit
-from uuid import UUID
 from xml.etree import ElementTree
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
-from sqlalchemy import Select, select
-from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session
 
-from ai_intel_agent.domain import EvidenceRole
-from ai_intel_agent.persistence import (
-    CandidateRecord,
-    ClaimRecord,
-    DigestRecord,
-    DigestStoryRecord,
-    DocumentVersionRecord,
-    EvidenceSpanRecord,
-    StoryRecord,
-    create_database_engine,
+from ai_intel_agent.domain import EvidenceRelation, EvidenceRole, EvidenceState
+from ai_intel_agent.persistence import create_database_engine
+from ai_intel_agent.publication import (
+    PublicClaim,
+    PublicDigest,
+    PublicEvidence,
+    PublicPublicationRepository,
+    PublicStory,
 )
 
-EVIDENCE_STATE_LABELS = {
-    "single-source": "单一来源",
-    "multi-source": "多来源",
+EVIDENCE_STATE_LABELS: dict[EvidenceState, str] = {
+    EvidenceState.SINGLE_SOURCE: "单一来源",
+    EvidenceState.MULTI_SOURCE: "多来源",
+    EvidenceState.CONFLICT: "证据冲突",
+    EvidenceState.INSUFFICIENT_EVIDENCE: "证据不足",
 }
 EVIDENCE_ROLE_LABELS: dict[EvidenceRole, str] = {
     EvidenceRole.PRIMARY: "第一方证据",
@@ -38,190 +33,10 @@ EVIDENCE_ROLE_LABELS: dict[EvidenceRole, str] = {
     EvidenceRole.SECONDARY: "二手证据",
     EvidenceRole.COMMUNITY: "社区证据",
 }
-
-
-@dataclass(frozen=True)
-class PublicEvidence:
-    exact_text: str
-    role: EvidenceRole
-    source_url: str
-    publisher: str
-
-
-@dataclass(frozen=True)
-class PublicClaim:
-    text: str
-    evidence: tuple[PublicEvidence, ...]
-
-
-@dataclass(frozen=True)
-class PublicStory:
-    stable_key: str
-    headline: str
-    claims: tuple[PublicClaim, ...]
-
-    @property
-    def evidence_state(self) -> str:
-        source_urls = {
-            evidence.source_url
-            for claim in self.claims
-            for evidence in claim.evidence
-        }
-        return "single-source" if len(source_urls) == 1 else "multi-source"
-
-
-@dataclass(frozen=True)
-class PublicDigest:
-    stable_key: str
-    publication_date: date
-    published_at: datetime
-    stories: tuple[PublicStory, ...]
-
-
-@dataclass
-class _ClaimBuilder:
-    text: str
-    evidence: list[PublicEvidence] = field(default_factory=list)
-    evidence_ids: set[UUID] = field(default_factory=set)
-
-
-@dataclass
-class _StoryBuilder:
-    stable_key: str
-    headline: str
-    claims: list[_ClaimBuilder] = field(default_factory=list)
-    claims_by_id: dict[UUID, _ClaimBuilder] = field(default_factory=dict)
-
-
-class PublicPublicationRepository:
-    """Read only the public projection of published Digests and their Stories."""
-
-    def __init__(self, engine: Engine) -> None:
-        self._engine = engine
-
-    def latest_digest(self) -> PublicDigest | None:
-        with Session(self._engine) as session:
-            record = session.scalars(self._published_digests_statement()).first()
-            return self._to_public_digest(session, record) if record is not None else None
-
-    def digest_for_date(self, publication_date: date) -> PublicDigest | None:
-        with Session(self._engine) as session:
-            record = session.scalars(
-                self._published_digests_statement().where(
-                    DigestRecord.publication_date == publication_date
-                )
-            ).first()
-            return self._to_public_digest(session, record) if record is not None else None
-
-    def published_digests(self) -> tuple[PublicDigest, ...]:
-        with Session(self._engine) as session:
-            records = session.scalars(self._published_digests_statement()).all()
-            return tuple(self._to_public_digest(session, record) for record in records)
-
-    def published_story(self, stable_key: str) -> PublicStory | None:
-        with Session(self._engine) as session:
-            stories = self._load_public_stories(session, stable_key=stable_key)
-            return stories[0] if stories else None
-
-    def browse_published_stories(self) -> tuple[PublicStory, ...]:
-        with Session(self._engine) as session:
-            return self._load_public_stories(session)
-
-    @staticmethod
-    def _published_digests_statement() -> Select[tuple[DigestRecord]]:
-        return (
-            select(DigestRecord)
-            .where(DigestRecord.state == "published")
-            .order_by(DigestRecord.publication_date.desc())
-        )
-
-    def _to_public_digest(
-        self, session: Session, record: DigestRecord
-    ) -> PublicDigest:
-        if record.published_at is None:
-            raise ValueError("A published Digest must have a publication time")
-        return PublicDigest(
-            stable_key=record.stable_key,
-            publication_date=record.publication_date,
-            published_at=record.published_at,
-            stories=self._load_public_stories(session, digest_id=record.id),
-        )
-
-    @staticmethod
-    def _load_public_stories(
-        session: Session,
-        *,
-        digest_id: UUID | None = None,
-        stable_key: str | None = None,
-    ) -> tuple[PublicStory, ...]:
-        statement = (
-            select(
-                StoryRecord.id.label("story_id"),
-                StoryRecord.stable_key,
-                StoryRecord.headline,
-                ClaimRecord.id.label("claim_id"),
-                ClaimRecord.text.label("claim_text"),
-                EvidenceSpanRecord.id.label("evidence_id"),
-                EvidenceSpanRecord.exact_text,
-                EvidenceSpanRecord.role,
-                DocumentVersionRecord.source_url,
-                CandidateRecord.publisher,
-            )
-            .join(DigestStoryRecord, DigestStoryRecord.story_id == StoryRecord.id)
-            .join(DigestRecord, DigestRecord.id == DigestStoryRecord.digest_id)
-            .join(ClaimRecord, ClaimRecord.story_id == StoryRecord.id)
-            .join(EvidenceSpanRecord, EvidenceSpanRecord.claim_id == ClaimRecord.id)
-            .join(
-                DocumentVersionRecord,
-                DocumentVersionRecord.id == EvidenceSpanRecord.document_version_id,
-            )
-            .join(CandidateRecord, CandidateRecord.id == DocumentVersionRecord.candidate_id)
-            .where(DigestRecord.state == "published")
-            .order_by(
-                DigestRecord.publication_date.desc(),
-                DigestStoryRecord.position,
-                ClaimRecord.position,
-                EvidenceSpanRecord.start_offset,
-            )
-        )
-        if digest_id is not None:
-            statement = statement.where(DigestRecord.id == digest_id)
-        if stable_key is not None:
-            statement = statement.where(StoryRecord.stable_key == stable_key)
-
-        builders: dict[UUID, _StoryBuilder] = {}
-        for row in session.execute(statement):
-            story = builders.setdefault(
-                row.story_id,
-                _StoryBuilder(stable_key=row.stable_key, headline=row.headline),
-            )
-            claim = story.claims_by_id.get(row.claim_id)
-            if claim is None:
-                claim = _ClaimBuilder(text=row.claim_text)
-                story.claims_by_id[row.claim_id] = claim
-                story.claims.append(claim)
-            if row.evidence_id not in claim.evidence_ids:
-                claim.evidence_ids.add(row.evidence_id)
-                claim.evidence.append(
-                    PublicEvidence(
-                        exact_text=row.exact_text,
-                        role=EvidenceRole(row.role),
-                        source_url=row.source_url,
-                        publisher=row.publisher,
-                    )
-                )
-
-        return tuple(
-            PublicStory(
-                stable_key=story.stable_key,
-                headline=story.headline,
-                claims=tuple(
-                    PublicClaim(text=claim.text, evidence=tuple(claim.evidence))
-                    for claim in story.claims
-                ),
-            )
-            for story in builders.values()
-        )
+EVIDENCE_RELATION_LABELS: dict[EvidenceRelation, str] = {
+    EvidenceRelation.SUPPORTS: "支持",
+    EvidenceRelation.CONTRADICTS: "反驳",
+}
 
 
 def create_app(database_url: str) -> FastAPI:
@@ -329,12 +144,9 @@ def _render_story(
             f'<a href="{escape(headline_url, quote=True)}">{headline}</a>'
         )
     claims = "".join(_render_claim(claim) for claim in story.claims)
-    evidence_state = story.evidence_state
     return (
         "<article>"
         f"<h2>{headline}</h2>"
-        f'<p data-evidence-state="{evidence_state}"><strong>证据状态：</strong>'
-        f"{EVIDENCE_STATE_LABELS[evidence_state]}</p>"
         f"{claims}</article>"
     )
 
@@ -353,12 +165,19 @@ def _render_linked_stories(
 
 
 def _render_claim(claim: PublicClaim) -> str:
+    evidence_state = claim.evidence_state
     evidence = "".join(_render_evidence(item) for item in claim.evidence)
-    return f"<section><p><strong>Claim：</strong>{escape(claim.text)}</p>{evidence}</section>"
+    return (
+        "<section>"
+        f"<p><strong>Claim：</strong>{escape(claim.text)}</p>"
+        f'<p data-evidence-state="{evidence_state.value}">'
+        f"<strong>证据状态：</strong>{EVIDENCE_STATE_LABELS[evidence_state]}</p>"
+        f"{evidence}</section>"
+    )
 
 
 def _render_evidence(evidence: PublicEvidence) -> str:
-    source_url = _safe_source_url(evidence.source_url)
+    source_url = _safe_source_url(evidence.canonical_url)
     source_link = ""
     if source_url is not None:
         source_link = (
@@ -367,9 +186,11 @@ def _render_evidence(evidence: PublicEvidence) -> str:
             f"{escape(source_url)}</a></p>"
         )
     role = EVIDENCE_ROLE_LABELS[evidence.role]
+    relation = EVIDENCE_RELATION_LABELS[evidence.relation]
     return (
         f"<blockquote>{escape(evidence.exact_text)}</blockquote>"
         f"<p><strong>Evidence Role：</strong>{escape(role)}</p>"
+        f"<p><strong>Evidence Relation：</strong>{escape(relation)}</p>"
         f"<p><strong>发布者：</strong>{escape(evidence.publisher)}</p>"
         f"{source_link}"
     )

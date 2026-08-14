@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import os
+from datetime import UTC, date, datetime
 from hashlib import sha256
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 from xml.etree import ElementTree
 
 import pytest
@@ -15,6 +16,12 @@ from sqlalchemy.orm import Session
 from typer.testing import CliRunner
 
 from ai_intel_agent.cli import app
+from ai_intel_agent.domain import (
+    DigestState,
+    EvidenceRelation,
+    EvidenceRole,
+    StoryReviewState,
+)
 from ai_intel_agent.persistence import (
     AuditEventRecord,
     CandidateRecord,
@@ -32,6 +39,7 @@ from ai_intel_agent.pipeline import persist_sample_story, publish_sample_digest
 from ai_intel_agent.web import create_app
 
 runner = CliRunner()
+PUBLIC_EVIDENCE_EXCERPT_MAX_CHARACTERS = 280
 RECORD_TYPES = (
     CandidateRecord,
     DocumentVersionRecord,
@@ -87,6 +95,93 @@ def empty_database(postgres_url: str):
         session.commit()
     yield engine
     engine.dispose()
+
+
+def _publish_story_record(
+    session: Session,
+    *,
+    story_id: UUID,
+    publication_date: date,
+) -> None:
+    digest_id = uuid4()
+    session.execute(
+        update(StoryRecord)
+        .where(StoryRecord.id == story_id)
+        .values(review_state=StoryReviewState.ACCEPTED.value)
+    )
+    session.execute(
+        insert(DigestRecord).values(
+            id=digest_id,
+            stable_key=f"test-digest:{publication_date.isoformat()}:{digest_id}",
+            publication_date=publication_date,
+            state=DigestState.DRAFT.value,
+            published_at=None,
+        )
+    )
+    session.execute(
+        insert(DigestStoryRecord).values(
+            digest_id=digest_id,
+            story_id=story_id,
+            position=0,
+        )
+    )
+    session.execute(
+        update(DigestRecord)
+        .where(DigestRecord.id == digest_id)
+        .values(
+            state=DigestState.PUBLISHED.value,
+            published_at=datetime(2026, 8, 13, 6, tzinfo=UTC),
+        )
+    )
+
+
+def _insert_evidence_source(
+    session: Session,
+    *,
+    claim_id: UUID,
+    canonical_url: str,
+    publisher: str,
+    evidence_text: str,
+    role: EvidenceRole,
+    relation: EvidenceRelation = EvidenceRelation.SUPPORTS,
+) -> None:
+    candidate_id = uuid4()
+    document_id = uuid4()
+    body = f"{publisher}：{evidence_text}"
+    start_offset = body.index(evidence_text)
+    session.execute(
+        insert(CandidateRecord).values(
+            id=candidate_id,
+            title=f"{publisher} Evidence",
+            canonical_url=canonical_url,
+            publisher=publisher,
+            discovered_at=datetime(2026, 8, 13, tzinfo=UTC),
+        )
+    )
+    session.execute(
+        insert(DocumentVersionRecord).values(
+            id=document_id,
+            candidate_id=candidate_id,
+            source_url=canonical_url,
+            title=f"{publisher} Evidence",
+            body=body,
+            content_hash=sha256(body.encode("utf-8")).hexdigest(),
+            observed_at=datetime(2026, 8, 13, tzinfo=UTC),
+        )
+    )
+    session.execute(
+        insert(EvidenceSpanRecord).values(
+            id=uuid4(),
+            claim_id=claim_id,
+            document_version_id=document_id,
+            exact_text=evidence_text,
+            start_offset=start_offset,
+            end_offset=start_offset + len(evidence_text),
+            text_hash=sha256(evidence_text.encode("utf-8")).hexdigest(),
+            role=role.value,
+            relation=relation.value,
+        )
+    )
 
 
 @pytest.mark.postgres
@@ -154,12 +249,13 @@ def test_sample_cli_twice_reviews_stories_and_publishes_one_digest(
             )
             .where(StoryRecord.id == accepted_story_id)
         )
-        exact_text, start_offset, end_offset, text_hash = session.execute(
+        exact_text, start_offset, end_offset, text_hash, relation = session.execute(
             select(
                 EvidenceSpanRecord.exact_text,
                 EvidenceSpanRecord.start_offset,
                 EvidenceSpanRecord.end_offset,
                 EvidenceSpanRecord.text_hash,
+                EvidenceSpanRecord.relation,
             )
             .join(ClaimRecord, EvidenceSpanRecord.claim_id == ClaimRecord.id)
             .join(StoryRecord, ClaimRecord.story_id == StoryRecord.id)
@@ -204,6 +300,7 @@ def test_sample_cli_twice_reviews_stories_and_publishes_one_digest(
     assert trace_evidence_span_id == evidence_span_id
     assert document_body[start_offset:end_offset] == exact_text
     assert sha256(exact_text.encode("utf-8")).hexdigest() == text_hash
+    assert relation == EvidenceRelation.SUPPORTS.value
     assert digest_id == first_digest_id
     assert digest_stable_key == "sample-digest:2026-08-12"
     assert digest_state == "published"
@@ -285,7 +382,8 @@ def test_sample_cli_twice_reviews_stories_and_publishes_one_digest(
             start_offset=0,
             end_offset=1,
             text_hash="0" * 64,
-            role="primary",
+            role=EvidenceRole.PRIMARY.value,
+            relation=EvidenceRelation.SUPPORTS.value,
         ),
     )
     for statement in immutable_writes:
@@ -392,3 +490,269 @@ def test_anonymous_visitor_reads_published_digest_through_web_and_rss(
     assert items[0].findtext("link") == "http://testserver/digests/2026-08-12"
     description = items[0].findtext("description") or ""
     assert all(value in description for value in public_values)
+
+
+@pytest.mark.postgres
+def test_public_surfaces_use_canonical_links_and_bounded_evidence_excerpts(
+    postgres_url: str, empty_database
+) -> None:
+    sample = persist_sample_story(postgres_url)
+    canonical_url = "https://example.com/canonical-story"
+    redirected_source_url = "https://cdn.example.com/redirected-copy"
+    private_text = "证据" * 150 + "不得公开的原文结尾"
+    expected_excerpt = (
+        private_text[: PUBLIC_EVIDENCE_EXCERPT_MAX_CHARACTERS - 1] + "…"
+    )
+
+    with Session(empty_database) as session:
+        session.execute(
+            update(CandidateRecord)
+            .where(CandidateRecord.id == sample.candidate.id)
+            .values(canonical_url=canonical_url)
+        )
+        session.execute(
+            update(DocumentVersionRecord)
+            .where(DocumentVersionRecord.id == sample.document_version.id)
+            .values(
+                source_url=redirected_source_url,
+                body=private_text,
+                content_hash=sha256(private_text.encode("utf-8")).hexdigest(),
+            )
+        )
+        session.execute(
+            update(EvidenceSpanRecord)
+            .where(EvidenceSpanRecord.id == sample.evidence_span.id)
+            .values(
+                exact_text=private_text,
+                start_offset=0,
+                end_offset=len(private_text),
+                text_hash=sha256(private_text.encode("utf-8")).hexdigest(),
+            )
+        )
+        _publish_story_record(
+            session,
+            story_id=sample.story.id,
+            publication_date=date(2026, 8, 13),
+        )
+        session.commit()
+
+    with TestClient(create_app(postgres_url)) as client:
+        responses = (
+            client.get("/"),
+            client.get("/digests/2026-08-13"),
+            client.get("/stories/sample-story-v1"),
+            client.get("/browse"),
+            client.get("/rss.xml"),
+        )
+
+    for response in responses:
+        assert response.status_code == 200
+        assert canonical_url in response.text
+        assert redirected_source_url not in response.text
+        assert expected_excerpt in response.text
+        assert private_text not in response.text
+        assert "不得公开的原文结尾" not in response.text
+
+
+@pytest.mark.postgres
+def test_public_surfaces_fail_closed_when_a_digest_contains_a_rejected_story(
+    postgres_url: str, empty_database
+) -> None:
+    publish_sample_digest(postgres_url)
+    publication_date = date(2026, 8, 14)
+    digest_id = uuid4()
+
+    with Session(empty_database) as session:
+        rejected_story_id = session.scalar(
+            select(StoryRecord.id).where(
+                StoryRecord.stable_key == "sample-story-v1-rejected"
+            )
+        )
+        session.execute(
+            update(StoryRecord)
+            .where(StoryRecord.id == rejected_story_id)
+            .values(review_state=StoryReviewState.ACCEPTED.value)
+        )
+        session.execute(
+            insert(DigestRecord).values(
+                id=digest_id,
+                stable_key="test-digest:2026-08-14",
+                publication_date=publication_date,
+                state=DigestState.DRAFT.value,
+                published_at=None,
+            )
+        )
+        session.execute(
+            insert(DigestStoryRecord).values(
+                digest_id=digest_id,
+                story_id=rejected_story_id,
+                position=0,
+            )
+        )
+        session.execute(
+            update(StoryRecord)
+            .where(StoryRecord.id == rejected_story_id)
+            .values(review_state=StoryReviewState.REJECTED.value)
+        )
+        session.execute(
+            update(DigestRecord)
+            .where(DigestRecord.id == digest_id)
+            .values(
+                state=DigestState.PUBLISHED.value,
+                published_at=datetime(2026, 8, 14, 6, tzinfo=UTC),
+            )
+        )
+        session.commit()
+
+    rejected_headline = "证据不足的 AI 性能声明"
+    with TestClient(create_app(postgres_url)) as client:
+        responses = (
+            client.get("/"),
+            client.get("/digests/2026-08-14"),
+            client.get("/browse"),
+            client.get("/rss.xml"),
+        )
+        rejected_story = client.get("/stories/sample-story-v1-rejected")
+
+    assert rejected_story.status_code == 404
+    for response in responses:
+        assert response.status_code == 200
+        assert rejected_headline not in response.text
+
+
+@pytest.mark.postgres
+def test_evidence_state_is_evaluated_relative_to_each_claim(
+    postgres_url: str, empty_database
+) -> None:
+    sample = persist_sample_story(postgres_url)
+    second_claim_id = uuid4()
+
+    with Session(empty_database) as session:
+        session.execute(
+            insert(ClaimRecord).values(
+                id=second_claim_id,
+                story_id=sample.story.id,
+                position=1,
+                text="第二个发布者宣布了另一个事实。",
+            )
+        )
+        _insert_evidence_source(
+            session,
+            claim_id=second_claim_id,
+            canonical_url="https://second.example.com/fact",
+            publisher="第二个发布者",
+            evidence_text="另一个可独立判断的事实",
+            role=EvidenceRole.PRIMARY,
+        )
+        _publish_story_record(
+            session,
+            story_id=sample.story.id,
+            publication_date=date(2026, 8, 13),
+        )
+        session.commit()
+
+    with TestClient(create_app(postgres_url)) as client:
+        story = client.get("/stories/sample-story-v1")
+
+    assert story.status_code == 200
+    assert 'data-evidence-state="single-source"' in story.text
+    assert "单一来源" in story.text
+    assert "多来源" not in story.text
+
+
+@pytest.mark.postgres
+def test_claim_without_evidence_is_visible_as_insufficient_evidence(
+    postgres_url: str, empty_database
+) -> None:
+    sample = persist_sample_story(postgres_url)
+    unsupported_claim = "这个 Claim 尚无可公开的 Evidence Span。"
+
+    with Session(empty_database) as session:
+        session.execute(
+            insert(ClaimRecord).values(
+                id=uuid4(),
+                story_id=sample.story.id,
+                position=1,
+                text=unsupported_claim,
+            )
+        )
+        _publish_story_record(
+            session,
+            story_id=sample.story.id,
+            publication_date=date(2026, 8, 13),
+        )
+        session.commit()
+
+    with TestClient(create_app(postgres_url)) as client:
+        story = client.get("/stories/sample-story-v1")
+
+    assert story.status_code == 200
+    assert unsupported_claim in story.text
+    assert 'data-evidence-state="insufficient-evidence"' in story.text
+    assert "证据不足" in story.text
+
+
+@pytest.mark.postgres
+def test_two_independent_sources_are_multi_source_for_the_same_claim(
+    postgres_url: str, empty_database
+) -> None:
+    sample = persist_sample_story(postgres_url)
+
+    with Session(empty_database) as session:
+        session.execute(
+            update(EvidenceSpanRecord)
+            .where(EvidenceSpanRecord.id == sample.evidence_span.id)
+            .values(role=EvidenceRole.INDEPENDENT.value)
+        )
+        _insert_evidence_source(
+            session,
+            claim_id=sample.claim.id,
+            canonical_url="https://independent.example.com/confirmation",
+            publisher="独立确认者",
+            evidence_text="独立确认了相同的 Claim",
+            role=EvidenceRole.INDEPENDENT,
+        )
+        _publish_story_record(
+            session,
+            story_id=sample.story.id,
+            publication_date=date(2026, 8, 13),
+        )
+        session.commit()
+
+    with TestClient(create_app(postgres_url)) as client:
+        story = client.get("/stories/sample-story-v1")
+
+    assert story.status_code == 200
+    assert 'data-evidence-state="multi-source"' in story.text
+    assert "多来源" in story.text
+
+
+@pytest.mark.postgres
+def test_supporting_and_contradicting_evidence_is_visible_as_conflict(
+    postgres_url: str, empty_database
+) -> None:
+    sample = persist_sample_story(postgres_url)
+
+    with Session(empty_database) as session:
+        _insert_evidence_source(
+            session,
+            claim_id=sample.claim.id,
+            canonical_url="https://independent.example.com/contradiction",
+            publisher="独立核查者",
+            evidence_text="独立核查结果与该 Claim 矛盾",
+            role=EvidenceRole.INDEPENDENT,
+            relation=EvidenceRelation.CONTRADICTS,
+        )
+        _publish_story_record(
+            session,
+            story_id=sample.story.id,
+            publication_date=date(2026, 8, 13),
+        )
+        session.commit()
+
+    with TestClient(create_app(postgres_url)) as client:
+        story = client.get("/stories/sample-story-v1")
+
+    assert story.status_code == 200
+    assert 'data-evidence-state="conflict"' in story.text
+    assert "证据冲突" in story.text
