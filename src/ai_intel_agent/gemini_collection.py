@@ -611,7 +611,7 @@ def collect_gemini_release_notes(
         drafts_created = 0
         for discovery in discoveries:
             document = discovery.document_version
-            if draft_repository.has_draft_for_document_version(document.id):
+            if draft_repository.has_draft_for_candidate(discovery.candidate.id):
                 continue
             prepared = provider.prepare(document)
             story, claims, evidence_spans, traces = _build_draft_records(
@@ -700,12 +700,12 @@ def _build_draft_records(
 ]:
     story_id = uuid5(
         NAMESPACE_URL,
-        f"ai-intel-agent:gemini-draft-story:{document.id}:{prepared.protocol_version}",
+        f"ai-intel-agent:gemini-draft-story:{document.candidate_id}",
     )
     story = Story(
         id=story_id,
         primary_document_version_id=document.id,
-        stable_key=f"gemini-release:{document.candidate_id}:{document.content_hash[:16]}",
+        stable_key=f"gemini-release:{document.candidate_id}",
         headline=prepared.headline,
         occurred_at=document.published_at or occurred_at,
         review_state=StoryReviewState.UNREVIEWED,

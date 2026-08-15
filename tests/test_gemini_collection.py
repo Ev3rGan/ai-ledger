@@ -84,12 +84,19 @@ def gemini_database_url():
 
 
 @pytest.mark.postgres
-def test_collect_gemini_cli_persists_exact_draft_once(
+def test_collect_gemini_cli_keeps_one_story_when_source_revision_changes(
     gemini_database_url: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider_calls: list[dict[str, object]] = []
     fixture_html = FIXTURE.read_text(encoding="utf-8")
+    revised_fixture_html = fixture_html.replace(
+        "<li>The deprecated preview model shuts down on September 1, 2026.</li>",
+        "<li>Deployment guidance was clarified after publication.</li>\n"
+        "        <li>The deprecated preview model shuts down on September 1, 2026.</li>",
+    )
+    assert revised_fixture_html != fixture_html
+    source_fetches = 0
     provider_output = {
         "headline": "Gemini 3.6 Flash 正式发布",
         "claims": [
@@ -105,14 +112,17 @@ def test_collect_gemini_cli_persists_exact_draft_once(
     }
 
     def handle_request(request: httpx.Request) -> httpx.Response:
+        nonlocal source_fetches
         if request.method == "GET" and request.headers["host"] == "ai.google.dev":
             assert request.url.host == str(PUBLIC_ADDRESS)
             assert request.extensions["sni_hostname"] == "ai.google.dev"
+            source_html = fixture_html if source_fetches == 0 else revised_fixture_html
+            source_fetches += 1
             return httpx.Response(
                 200,
                 request=request,
                 headers={"content-type": "text/html; charset=utf-8"},
-                text=fixture_html,
+                text=source_html,
             )
         if request.method == "POST" and request.url.host == "api.deepseek.com":
             payload = json.loads(request.content)
@@ -164,8 +174,14 @@ def test_collect_gemini_cli_persists_exact_draft_once(
     second = runner.invoke(app, ["collect-gemini"], env=environment)
     assert second.exit_code == 0, second.output
     assert "sections_collected=1" in second.output
-    assert "document_versions_created=0" in second.output
+    assert "document_versions_created=1" in second.output
     assert "drafts_created=0" in second.output
+
+    third = runner.invoke(app, ["collect-gemini"], env=environment)
+    assert third.exit_code == 0, third.output
+    assert "sections_collected=1" in third.output
+    assert "document_versions_created=0" in third.output
+    assert "drafts_created=0" in third.output
     assert len(provider_calls) == 1
 
     engine = create_database_engine(gemini_database_url)
@@ -186,7 +202,7 @@ def test_collect_gemini_cli_persists_exact_draft_once(
                 )
             }
             candidate = session.scalar(select(CandidateRecord))
-            document = session.scalar(select(DocumentVersionRecord))
+            documents = session.scalars(select(DocumentVersionRecord)).all()
             story = session.scalar(select(StoryRecord))
             claims = session.scalars(select(ClaimRecord).order_by(ClaimRecord.position)).all()
             evidence = session.scalars(
@@ -202,18 +218,25 @@ def test_collect_gemini_cli_persists_exact_draft_once(
     assert counts == {
         "source_definitions": 1,
         "candidates": 1,
-        "document_versions": 1,
+        "document_versions": 2,
         "stories": 1,
         "claims": 2,
         "evidence_spans": 2,
         "structured_traces": 2,
     }
-    assert discovery_count == 2
+    assert discovery_count == 3
     assert candidate is not None
     assert candidate.canonical_url == f"{RELEASE_NOTES_URL}#august-12-2026"
-    assert document is not None
-    assert document.content_hash == sha256(document.body.encode("utf-8")).hexdigest()
+    assert len(documents) == 2
+    assert all(
+        document.content_hash == sha256(document.body.encode("utf-8")).hexdigest()
+        for document in documents
+    )
+    assert len({document.content_hash for document in documents}) == 2
     assert story is not None
+    document = next(
+        item for item in documents if item.id == story.primary_document_version_id
+    )
     assert story.headline == provider_output["headline"]
     assert story.review_state == StoryReviewState.UNREVIEWED.value
     assert [claim.text for claim in claims] == [

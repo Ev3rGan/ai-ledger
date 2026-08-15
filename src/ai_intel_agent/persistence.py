@@ -432,12 +432,18 @@ class GeminiDraftRepository:
                 )
             )
 
-    def has_draft_for_document_version(self, document_version_id: UUID) -> bool:
+    def has_draft_for_candidate(self, candidate_id: UUID) -> bool:
         with Session(self._engine) as session:
             return (
                 session.scalar(
-                    select(StoryRecord.id).where(
-                        StoryRecord.primary_document_version_id == document_version_id
+                    select(StoryRecord.id)
+                    .join(
+                        DocumentVersionRecord,
+                        StoryRecord.primary_document_version_id
+                        == DocumentVersionRecord.id,
+                    )
+                    .where(
+                        DocumentVersionRecord.candidate_id == candidate_id
                     )
                 )
                 is not None
