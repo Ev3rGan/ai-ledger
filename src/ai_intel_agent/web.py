@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import date
@@ -9,7 +10,8 @@ from urllib.parse import quote, urlsplit
 from xml.etree import ElementTree
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field
 
 from ai_intel_agent.domain import EvidenceRelation, EvidenceRole, EvidenceState
 from ai_intel_agent.persistence import create_database_engine
@@ -19,6 +21,11 @@ from ai_intel_agent.publication import (
     PublicEvidence,
     PublicPublicationRepository,
     PublicStory,
+)
+from ai_intel_agent.research import (
+    ResearchProvider,
+    ResearchRepository,
+    stream_research_events,
 )
 
 EVIDENCE_STATE_LABELS: dict[EvidenceState, str] = {
@@ -39,9 +46,20 @@ EVIDENCE_RELATION_LABELS: dict[EvidenceRelation, str] = {
 }
 
 
-def create_app(database_url: str) -> FastAPI:
+class ResearchQuestion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question: str = Field(min_length=1, max_length=500)
+
+
+def create_app(
+    database_url: str,
+    *,
+    research_provider: ResearchProvider | None = None,
+) -> FastAPI:
     engine = create_database_engine(database_url)
     repository = PublicPublicationRepository(engine)
+    research_repository = ResearchRepository(engine)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -102,6 +120,23 @@ def create_app(database_url: str) -> FastAPI:
         )
         return HTMLResponse(_render_page("Browse", content))
 
+    @app.get("/research", response_class=HTMLResponse, name="research")
+    def research() -> HTMLResponse:
+        return HTMLResponse(_render_page("Research", _render_research_page()))
+
+    @app.post("/research/answer", name="research_answer")
+    def research_answer(payload: ResearchQuestion) -> StreamingResponse:
+        events = stream_research_events(
+            payload.question,
+            repository=research_repository,
+            provider=research_provider,
+        )
+        return StreamingResponse(
+            (_encode_sse(event, data) for event, data in events),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+        )
+
     @app.get("/rss.xml", name="rss")
     def rss(request: Request) -> Response:
         body = _render_rss(
@@ -130,6 +165,7 @@ def _render_page(title: str, content: str) -> str:
         "solid #bbb;margin-top:1.5rem;padding-top:1rem}blockquote{margin-left:0;padding-left:1rem;"
         "border-left:3px solid #777}a{color:#075985}</style></head><body>"
         '<nav><a href="/">首页</a><a href="/browse">Browse</a>'
+        '<a href="/research">Research</a>'
         '<a href="/rss.xml">RSS</a></nav><main>'
         f"{content}</main></body></html>"
     )
@@ -168,7 +204,7 @@ def _render_claim(claim: PublicClaim) -> str:
     evidence_state = claim.evidence_state
     evidence = "".join(_render_evidence(item) for item in claim.evidence)
     return (
-        "<section>"
+        f'<section id="claim-{claim.id}">'
         f"<p><strong>Claim：</strong>{escape(claim.text)}</p>"
         f'<p data-evidence-state="{evidence_state.value}">'
         f"<strong>证据状态：</strong>{EVIDENCE_STATE_LABELS[evidence_state]}</p>"
@@ -188,7 +224,7 @@ def _render_evidence(evidence: PublicEvidence) -> str:
     role = EVIDENCE_ROLE_LABELS[evidence.role]
     relation = EVIDENCE_RELATION_LABELS[evidence.relation]
     return (
-        f"<blockquote>{escape(evidence.exact_text)}</blockquote>"
+        f'<blockquote id="evidence-{evidence.id}">{escape(evidence.exact_text)}</blockquote>'
         f"<p><strong>Evidence Role：</strong>{escape(role)}</p>"
         f"<p><strong>Evidence Relation：</strong>{escape(relation)}</p>"
         f"<p><strong>发布者：</strong>{escape(evidence.publisher)}</p>"
@@ -201,6 +237,95 @@ def _safe_source_url(value: str) -> str | None:
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return None
     return value
+
+
+def _render_research_page() -> str:
+    return r"""
+<h1>Research</h1>
+<form id="research-form">
+  <label for="research-question">问题</label>
+  <textarea id="research-question" maxlength="500" rows="4" required></textarea>
+  <button type="submit">提问</button>
+</form>
+<p id="research-status" role="status"></p>
+<p id="research-answer"></p>
+<p id="research-refusal"></p>
+<ul id="research-citations"></ul>
+<script>
+(() => {
+  const form = document.getElementById("research-form");
+  const question = document.getElementById("research-question");
+  const status = document.getElementById("research-status");
+  const answer = document.getElementById("research-answer");
+  const refusal = document.getElementById("research-refusal");
+  const citations = document.getElementById("research-citations");
+
+  function handleEvent(block) {
+    let event = "";
+    let data = "";
+    for (const line of block.split("\n")) {
+      if (line.startsWith("event: ")) event = line.slice(7);
+      if (line.startsWith("data: ")) data += line.slice(6);
+    }
+    if (!event || !data) return;
+    const payload = JSON.parse(data);
+    if (event === "status") {
+      status.textContent = payload.state === "retrieving" ? "正在检索…" : "正在生成…";
+    } else if (event === "answer.delta") {
+      answer.textContent += payload.text;
+    } else if (event === "citation") {
+      const item = document.createElement("li");
+      const link = document.createElement("a");
+      link.href = payload.evidence_url;
+      link.textContent = `${payload.story_title} — ${payload.claim_text} — ${payload.evidence_text}`;
+      item.appendChild(link);
+      citations.appendChild(item);
+    } else if (event === "refusal" || event === "error") {
+      refusal.textContent = payload.message;
+    } else if (event === "done") {
+      status.textContent = payload.status === "answered" ? "回答完成" : "已结束";
+    }
+  }
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    answer.textContent = "";
+    refusal.textContent = "";
+    citations.replaceChildren();
+    status.textContent = "正在连接…";
+    try {
+      const response = await fetch("/research/answer", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({question: question.value}),
+      });
+      if (!response.ok || !response.body) throw new Error("Research request failed");
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const {value, done} = await reader.read();
+        buffer += decoder.decode(value || new Uint8Array(), {stream: !done});
+        let boundary;
+        while ((boundary = buffer.indexOf("\n\n")) >= 0) {
+          handleEvent(buffer.slice(0, boundary));
+          buffer = buffer.slice(boundary + 2);
+        }
+        if (done) break;
+      }
+    } catch (_) {
+      status.textContent = "请求失败";
+      refusal.textContent = "Research 服务当前不可用。";
+    }
+  });
+})();
+</script>
+"""
+
+
+def _encode_sse(event: str, data: dict[str, object]) -> str:
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    return f"event: {event}\ndata: {payload}\n\n"
 
 
 def _render_rss(

@@ -30,6 +30,7 @@ PUBLIC_EVIDENCE_EXCERPT_MAX_CHARACTERS = 280
 
 @dataclass(frozen=True)
 class PublicEvidence:
+    id: UUID
     exact_text: str
     role: EvidenceRole
     relation: EvidenceRelation
@@ -39,6 +40,7 @@ class PublicEvidence:
 
 @dataclass(frozen=True)
 class PublicClaim:
+    id: UUID
     text: str
     evidence: tuple[PublicEvidence, ...]
 
@@ -72,6 +74,7 @@ class PublicClaim:
 
 @dataclass(frozen=True)
 class PublicStory:
+    id: UUID
     stable_key: str
     headline: str
     claims: tuple[PublicClaim, ...]
@@ -87,6 +90,7 @@ class PublicDigest:
 
 @dataclass
 class _ClaimBuilder:
+    id: UUID
     text: str
     evidence: list[PublicEvidence] = field(default_factory=list)
     evidence_ids: set[UUID] = field(default_factory=set)
@@ -94,6 +98,7 @@ class _ClaimBuilder:
 
 @dataclass
 class _StoryBuilder:
+    id: UUID
     stable_key: str
     headline: str
     claims: list[_ClaimBuilder] = field(default_factory=list)
@@ -208,20 +213,25 @@ class PublicPublicationRepository:
         for row in session.execute(statement):
             story = builders.setdefault(
                 row.story_id,
-                _StoryBuilder(stable_key=row.stable_key, headline=row.headline),
+                _StoryBuilder(
+                    id=row.story_id,
+                    stable_key=row.stable_key,
+                    headline=row.headline,
+                ),
             )
             if row.claim_id is None:
                 continue
             claim = story.claims_by_id.get(row.claim_id)
             if claim is None:
-                claim = _ClaimBuilder(text=row.claim_text)
+                claim = _ClaimBuilder(id=row.claim_id, text=row.claim_text)
                 story.claims_by_id[row.claim_id] = claim
                 story.claims.append(claim)
             if row.evidence_id is not None and row.evidence_id not in claim.evidence_ids:
                 claim.evidence_ids.add(row.evidence_id)
                 claim.evidence.append(
                     PublicEvidence(
-                        exact_text=_bounded_public_excerpt(row.exact_text),
+                        id=row.evidence_id,
+                        exact_text=bounded_public_evidence_excerpt(row.exact_text),
                         role=EvidenceRole(row.role),
                         relation=EvidenceRelation(row.relation),
                         canonical_url=row.canonical_url,
@@ -231,10 +241,15 @@ class PublicPublicationRepository:
 
         return tuple(
             PublicStory(
+                id=story.id,
                 stable_key=story.stable_key,
                 headline=story.headline,
                 claims=tuple(
-                    PublicClaim(text=claim.text, evidence=tuple(claim.evidence))
+                    PublicClaim(
+                        id=claim.id,
+                        text=claim.text,
+                        evidence=tuple(claim.evidence),
+                    )
                     for claim in story.claims
                 ),
             )
@@ -242,7 +257,7 @@ class PublicPublicationRepository:
         )
 
 
-def _bounded_public_excerpt(exact_text: str) -> str:
+def bounded_public_evidence_excerpt(exact_text: str) -> str:
     if len(exact_text) <= PUBLIC_EVIDENCE_EXCERPT_MAX_CHARACTERS:
         return exact_text
     return exact_text[: PUBLIC_EVIDENCE_EXCERPT_MAX_CHARACTERS - 1] + "…"

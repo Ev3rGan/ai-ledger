@@ -52,6 +52,7 @@ from ai_intel_agent.persistence import (
     database_url_from_environment,
 )
 from ai_intel_agent.pipeline import publish_sample_digest
+from ai_intel_agent.research import DeepSeekResearchProvider, ResearchError
 from ai_intel_agent.retrieval_calibration import (
     FastEmbedCalibrationRuntime,
     RetrievalCalibrationConfigurationError,
@@ -120,7 +121,21 @@ def serve(
 
     from ai_intel_agent.web import create_app
 
-    uvicorn.run(create_app(database_url), host=host, port=port)
+    api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    if not api_key:
+        uvicorn.run(create_app(database_url), host=host, port=port)
+        return
+
+    with httpx.Client(timeout=60.0) as client:
+        try:
+            research_provider = DeepSeekResearchProvider(client, api_key=api_key)
+        except ResearchError as error:
+            raise typer.BadParameter(str(error)) from error
+        uvicorn.run(
+            create_app(database_url, research_provider=research_provider),
+            host=host,
+            port=port,
+        )
 
 
 @contextmanager
