@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import replace
 from datetime import date, datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -32,12 +33,16 @@ from ai_intel_agent.domain import (
     AuditAction,
     AuditEvent,
     AuditSubjectType,
+    Claim,
     CollectionDiscovery,
     CollectionRun,
     DigestState,
+    EvidenceSpan,
     SampleDigestPublication,
     SampleStory,
+    Story,
     StoryReviewState,
+    StructuredTrace,
 )
 from alembic import command
 
@@ -406,6 +411,108 @@ class FeedCollectionRepository:
             session.flush()
             run_record.status = run.status.value
             run_record.completed_at = run.completed_at
+
+
+class GeminiDraftRepository:
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def known_document_version_ids(
+        self,
+        document_version_ids: set[UUID],
+    ) -> set[UUID]:
+        if not document_version_ids:
+            return set()
+        with Session(self._engine) as session:
+            return set(
+                session.scalars(
+                    select(DocumentVersionRecord.id).where(
+                        DocumentVersionRecord.id.in_(document_version_ids)
+                    )
+                )
+            )
+
+    def has_draft_for_candidate(self, candidate_id: UUID) -> bool:
+        with Session(self._engine) as session:
+            return (
+                session.scalar(
+                    select(StoryRecord.id)
+                    .join(
+                        DocumentVersionRecord,
+                        StoryRecord.primary_document_version_id
+                        == DocumentVersionRecord.id,
+                    )
+                    .where(
+                        DocumentVersionRecord.candidate_id == candidate_id
+                    )
+                )
+                is not None
+            )
+
+    def persist(
+        self,
+        story: Story,
+        claims: tuple[Claim, ...],
+        evidence_spans: tuple[EvidenceSpan, ...],
+        traces: tuple[StructuredTrace, ...],
+    ) -> bool:
+        if not claims or not (
+            len(claims) == len(evidence_spans) == len(traces)
+        ):
+            raise ValueError("A Gemini draft requires one Evidence Span and Trace per Claim")
+        with Session(self._engine) as session, session.begin():
+            if session.get(StoryRecord, story.id) is not None:
+                return False
+            document = session.get(DocumentVersionRecord, story.primary_document_version_id)
+            if document is None:
+                raise ValueError("Gemini draft Document Version does not exist")
+            for position, (claim, evidence, trace) in enumerate(
+                zip(claims, evidence_spans, traces, strict=True)
+            ):
+                if (
+                    claim.story_id != story.id
+                    or claim.position != position
+                    or evidence.claim_id != claim.id
+                    or evidence.document_version_id != document.id
+                    or trace.evidence_span_id != evidence.id
+                    or evidence.exact_text
+                    != document.body[evidence.start_offset : evidence.end_offset]
+                    or evidence.text_hash
+                    != sha256(evidence.exact_text.encode("utf-8")).hexdigest()
+                ):
+                    raise ValueError("Gemini draft Claim provenance is invalid")
+            session.add(
+                StoryRecord(
+                    **{
+                        **story.__dict__,
+                        "review_state": story.review_state.value,
+                    }
+                )
+            )
+            session.flush()
+            session.add_all(ClaimRecord(**claim.__dict__) for claim in claims)
+            session.flush()
+            session.add_all(
+                EvidenceSpanRecord(
+                    **{
+                        **evidence.__dict__,
+                        "role": evidence.role.value,
+                        "relation": evidence.relation.value,
+                    }
+                )
+                for evidence in evidence_spans
+            )
+            session.flush()
+            session.add_all(
+                TraceRecord(
+                    **{
+                        **trace.__dict__,
+                        "attributes": dict(trace.attributes),
+                    }
+                )
+                for trace in traces
+            )
+            return True
 
 
 def _persist_source_definition(

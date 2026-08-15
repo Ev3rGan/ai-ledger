@@ -27,6 +27,13 @@ from ai_intel_agent.feed_acquisition import (
     load_approved_feed_source_definitions,
     load_sample_feed_source_definitions,
 )
+from ai_intel_agent.gemini_collection import (
+    DeepSeekGeminiDraftProvider,
+    GeminiCollectionError,
+    HttpGeminiReleaseNotesFetcher,
+    collect_gemini_release_notes,
+    deepseek_api_key_from_environment,
+)
 from ai_intel_agent.model_routing_evaluation import (
     HttpModelEvaluationClient,
     ModelEvaluationConfigurationError,
@@ -141,6 +148,46 @@ def collect_feeds(
     console.print(
         f"[green]Completed Collection Run {run.id}:[/] {run.status.value}; "
         f"{succeeded}/{len(run.source_definition_results)} Source Definitions succeeded"
+    )
+
+
+@app.command("collect-gemini")
+def collect_gemini(
+    backfill_days: Annotated[
+        int,
+        typer.Option(
+            "--backfill-days",
+            min=1,
+            max=3650,
+            help="Collect dated sections in this many prior calendar days.",
+        ),
+    ] = 10,
+) -> None:
+    """Collect Gemini API Release Notes and prepare DeepSeek draft Stories."""
+    try:
+        database_url = database_url_from_environment()
+        api_key = deepseek_api_key_from_environment()
+        with (
+            httpx.Client(timeout=30, trust_env=False) as source_client,
+            httpx.Client(timeout=180) as provider_client,
+        ):
+            summary = collect_gemini_release_notes(
+                database_url,
+                fetcher=HttpGeminiReleaseNotesFetcher(source_client),
+                provider=DeepSeekGeminiDraftProvider(
+                    provider_client,
+                    api_key=api_key,
+                ),
+                clock=SystemClock(),
+                backfill_days=backfill_days,
+            )
+    except (GeminiCollectionError, ValueError) as error:
+        raise typer.BadParameter(str(error)) from error
+    console.print(
+        f"[green]Completed Gemini Collection Run {summary.collection_run_id}:[/] "
+        f"sections_collected={summary.sections_collected}; "
+        f"document_versions_created={summary.document_versions_created}; "
+        f"drafts_created={summary.drafts_created}"
     )
 
 
