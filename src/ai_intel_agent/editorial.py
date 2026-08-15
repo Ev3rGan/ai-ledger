@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import replace
-from datetime import datetime
+from dataclasses import dataclass, replace
+from datetime import date, datetime
 from typing import Protocol
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -11,11 +11,43 @@ from ai_intel_agent.domain import (
     AuditSubjectType,
     Digest,
     DigestState,
+    EvidenceRelation,
+    EvidenceRole,
     SampleDigestPublication,
     SampleStory,
     Story,
     StoryReviewState,
 )
+
+
+@dataclass(frozen=True)
+class EvidenceSpanInspection:
+    exact_text: str
+    role: EvidenceRole
+    relation: EvidenceRelation
+    publisher: str
+    canonical_url: str
+
+
+@dataclass(frozen=True)
+class ClaimInspection:
+    text: str
+    evidence_spans: tuple[EvidenceSpanInspection, ...]
+
+
+@dataclass(frozen=True)
+class StoryInspection:
+    id: UUID
+    stable_key: str
+    headline: str
+    review_state: StoryReviewState
+    claims: tuple[ClaimInspection, ...]
+
+
+@dataclass(frozen=True)
+class DigestPreview:
+    publication_date: date
+    stories: tuple[StoryInspection, ...]
 
 
 class Clock(Protocol):
@@ -34,6 +66,10 @@ class EditorialStateError(ValueError):
 
 def _id(name: str) -> UUID:
     return uuid5(NAMESPACE_URL, f"ai-intel-agent:sample-editorial-v1:{name}")
+
+
+def _mvp_id(name: str) -> UUID:
+    return uuid5(NAMESPACE_URL, f"ai-intel-agent:mvp-editorial-v1:{name}")
 
 
 def _review_story(story: Story, decision: StoryReviewState) -> Story:
@@ -66,6 +102,85 @@ def _publish_digest(digest: Digest, now: datetime) -> Digest:
     if not digest.story_ids:
         raise EditorialStateError("A Digest must contain at least one accepted Story")
     return replace(digest, state=DigestState.PUBLISHED, published_at=now)
+
+
+def review_story(
+    story: Story,
+    decision: StoryReviewState,
+    *,
+    actor_identifier: str,
+    now: datetime,
+) -> tuple[Story, AuditEvent]:
+    reviewed = _review_story(story, decision)
+    action = (
+        AuditAction.STORY_ACCEPTED
+        if decision is StoryReviewState.ACCEPTED
+        else AuditAction.STORY_REJECTED
+    )
+    return reviewed, AuditEvent(
+        id=_mvp_id(f"story:{story.id}:{action.value}"),
+        operation_key=f"mvp-editorial-v1:story:{story.id}:{action.value}",
+        actor_identifier=actor_identifier,
+        action=action,
+        subject_type=AuditSubjectType.STORY,
+        subject_id=story.id,
+        occurred_at=now,
+        sequence=0,
+        attributes={
+            "from_state": StoryReviewState.UNREVIEWED.value,
+            "to_state": decision.value,
+        },
+    )
+
+
+def compose_digest(publication_date: date, story_ids: tuple[UUID, ...]) -> Digest:
+    return Digest(
+        id=_mvp_id(f"digest:{publication_date.isoformat()}"),
+        stable_key=f"digest:{publication_date.isoformat()}",
+        publication_date=publication_date,
+        state=DigestState.DRAFT,
+        published_at=None,
+        story_ids=story_ids,
+    )
+
+
+def publish_digest(
+    digest: Digest,
+    *,
+    actor_identifier: str,
+    now: datetime,
+) -> tuple[Digest, tuple[AuditEvent, AuditEvent]]:
+    published = _publish_digest(digest, now)
+    composed_event = AuditEvent(
+        id=_mvp_id(f"digest:{digest.id}:{AuditAction.DIGEST_COMPOSED.value}"),
+        operation_key=(
+            f"mvp-editorial-v1:digest:{digest.id}:{AuditAction.DIGEST_COMPOSED.value}"
+        ),
+        actor_identifier=actor_identifier,
+        action=AuditAction.DIGEST_COMPOSED,
+        subject_type=AuditSubjectType.DIGEST,
+        subject_id=digest.id,
+        occurred_at=now,
+        sequence=0,
+        attributes={"included_story_ids": [str(story_id) for story_id in digest.story_ids]},
+    )
+    published_event = AuditEvent(
+        id=_mvp_id(f"digest:{digest.id}:{AuditAction.DIGEST_PUBLISHED.value}"),
+        operation_key=(
+            f"mvp-editorial-v1:digest:{digest.id}:{AuditAction.DIGEST_PUBLISHED.value}"
+        ),
+        actor_identifier=actor_identifier,
+        action=AuditAction.DIGEST_PUBLISHED,
+        subject_type=AuditSubjectType.DIGEST,
+        subject_id=digest.id,
+        occurred_at=now,
+        sequence=1,
+        attributes={
+            "from_state": DigestState.DRAFT.value,
+            "to_state": DigestState.PUBLISHED.value,
+        },
+    )
+    return published, (composed_event, published_event)
 
 
 def review_and_publish_digest(
