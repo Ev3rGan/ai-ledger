@@ -20,6 +20,20 @@ uv run alembic upgrade head
 uv run ai-intel-agent run --sample
 ```
 
+For the complete local MVP, have the supervising PowerShell process inject only
+`AI_INTEL_DATABASE_URL` and `DEEPSEEK_API_KEY`, then run:
+
+```powershell
+uv run ai-intel-agent start-local
+```
+
+This one foreground command starts loopback PostgreSQL/pgvector through Docker Compose, applies
+all migrations, and owns the formal Web server plus Gemini collection scheduler at 06:00 and
+18:00 Asia/Shanghai. Press `Ctrl+C` for safe shutdown; the database volume is retained. See the
+[`Local MVP runbook`](docs/mvp-local-runbook.md) for process-only configuration, operator CLI
+steps, public URLs, and the required live acceptance record. The local-start path does not load
+credentials from `.env`.
+
 The sample uses a fixed Asia/Shanghai clock, fixed source data, and deterministic identifiers.
 Running it again leaves one corresponding set of records, one Digest, four audit events, and the
 same report.
