@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, date, datetime
@@ -50,6 +51,7 @@ from ai_intel_agent.persistence import (
     EditorialRepository,
     create_database_engine,
     database_url_from_environment,
+    upgrade_database,
 )
 from ai_intel_agent.pipeline import publish_sample_digest
 from ai_intel_agent.research import DeepSeekResearchProvider, ResearchError
@@ -60,6 +62,15 @@ from ai_intel_agent.retrieval_calibration import (
     load_retrieval_corpus,
     require_human_approved_retrieval_corpus,
     run_retrieval_calibration,
+)
+from ai_intel_agent.runtime import (
+    DockerComposeDatabase,
+    GeminiScheduler,
+    LocalMvpConfiguration,
+    LocalMvpRuntime,
+    LocalMvpState,
+    MvpChildProcesses,
+    SchedulerStopController,
 )
 from ai_intel_agent.runtime_benchmark import (
     HttpRuntimeProbeClient,
@@ -136,6 +147,88 @@ def serve(
             host=host,
             port=port,
         )
+
+
+@app.command("schedule-gemini")
+def schedule_gemini(
+    backfill_days: Annotated[
+        int,
+        typer.Option(
+            "--backfill-days",
+            min=1,
+            max=3650,
+            help="Collect dated sections in this many prior calendar days.",
+        ),
+    ] = 10,
+) -> None:
+    """Collect Gemini at 06:00 and 18:00 Asia/Shanghai until interrupted."""
+    _local_mvp_configuration()
+
+    console.print("Gemini scheduler active at 06:00 and 18:00 Asia/Shanghai.")
+    with SchedulerStopController() as stopped:
+        GeminiScheduler(
+            collect=lambda: collect_gemini(backfill_days),
+            now=lambda: datetime.now(UTC),
+            wait=stopped.wait,
+        ).run()
+
+
+def _local_mvp_configuration() -> LocalMvpConfiguration:
+    try:
+        return LocalMvpConfiguration.from_environment(os.environ)
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from error
+
+
+@app.command("start-local")
+def start_local(
+    host: Annotated[
+        str, typer.Option("--host", help="Loopback interface for the Web service.")
+    ] = "127.0.0.1",
+    port: Annotated[
+        int,
+        typer.Option(
+            "--port",
+            min=1,
+            max=65535,
+            help="TCP port for the Web service.",
+        ),
+    ] = 8000,
+) -> None:
+    """Start PostgreSQL, migrate, then run the Web service and scheduler."""
+    if host not in {"127.0.0.1", "localhost"}:
+        raise typer.BadParameter("start-local only supports a loopback Web host")
+    configuration = _local_mvp_configuration()
+
+    project_root = Path(__file__).resolve().parents[2]
+    process_environment = dict(os.environ)
+    runtime = LocalMvpRuntime(
+        database=DockerComposeDatabase(
+            project_root=project_root,
+            compose_environment=configuration.compose_environment,
+        ),
+        migrate=lambda: upgrade_database(configuration.database_url),
+        processes=MvpChildProcesses(
+            project_root=project_root,
+            host=host,
+            port=port,
+            environment=process_environment,
+        ),
+        state_changed=lambda state: _print_local_mvp_state(state, host, port),
+    )
+    try:
+        runtime.run()
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        raise typer.BadParameter(f"Local MVP failed: {error}") from error
+
+
+def _print_local_mvp_state(state: LocalMvpState, host: str, port: int) -> None:
+    if state is LocalMvpState.SCHEDULER_AND_WEB_RUNNING:
+        console.print(
+            f"Local MVP running at http://{host}:{port}; press Ctrl+C to stop safely."
+        )
+        return
+    console.print(f"Local MVP state: {state.value}")
 
 
 @contextmanager
