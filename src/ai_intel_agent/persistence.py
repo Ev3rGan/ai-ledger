@@ -36,13 +36,26 @@ from ai_intel_agent.domain import (
     Claim,
     CollectionDiscovery,
     CollectionRun,
+    Digest,
     DigestState,
+    EvidenceRelation,
+    EvidenceRole,
     EvidenceSpan,
     SampleDigestPublication,
     SampleStory,
     Story,
     StoryReviewState,
     StructuredTrace,
+)
+from ai_intel_agent.editorial import (
+    ClaimInspection,
+    DigestPreview,
+    EditorialStateError,
+    EvidenceSpanInspection,
+    StoryInspection,
+    compose_digest,
+    publish_digest,
+    review_story,
 )
 from alembic import command
 
@@ -310,6 +323,209 @@ class SampleStoryRepository:
     def persist(self, sample: SampleStory) -> None:
         with Session(self._engine) as session, session.begin():
             _persist_sample_story(session, sample)
+
+
+class EditorialRepository:
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def stories(self) -> tuple[StoryInspection, ...]:
+        with Session(self._engine) as session:
+            story_ids = session.scalars(
+                select(StoryRecord.id).order_by(
+                    StoryRecord.occurred_at.desc(), StoryRecord.stable_key
+                )
+            ).all()
+            return tuple(self._story(session, story_id) for story_id in story_ids)
+
+    def story(self, stable_key: str) -> StoryInspection | None:
+        with Session(self._engine) as session:
+            story_id = session.scalar(
+                select(StoryRecord.id).where(StoryRecord.stable_key == stable_key)
+            )
+            return self._story(session, story_id) if story_id is not None else None
+
+    def review(
+        self,
+        stable_key: str,
+        decision: StoryReviewState,
+        *,
+        actor_identifier: str,
+        occurred_at: datetime,
+    ) -> StoryInspection:
+        with Session(self._engine) as session, session.begin():
+            record = session.scalar(
+                select(StoryRecord)
+                .where(StoryRecord.stable_key == stable_key)
+                .with_for_update()
+            )
+            if record is None:
+                raise ValueError(f"Story {stable_key!r} does not exist")
+            reviewed, event = review_story(
+                Story(
+                    id=record.id,
+                    primary_document_version_id=record.primary_document_version_id,
+                    stable_key=record.stable_key,
+                    headline=record.headline,
+                    occurred_at=record.occurred_at,
+                    review_state=StoryReviewState(record.review_state),
+                ),
+                decision,
+                actor_identifier=actor_identifier,
+                now=occurred_at,
+            )
+            record.review_state = reviewed.review_state.value
+            _persist_audit_event(session, event)
+            session.flush()
+            return self._story(session, record.id)
+
+    def preview_digest(self, publication_date: date) -> DigestPreview:
+        with Session(self._engine) as session:
+            story_ids = self._eligible_story_ids(session)
+            return DigestPreview(
+                publication_date=publication_date,
+                stories=tuple(self._story(session, story_id) for story_id in story_ids),
+            )
+
+    def publish_digest(
+        self,
+        publication_date: date,
+        *,
+        actor_identifier: str,
+        published_at: datetime,
+    ) -> Digest:
+        identity = compose_digest(publication_date, ())
+        with Session(self._engine) as session, session.begin():
+            existing = session.get(DigestRecord, identity.id)
+            if existing is not None:
+                if existing.state != DigestState.PUBLISHED.value:
+                    raise EditorialStateError("An existing Digest is not published")
+                return self._digest(session, existing)
+
+            story_ids = self._eligible_story_ids(session, lock=True)
+            draft = compose_digest(publication_date, story_ids)
+            published, events = publish_digest(
+                draft,
+                actor_identifier=actor_identifier,
+                now=published_at,
+            )
+            session.add(
+                DigestRecord(
+                    id=draft.id,
+                    stable_key=draft.stable_key,
+                    publication_date=draft.publication_date,
+                    state=draft.state.value,
+                    published_at=draft.published_at,
+                )
+            )
+            session.flush()
+            session.add_all(
+                DigestStoryRecord(
+                    digest_id=draft.id,
+                    story_id=story_id,
+                    position=position,
+                )
+                for position, story_id in enumerate(draft.story_ids)
+            )
+            _persist_audit_event(session, events[0])
+            session.flush()
+            record = session.get(DigestRecord, draft.id)
+            if record is None:
+                raise ValueError("Digest composition did not create a Digest")
+            record.state = published.state.value
+            record.published_at = published.published_at
+            _persist_audit_event(session, events[1])
+            session.flush()
+            return published
+
+    @staticmethod
+    def _eligible_story_ids(session: Session, *, lock: bool = False) -> tuple[UUID, ...]:
+        already_composed = (
+            select(DigestStoryRecord.story_id)
+            .where(DigestStoryRecord.story_id == StoryRecord.id)
+            .exists()
+        )
+        statement = (
+            select(StoryRecord.id)
+            .where(
+                StoryRecord.review_state == StoryReviewState.ACCEPTED.value,
+                ~already_composed,
+            )
+            .order_by(StoryRecord.occurred_at, StoryRecord.stable_key)
+        )
+        if lock:
+            statement = statement.with_for_update()
+        return tuple(session.scalars(statement))
+
+    @staticmethod
+    def _digest(session: Session, record: DigestRecord) -> Digest:
+        story_ids = tuple(
+            session.scalars(
+                select(DigestStoryRecord.story_id)
+                .where(DigestStoryRecord.digest_id == record.id)
+                .order_by(DigestStoryRecord.position)
+            )
+        )
+        return Digest(
+            id=record.id,
+            stable_key=record.stable_key,
+            publication_date=record.publication_date,
+            state=DigestState(record.state),
+            published_at=record.published_at,
+            story_ids=story_ids,
+        )
+
+    @staticmethod
+    def _story(session: Session, story_id: UUID) -> StoryInspection:
+        story = session.get(StoryRecord, story_id)
+        if story is None:
+            raise ValueError(f"Story {story_id} does not exist")
+        claims: list[ClaimInspection] = []
+        claim_records = session.scalars(
+            select(ClaimRecord)
+            .where(ClaimRecord.story_id == story.id)
+            .order_by(ClaimRecord.position)
+        ).all()
+        for claim in claim_records:
+            evidence_spans = tuple(
+                EvidenceSpanInspection(
+                    exact_text=row.exact_text,
+                    role=EvidenceRole(row.role),
+                    relation=EvidenceRelation(row.relation),
+                    publisher=row.publisher,
+                    canonical_url=row.canonical_url,
+                )
+                for row in session.execute(
+                    select(
+                        EvidenceSpanRecord.exact_text,
+                        EvidenceSpanRecord.role,
+                        EvidenceSpanRecord.relation,
+                        CandidateRecord.publisher,
+                        CandidateRecord.canonical_url,
+                    )
+                    .join(
+                        DocumentVersionRecord,
+                        DocumentVersionRecord.id
+                        == EvidenceSpanRecord.document_version_id,
+                    )
+                    .join(
+                        CandidateRecord,
+                        CandidateRecord.id == DocumentVersionRecord.candidate_id,
+                    )
+                    .where(EvidenceSpanRecord.claim_id == claim.id)
+                    .order_by(EvidenceSpanRecord.start_offset)
+                )
+            )
+            claims.append(
+                ClaimInspection(text=claim.text, evidence_spans=evidence_spans)
+            )
+        return StoryInspection(
+            id=story.id,
+            stable_key=story.stable_key,
+            headline=story.headline,
+            review_state=StoryReviewState(story.review_state),
+            claims=tuple(claims),
+        )
 
 
 class SampleEditorialRepository:
@@ -761,8 +977,10 @@ def upgrade_database(database_url: str) -> None:
 
 
 def database_url_from_environment() -> str:
-    load_dotenv()
     database_url = os.getenv("AI_INTEL_DATABASE_URL")
+    if not database_url:
+        load_dotenv()
+        database_url = os.getenv("AI_INTEL_DATABASE_URL")
     if not database_url:
         raise ValueError("Set AI_INTEL_DATABASE_URL to a PostgreSQL connection URL")
     return database_url

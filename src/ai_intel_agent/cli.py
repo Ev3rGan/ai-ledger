@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import os
-from datetime import date
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Annotated
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import httpx
 import typer
@@ -16,7 +19,8 @@ from ai_intel_agent.collection import (
     SystemClock,
     collect_feed_source_definitions,
 )
-from ai_intel_agent.domain import SourceDefinitionCollectionStatus
+from ai_intel_agent.domain import SourceDefinitionCollectionStatus, StoryReviewState
+from ai_intel_agent.editorial import EditorialStateError, StoryInspection
 from ai_intel_agent.extraction_benchmark import (
     BenchmarkConfigurationError,
     run_document_extraction_benchmark,
@@ -42,7 +46,11 @@ from ai_intel_agent.model_routing_evaluation import (
     load_protocol_configuration,
     run_model_routing_evaluation,
 )
-from ai_intel_agent.persistence import database_url_from_environment
+from ai_intel_agent.persistence import (
+    EditorialRepository,
+    create_database_engine,
+    database_url_from_environment,
+)
 from ai_intel_agent.pipeline import publish_sample_digest
 from ai_intel_agent.retrieval_calibration import (
     FastEmbedCalibrationRuntime,
@@ -64,9 +72,13 @@ from ai_intel_agent.sample import FixedClock
 from ai_intel_agent.source_audit import run_source_definition_activation_audit
 
 app = typer.Typer(help="Run the deterministic AI intelligence workflow.")
+story_app = typer.Typer(help="Inspect and review persisted Stories.")
+digest_app = typer.Typer(help="Preview and publish persisted Digests.")
 runtime_benchmark_app = typer.Typer(
     help="Capture and compare fixed Hong Kong runtime probes."
 )
+app.add_typer(story_app, name="story")
+app.add_typer(digest_app, name="digest")
 app.add_typer(runtime_benchmark_app, name="benchmark-runtime")
 console = Console()
 DEFAULT_OUTPUT = Path("reports/daily.md")
@@ -81,6 +93,192 @@ DEFAULT_RETRIEVAL_PROFILE_OUTPUT = Path("reports/retrieval-profile.v1.json")
 @app.callback()
 def main() -> None:
     """AI intelligence command line interface."""
+
+
+@app.command("serve")
+def serve(
+    host: Annotated[
+        str, typer.Option("--host", help="Interface on which the Web service listens.")
+    ] = "127.0.0.1",
+    port: Annotated[
+        int,
+        typer.Option(
+            "--port",
+            min=1,
+            max=65535,
+            help="TCP port on which the Web service listens.",
+        ),
+    ] = 8000,
+) -> None:
+    """Start the supported database-backed Web service."""
+    try:
+        database_url = database_url_from_environment()
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from error
+
+    import uvicorn
+
+    from ai_intel_agent.web import create_app
+
+    uvicorn.run(create_app(database_url), host=host, port=port)
+
+
+@contextmanager
+def _editorial_repository() -> Iterator[EditorialRepository]:
+    try:
+        database_url = database_url_from_environment()
+        engine = create_database_engine(database_url)
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from error
+    try:
+        yield EditorialRepository(engine)
+    finally:
+        engine.dispose()
+
+
+def _print_story(story: StoryInspection) -> None:
+    console.print(f"Story: {story.headline}", markup=False)
+    console.print(f"Stable key: {story.stable_key}", markup=False)
+    console.print(f"Review state: {story.review_state.value}", markup=False)
+    for position, claim in enumerate(story.claims, start=1):
+        console.print(f"Claim {position}: {claim.text}", markup=False)
+        for evidence_span in claim.evidence_spans:
+            console.print(
+                f"Evidence Span: {evidence_span.exact_text}",
+                markup=False,
+                soft_wrap=True,
+            )
+            console.print(
+                f"Evidence Role: {evidence_span.role.value}", markup=False
+            )
+            console.print(
+                f"Evidence Relation: {evidence_span.relation.value}", markup=False
+            )
+            console.print(f"Publisher: {evidence_span.publisher}", markup=False)
+            console.print(
+                f"Canonical source: {evidence_span.canonical_url}", markup=False
+            )
+
+
+@story_app.command("list")
+def list_stories() -> None:
+    """List persisted Stories for operator review."""
+    with _editorial_repository() as repository:
+        stories = repository.stories()
+    if not stories:
+        console.print("No persisted Stories.")
+        return
+    for story in stories:
+        console.print(
+            f"{story.stable_key}\t{story.review_state.value}\t{story.headline}",
+            markup=False,
+        )
+
+
+@story_app.command("show")
+def show_story(stable_key: str) -> None:
+    """Show a persisted Story with its Claims and exact Evidence Spans."""
+    with _editorial_repository() as repository:
+        story = repository.story(stable_key)
+    if story is None:
+        raise typer.BadParameter(f"Story {stable_key!r} does not exist")
+    _print_story(story)
+
+
+def _review_story(
+    stable_key: str,
+    decision: StoryReviewState,
+    actor: str,
+) -> None:
+    with _editorial_repository() as repository:
+        try:
+            story = repository.review(
+                stable_key,
+                decision,
+                actor_identifier=actor,
+                occurred_at=datetime.now(UTC),
+            )
+        except (EditorialStateError, ValueError) as error:
+            raise typer.BadParameter(str(error)) from error
+    console.print(
+        f"Story {story.stable_key} is {story.review_state.value}.", markup=False
+    )
+
+
+@story_app.command("accept")
+def accept_story(
+    stable_key: str,
+    actor: Annotated[
+        str, typer.Option("--actor", help="Identifier recorded in the audit event.")
+    ] = "local-operator",
+) -> None:
+    """Accept one unreviewed Story."""
+    _review_story(stable_key, StoryReviewState.ACCEPTED, actor)
+
+
+@story_app.command("reject")
+def reject_story(
+    stable_key: str,
+    actor: Annotated[
+        str, typer.Option("--actor", help="Identifier recorded in the audit event.")
+    ] = "local-operator",
+) -> None:
+    """Reject one unreviewed Story."""
+    _review_story(stable_key, StoryReviewState.REJECTED, actor)
+
+
+def _digest_date(publication_date: str | None) -> date:
+    if publication_date is None:
+        return datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    try:
+        return date.fromisoformat(publication_date)
+    except ValueError as error:
+        raise typer.BadParameter("Digest date must use YYYY-MM-DD form") from error
+
+
+@digest_app.command("preview")
+def preview_digest(
+    publication_date: Annotated[
+        str | None,
+        typer.Option("--date", help="Digest publication date in YYYY-MM-DD form."),
+    ] = None,
+) -> None:
+    """Preview accepted Stories that are not already in a Digest."""
+    with _editorial_repository() as repository:
+        preview = repository.preview_digest(_digest_date(publication_date))
+    console.print(f"Digest preview: {preview.publication_date.isoformat()}", markup=False)
+    if not preview.stories:
+        console.print("No accepted Stories are eligible.")
+        return
+    for story in preview.stories:
+        console.print(f"{story.stable_key}\t{story.headline}", markup=False)
+
+
+@digest_app.command("publish")
+def publish_digest_command(
+    publication_date: Annotated[
+        str | None,
+        typer.Option("--date", help="Digest publication date in YYYY-MM-DD form."),
+    ] = None,
+    actor: Annotated[
+        str, typer.Option("--actor", help="Identifier recorded in audit events.")
+    ] = "local-operator",
+) -> None:
+    """Compose and publish a Digest from eligible accepted Stories."""
+    with _editorial_repository() as repository:
+        try:
+            digest = repository.publish_digest(
+                _digest_date(publication_date),
+                actor_identifier=actor,
+                published_at=datetime.now(UTC),
+            )
+        except (EditorialStateError, ValueError) as error:
+            raise typer.BadParameter(str(error)) from error
+    console.print(
+        f"Digest {digest.publication_date.isoformat()} published with "
+        f"{len(digest.story_ids)} Story.",
+        markup=False,
+    )
 
 
 @app.command("run")
