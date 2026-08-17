@@ -361,6 +361,11 @@ def normalize_database_url(database_url: str) -> str:
     return database_url
 
 
+def database_url_for_alembic_config(database_url: str) -> str:
+    """Escape percent signs at Alembic's ConfigParser boundary."""
+    return normalize_database_url(database_url).replace("%", "%%")
+
+
 def create_database_engine(database_url: str) -> Engine:
     normalized_url = normalize_database_url(database_url)
     if not normalized_url.startswith("postgresql+psycopg://"):
@@ -1258,7 +1263,10 @@ def upgrade_database(database_url: str) -> None:
         else Path(__file__).resolve().parents[2]
     )
     config = Config(str(project_root / "alembic.ini"))
-    config.set_main_option("sqlalchemy.url", normalize_database_url(database_url))
+    config.set_main_option(
+        "sqlalchemy.url",
+        database_url_for_alembic_config(database_url),
+    )
     command.upgrade(config, "head")
 
 

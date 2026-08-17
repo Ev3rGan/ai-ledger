@@ -20,6 +20,7 @@ from sqlalchemy.engine import make_url
 from typer.testing import CliRunner
 
 import ai_intel_agent.cli as cli_module
+import ai_intel_agent.persistence as persistence_module
 from ai_intel_agent.cli import app
 from ai_intel_agent.persistence import (
     PersistentMeteredProviderBudget,
@@ -43,6 +44,25 @@ from ai_intel_agent.runtime import (
 from ai_intel_agent.web import create_app
 
 runner = CliRunner()
+
+
+def test_database_migration_accepts_percent_encoded_password(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, str] = {}
+
+    def record_upgrade(config, revision: str) -> None:
+        observed["database_url"] = config.get_main_option("sqlalchemy.url")
+        observed["revision"] = revision
+
+    monkeypatch.setattr(persistence_module.command, "upgrade", record_upgrade)
+    database_url = (
+        "postgresql+psycopg://ai_ledger:contains%2Fslash@postgres:5432/ai_ledger"
+    )
+
+    upgrade_database(database_url)
+
+    assert observed == {"database_url": database_url, "revision": "head"}
 
 
 @pytest.fixture(scope="module")
