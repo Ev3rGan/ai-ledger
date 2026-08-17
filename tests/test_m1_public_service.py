@@ -491,6 +491,11 @@ def test_versioned_linux_bundle_keeps_only_https_boundary_public() -> None:
     assert "80:80" in compose and "443:443" in compose
     postgres_block = compose.split("\n  postgres:\n", 1)[1].split("\n  web:\n", 1)[0]
     assert "ports:" not in postgres_block
+    scheduler_block = compose.split("\n  scheduler:\n", 1)[1].split(
+        "\n  backup:\n", 1
+    )[0]
+    assert "      - edge\n      - database" in scheduler_block
+    assert "ports:" not in scheduler_block
     assert "internal: true" in compose
     assert "restart: unless-stopped" in compose
     assert "max-size: \"10m\"" in compose

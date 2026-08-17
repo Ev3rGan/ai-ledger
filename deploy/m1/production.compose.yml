@@ -124,6 +124,7 @@ services:
       - database-password
       - deepseek-api-key
     networks:
+      - edge
       - database
     healthcheck:
       test: ["CMD", "ai-intel-agent", "operator", "scheduler-health", "--production"]
