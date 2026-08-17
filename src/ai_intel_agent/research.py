@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hmac
 import json
 import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from datetime import UTC, date, datetime
 from hashlib import sha256
 from importlib.resources import files
 from string import Formatter
@@ -26,6 +28,7 @@ from ai_intel_agent.model_routing_evaluation import (
     load_protocol_configuration,
 )
 from ai_intel_agent.persistence import (
+    AnonymousResearchAllowanceRepository,
     ClaimRecord,
     DigestRecord,
     DigestStoryRecord,
@@ -71,6 +74,14 @@ class ResearchError(ValueError):
 
 class ResearchProvider(Protocol):
     def stream(self, evidence_set: ResearchEvidenceSet) -> Iterator[str]: ...
+
+
+class MeteredProviderBudget(Protocol):
+    def reserve(self) -> bool: ...
+
+
+class ResearchAllowance(Protocol):
+    def reserve(self, anonymous_client_id: str) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -128,12 +139,14 @@ class DeepSeekResearchProvider:
         client: httpx.Client,
         *,
         api_key: str,
+        budget: MeteredProviderBudget | None = None,
         sleeper: Callable[[float], None] = sleep,
     ) -> None:
         if not api_key.strip():
             raise ResearchError("DEEPSEEK_API_KEY is required for Research")
         self._client = client
         self._api_key = api_key
+        self._budget = budget
         self._sleeper = sleeper
         self._protocol = load_research_protocol()
         self._routing_protocol = load_protocol_configuration()
@@ -183,6 +196,8 @@ class DeepSeekResearchProvider:
         attempts = 0
         while attempts < self._routing_protocol.retry_policy.max_attempts:
             attempts += 1
+            if self._budget is not None and not self._budget.reserve():
+                raise ResearchError("Aggregate monthly Provider budget is exhausted")
             try:
                 with self._client.stream(
                     "POST",
@@ -337,11 +352,49 @@ class ResearchRepository:
         return ResearchEvidenceSet(question=question, evidence=evidence)
 
 
+class PersistentAnonymousResearchAllowance:
+    """Persist a privacy-preserving daily Provider-call allowance in PostgreSQL."""
+
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        daily_limit: int,
+        identity_salt: bytes,
+        today: Callable[[], date] | None = None,
+    ) -> None:
+        if daily_limit < 1:
+            raise ValueError("Anonymous Research daily limit must be positive")
+        if not identity_salt:
+            raise ValueError("Anonymous Research identity salt must not be empty")
+        self._repository = AnonymousResearchAllowanceRepository(engine)
+        self._daily_limit = daily_limit
+        self._identity_salt = identity_salt
+        self._today = today or (lambda: datetime.now(UTC).date())
+
+    def reserve(self, anonymous_client_id: str) -> bool:
+        normalized_id = anonymous_client_id.strip()
+        if not normalized_id:
+            return False
+        client_hash = hmac.new(
+            self._identity_salt,
+            normalized_id.encode("utf-8"),
+            sha256,
+        ).hexdigest()
+        return self._repository.reserve(
+            usage_date=self._today(),
+            client_hash=client_hash,
+            daily_limit=self._daily_limit,
+        )
+
+
 def stream_research_events(
     question: str,
     *,
     repository: ResearchRepository,
     provider: ResearchProvider | None,
+    allowance: ResearchAllowance | None = None,
+    anonymous_client_id: str | None = None,
 ) -> Iterator[tuple[str, dict[str, object]]]:
     protocol = load_research_protocol()
     version = protocol.sse_contract_version
@@ -360,6 +413,15 @@ def stream_research_events(
             "message": "Research Provider 当前不可用。",
         }
         yield "done", {"version": version, "status": "failed"}
+        return
+
+    if allowance is not None and not allowance.reserve(anonymous_client_id or ""):
+        yield "refusal", {
+            "version": version,
+            "code": "anonymous-allowance-exhausted",
+            "message": "匿名 Research 今日额度已用尽，请明日再试。",
+        }
+        yield "done", {"version": version, "status": "refused"}
         return
 
     yield "status", {"version": version, "state": "generating"}

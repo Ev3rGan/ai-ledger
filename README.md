@@ -34,6 +34,13 @@ all migrations, and owns the formal Web server plus Gemini collection scheduler 
 steps, public URLs, and the required live acceptance record. The local-start path does not load
 credentials from `.env`.
 
+For the versioned one-Linux-host production boundary, use the
+[`MVP M1 production runbook`](docs/mvp-production-runbook.md). It records an immutable application
+image digest, Caddy automatic HTTPS, private PostgreSQL, Docker-secret files, independent Web and
+singleton Scheduler services, rotated logs, scheduled backup/isolated restore, persistent
+anonymous Research allowance, and fixed-version rollback. Live host, DNS, domain, firewall, and
+Provider acceptance remain explicit user-controlled actions.
+
 The sample uses a fixed Asia/Shanghai clock, fixed source data, and deterministic identifiers.
 Running it again leaves one corresponding set of records, one Digest, four audit events, and the
 same report.

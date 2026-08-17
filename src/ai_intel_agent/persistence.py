@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import os
-from dataclasses import replace
-from datetime import date, datetime
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+from datetime import UTC, date, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -303,6 +304,57 @@ class CollectionDiscoveryRecord(Base):
     candidate_id: Mapped[UUID] = mapped_column(ForeignKey("candidates.id"))
 
 
+class AnonymousResearchUsageRecord(Base):
+    __tablename__ = "anonymous_research_usage"
+    __table_args__ = (
+        CheckConstraint(
+            "provider_calls_used >= 1",
+            name="ck_anonymous_research_usage_positive",
+        ),
+    )
+
+    usage_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    client_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    provider_calls_used: Mapped[int] = mapped_column(Integer)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class MeteredProviderBudgetRecord(Base):
+    __tablename__ = "metered_provider_budget"
+    __table_args__ = (
+        CheckConstraint(
+            "reserved_cents >= 1 AND reserved_cents <= 10000",
+            name="ck_metered_provider_budget_range",
+        ),
+    )
+
+    billing_month: Mapped[date] = mapped_column(Date, primary_key=True)
+    reserved_cents: Mapped[int] = mapped_column(Integer)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class SchedulerStatusRecord(Base):
+    __tablename__ = "scheduler_status"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('waiting', 'running', 'failed', 'stopped')",
+            name="ck_scheduler_status_state",
+        ),
+        CheckConstraint(
+            "last_result IS NULL OR last_result IN ('succeeded', 'failed')",
+            name="ck_scheduler_status_last_result",
+        ),
+    )
+
+    scheduler_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    state: Mapped[str] = mapped_column(String(32))
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_result: Mapped[str | None] = mapped_column(String(32))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 def normalize_database_url(database_url: str) -> str:
     if database_url.startswith("postgresql://"):
         return database_url.replace("postgresql://", "postgresql+psycopg://", 1)
@@ -314,6 +366,235 @@ def create_database_engine(database_url: str) -> Engine:
     if not normalized_url.startswith("postgresql+psycopg://"):
         raise ValueError("AI_INTEL_DATABASE_URL must point to PostgreSQL")
     return create_engine(normalized_url)
+
+
+class AnonymousResearchAllowanceRepository:
+    """Atomically reserve one bounded Provider call for an anonymous client-day."""
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def reserve(
+        self,
+        *,
+        usage_date: date,
+        client_hash: str,
+        daily_limit: int,
+    ) -> bool:
+        if daily_limit < 1:
+            raise ValueError("Anonymous Research daily limit must be positive")
+        if len(client_hash) != 64:
+            raise ValueError("Anonymous Research client hash must be SHA-256")
+
+        now = datetime.now(UTC)
+        statement = (
+            insert(AnonymousResearchUsageRecord)
+            .values(
+                usage_date=usage_date,
+                client_hash=client_hash,
+                provider_calls_used=1,
+                updated_at=now,
+            )
+            .on_conflict_do_update(
+                index_elements=[
+                    AnonymousResearchUsageRecord.usage_date,
+                    AnonymousResearchUsageRecord.client_hash,
+                ],
+                set_={
+                    "provider_calls_used": (
+                        AnonymousResearchUsageRecord.provider_calls_used + 1
+                    ),
+                    "updated_at": now,
+                },
+                where=(
+                    AnonymousResearchUsageRecord.provider_calls_used < daily_limit
+                ),
+            )
+            .returning(AnonymousResearchUsageRecord.provider_calls_used)
+        )
+        with Session(self._engine) as session, session.begin():
+            return session.scalar(statement) is not None
+
+
+class MeteredProviderBudgetRepository:
+    """Reserve a conservative request cost under the aggregate USD 100 cap."""
+
+    MAXIMUM_MONTHLY_CENTS = 10_000
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def reserve(
+        self,
+        *,
+        billing_month: date,
+        reservation_cents: int,
+        monthly_limit_cents: int,
+    ) -> bool:
+        if billing_month.day != 1:
+            raise ValueError("Provider budget month must be the first day of a month")
+        if not 1 <= monthly_limit_cents <= self.MAXIMUM_MONTHLY_CENTS:
+            raise ValueError("Provider monthly budget must be between 1 and 10000 cents")
+        if not 1 <= reservation_cents <= monthly_limit_cents:
+            raise ValueError("Provider request reservation must fit the monthly budget")
+
+        now = datetime.now(UTC)
+        statement = (
+            insert(MeteredProviderBudgetRecord)
+            .values(
+                billing_month=billing_month,
+                reserved_cents=reservation_cents,
+                updated_at=now,
+            )
+            .on_conflict_do_update(
+                index_elements=[MeteredProviderBudgetRecord.billing_month],
+                set_={
+                    "reserved_cents": (
+                        MeteredProviderBudgetRecord.reserved_cents
+                        + reservation_cents
+                    ),
+                    "updated_at": now,
+                },
+                where=(
+                    MeteredProviderBudgetRecord.reserved_cents
+                    <= monthly_limit_cents - reservation_cents
+                ),
+            )
+            .returning(MeteredProviderBudgetRecord.reserved_cents)
+        )
+        with Session(self._engine) as session, session.begin():
+            return session.scalar(statement) is not None
+
+
+class PersistentMeteredProviderBudget:
+    """Fail before each metered request once its conservative USD cap is spent."""
+
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        monthly_limit_cents: int,
+        request_reservation_cents: int,
+        today: Callable[[], date] | None = None,
+    ) -> None:
+        self._repository = MeteredProviderBudgetRepository(engine)
+        self._monthly_limit_cents = monthly_limit_cents
+        self._request_reservation_cents = request_reservation_cents
+        self._today = today or (lambda: datetime.now(UTC).date())
+
+    def reserve(self) -> bool:
+        observed_date = self._today()
+        return self._repository.reserve(
+            billing_month=observed_date.replace(day=1),
+            reservation_cents=self._request_reservation_cents,
+            monthly_limit_cents=self._monthly_limit_cents,
+        )
+
+
+@dataclass(frozen=True)
+class SchedulerStatusSnapshot:
+    state: str
+    next_run_at: datetime | None
+    last_started_at: datetime | None
+    last_completed_at: datetime | None
+    last_result: str | None
+    updated_at: datetime
+
+
+class SchedulerStatusRepository:
+    """Persist the operator-visible status of the single production Scheduler."""
+
+    _KEY = "production"
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def waiting(self, *, next_run_at: datetime, observed_at: datetime) -> None:
+        self._upsert(
+            state="waiting",
+            observed_at=observed_at,
+            next_run_at=next_run_at,
+        )
+
+    def running(self, *, started_at: datetime) -> None:
+        self._upsert(
+            state="running",
+            observed_at=started_at,
+            last_started_at=started_at,
+        )
+
+    def succeeded(self, *, completed_at: datetime) -> None:
+        self._upsert(
+            state="waiting",
+            observed_at=completed_at,
+            last_completed_at=completed_at,
+            last_result="succeeded",
+        )
+
+    def failed(self, *, completed_at: datetime) -> None:
+        self._upsert(
+            state="failed",
+            observed_at=completed_at,
+            last_completed_at=completed_at,
+            last_result="failed",
+        )
+
+    def stopped(self, *, observed_at: datetime) -> None:
+        self._upsert(state="stopped", observed_at=observed_at)
+
+    def snapshot(self) -> SchedulerStatusSnapshot | None:
+        with Session(self._engine) as session:
+            record = session.get(SchedulerStatusRecord, self._KEY)
+            if record is None:
+                return None
+            return SchedulerStatusSnapshot(
+                state=record.state,
+                next_run_at=record.next_run_at,
+                last_started_at=record.last_started_at,
+                last_completed_at=record.last_completed_at,
+                last_result=record.last_result,
+                updated_at=record.updated_at,
+            )
+
+    def _upsert(
+        self,
+        *,
+        state: str,
+        observed_at: datetime,
+        next_run_at: datetime | None = None,
+        last_started_at: datetime | None = None,
+        last_completed_at: datetime | None = None,
+        last_result: str | None = None,
+    ) -> None:
+        values: dict[str, object] = {
+            "scheduler_key": self._KEY,
+            "state": state,
+            "updated_at": observed_at,
+        }
+        updates: dict[str, object] = {
+            "state": state,
+            "updated_at": observed_at,
+        }
+        optional_values = {
+            "next_run_at": next_run_at,
+            "last_started_at": last_started_at,
+            "last_completed_at": last_completed_at,
+            "last_result": last_result,
+        }
+        for name, value in optional_values.items():
+            if value is not None:
+                values[name] = value
+                updates[name] = value
+        statement = (
+            insert(SchedulerStatusRecord)
+            .values(**values)
+            .on_conflict_do_update(
+                index_elements=[SchedulerStatusRecord.scheduler_key],
+                set_=updates,
+            )
+        )
+        with Session(self._engine) as session, session.begin():
+            session.execute(statement)
 
 
 class SampleStoryRepository:
@@ -970,7 +1251,12 @@ def _verify_existing_publication(
 
 
 def upgrade_database(database_url: str) -> None:
-    project_root = Path(__file__).resolve().parents[2]
+    configured_root = os.getenv("AI_INTEL_PROJECT_ROOT", "").strip()
+    project_root = (
+        Path(configured_root).resolve()
+        if configured_root
+        else Path(__file__).resolve().parents[2]
+    )
     config = Config(str(project_root / "alembic.ini"))
     config.set_main_option("sqlalchemy.url", normalize_database_url(database_url))
     command.upgrade(config, "head")
@@ -978,6 +1264,10 @@ def upgrade_database(database_url: str) -> None:
 
 def database_url_from_environment() -> str:
     database_url = os.getenv("AI_INTEL_DATABASE_URL")
+    if not database_url and os.getenv("AI_INTEL_DATABASE_HOST"):
+        from ai_intel_agent.runtime import production_database_url
+
+        return production_database_url(os.environ)
     if not database_url:
         load_dotenv()
         database_url = os.getenv("AI_INTEL_DATABASE_URL")

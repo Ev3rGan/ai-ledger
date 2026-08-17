@@ -4,7 +4,7 @@ import os
 import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Annotated
@@ -15,6 +15,7 @@ import httpx
 import typer
 from dotenv import load_dotenv
 from rich.console import Console
+from sqlalchemy.engine import Engine
 
 from ai_intel_agent.collection import (
     SystemClock,
@@ -49,6 +50,8 @@ from ai_intel_agent.model_routing_evaluation import (
 )
 from ai_intel_agent.persistence import (
     EditorialRepository,
+    PersistentMeteredProviderBudget,
+    SchedulerStatusRepository,
     create_database_engine,
     database_url_from_environment,
     upgrade_database,
@@ -69,8 +72,14 @@ from ai_intel_agent.runtime import (
     LocalMvpConfiguration,
     LocalMvpRuntime,
     LocalMvpState,
+    M1ProviderConfiguration,
+    M1SchedulerConfiguration,
+    M1WebConfiguration,
     MvpChildProcesses,
+    PostgresSchedulerLease,
     SchedulerStopController,
+    configure_structured_logging,
+    production_database_url,
 )
 from ai_intel_agent.runtime_benchmark import (
     HttpRuntimeProbeClient,
@@ -89,9 +98,11 @@ digest_app = typer.Typer(help="Preview and publish persisted Digests.")
 runtime_benchmark_app = typer.Typer(
     help="Capture and compare fixed Hong Kong runtime probes."
 )
+operator_app = typer.Typer(help="Private production operator commands.")
 app.add_typer(story_app, name="story")
 app.add_typer(digest_app, name="digest")
 app.add_typer(runtime_benchmark_app, name="benchmark-runtime")
+app.add_typer(operator_app, name="operator")
 console = Console()
 DEFAULT_OUTPUT = Path("reports/daily.md")
 DEFAULT_SOURCE_AUDIT_OUTPUT = Path("reports/source-activation-audit.md")
@@ -105,6 +116,112 @@ DEFAULT_RETRIEVAL_PROFILE_OUTPUT = Path("reports/retrieval-profile.v1.json")
 @app.callback()
 def main() -> None:
     """AI intelligence command line interface."""
+
+
+def _operator_database_url(production: bool) -> str:
+    return (
+        production_database_url(os.environ)
+        if production
+        else database_url_from_environment()
+    )
+
+
+def _persistent_provider_budget(
+    engine: Engine,
+    configuration: M1ProviderConfiguration,
+) -> PersistentMeteredProviderBudget:
+    return PersistentMeteredProviderBudget(
+        engine,
+        monthly_limit_cents=configuration.monthly_budget_cents,
+        request_reservation_cents=configuration.request_reservation_cents,
+    )
+
+
+@operator_app.command("migrate")
+def operator_migrate(
+    production: Annotated[
+        bool,
+        typer.Option("--production", help="Load the M1 Docker-secret contract."),
+    ] = False,
+) -> None:
+    """Apply every database migration to the sole Alembic head."""
+    try:
+        database_url = _operator_database_url(production)
+        upgrade_database(database_url)
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from error
+    console.print_json(data={"database": "migrated"})
+
+
+@operator_app.command("status")
+def operator_status(
+    production: Annotated[
+        bool,
+        typer.Option("--production", help="Load the M1 Docker-secret contract."),
+    ] = False,
+) -> None:
+    """Report database readiness and recent Scheduler status without secrets."""
+    try:
+        database_url = _operator_database_url(production)
+        engine = create_database_engine(database_url)
+        try:
+            with engine.connect() as connection:
+                connection.exec_driver_sql("SELECT 1")
+            snapshot = SchedulerStatusRepository(engine).snapshot()
+        finally:
+            engine.dispose()
+    except (OSError, ValueError) as error:
+        raise typer.BadParameter(str(error)) from error
+
+    scheduler = None
+    if snapshot is not None:
+        scheduler = {
+            "state": snapshot.state,
+            "next_run_at": (
+                snapshot.next_run_at.isoformat() if snapshot.next_run_at is not None else None
+            ),
+            "last_started_at": (
+                snapshot.last_started_at.isoformat()
+                if snapshot.last_started_at is not None
+                else None
+            ),
+            "last_completed_at": (
+                snapshot.last_completed_at.isoformat()
+                if snapshot.last_completed_at is not None
+                else None
+            ),
+            "last_result": snapshot.last_result,
+            "updated_at": snapshot.updated_at.isoformat(),
+        }
+    console.print_json(data={"database": "ready", "scheduler": scheduler})
+
+
+@operator_app.command("scheduler-health")
+def operator_scheduler_health(
+    production: Annotated[
+        bool,
+        typer.Option("--production", help="Load the M1 Docker-secret contract."),
+    ] = False,
+) -> None:
+    """Exit successfully only while the persistent Scheduler status is active."""
+    try:
+        database_url = _operator_database_url(production)
+        engine = create_database_engine(database_url)
+        try:
+            snapshot = SchedulerStatusRepository(engine).snapshot()
+        finally:
+            engine.dispose()
+    except (OSError, ValueError) as error:
+        raise typer.BadParameter(str(error)) from error
+    if snapshot is None or snapshot.state not in {"waiting", "running"}:
+        raise typer.BadParameter("Production Scheduler is not active")
+    if (
+        snapshot.state == "waiting"
+        and snapshot.next_run_at is not None
+        and snapshot.next_run_at < datetime.now(UTC) - timedelta(minutes=5)
+    ):
+        raise typer.BadParameter("Production Scheduler next run is stale")
+    console.print_json(data={"scheduler": "active", "state": snapshot.state})
 
 
 @app.command("serve")
@@ -121,32 +238,81 @@ def serve(
             help="TCP port on which the Web service listens.",
         ),
     ] = 8000,
+    production: Annotated[
+        bool,
+        typer.Option(
+            "--production",
+            help="Require the M1 Docker-secret and anonymous-allowance contract.",
+        ),
+    ] = False,
 ) -> None:
     """Start the supported database-backed Web service."""
-    try:
-        database_url = database_url_from_environment()
-    except ValueError as error:
-        raise typer.BadParameter(str(error)) from error
+    if production:
+        try:
+            service_configuration = M1WebConfiguration.from_environment(os.environ)
+        except ValueError as error:
+            raise typer.BadParameter(str(error)) from error
+        database_url = service_configuration.database.database_url
+        api_key = service_configuration.provider.api_key
+        configure_structured_logging()
+    else:
+        try:
+            database_url = database_url_from_environment()
+        except ValueError as error:
+            raise typer.BadParameter(str(error)) from error
+        service_configuration = None
+        api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
 
     import uvicorn
 
     from ai_intel_agent.web import create_app
 
-    api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
     if not api_key:
         uvicorn.run(create_app(database_url), host=host, port=port)
         return
 
+    budget_engine = create_database_engine(database_url) if production else None
+    provider_budget = (
+        _persistent_provider_budget(budget_engine, service_configuration.provider)
+        if budget_engine is not None and service_configuration is not None
+        else None
+    )
     with httpx.Client(timeout=60.0) as client:
         try:
-            research_provider = DeepSeekResearchProvider(client, api_key=api_key)
+            if provider_budget is None:
+                research_provider = DeepSeekResearchProvider(client, api_key=api_key)
+            else:
+                research_provider = DeepSeekResearchProvider(
+                    client,
+                    api_key=api_key,
+                    budget=provider_budget,
+                )
         except ResearchError as error:
+            if budget_engine is not None:
+                budget_engine.dispose()
             raise typer.BadParameter(str(error)) from error
-        uvicorn.run(
-            create_app(database_url, research_provider=research_provider),
-            host=host,
-            port=port,
+        web_app = create_app(
+            database_url,
+            research_provider=research_provider,
+            anonymous_research_daily_limit=(
+                service_configuration.anonymous_research_daily_limit
+                if service_configuration is not None
+                else None
+            ),
+            anonymous_identity_salt=(
+                service_configuration.anonymous_identity_salt
+                if service_configuration is not None
+                else None
+            ),
         )
+        try:
+            if production:
+                uvicorn.run(web_app, host=host, port=port, log_config=None)
+            else:
+                uvicorn.run(web_app, host=host, port=port)
+        finally:
+            if budget_engine is not None:
+                budget_engine.dispose()
 
 
 @app.command("schedule-gemini")
@@ -160,10 +326,58 @@ def schedule_gemini(
             help="Collect dated sections in this many prior calendar days.",
         ),
     ] = 10,
+    production: Annotated[
+        bool,
+        typer.Option(
+            "--production",
+            help="Require M1 secret files, persistent status, and the singleton lease.",
+        ),
+    ] = False,
 ) -> None:
     """Collect Gemini at 06:00 and 18:00 Asia/Shanghai until interrupted."""
-    _local_mvp_configuration()
+    if production:
+        try:
+            service_configuration = M1SchedulerConfiguration.from_environment(os.environ)
+        except ValueError as error:
+            raise typer.BadParameter(str(error)) from error
+        database_url = service_configuration.database.database_url
+        engine = create_database_engine(database_url)
+        provider_budget = _persistent_provider_budget(
+            engine,
+            service_configuration.provider,
+        )
+        configure_structured_logging()
+        status = SchedulerStatusRepository(engine)
+        try:
+            with PostgresSchedulerLease(engine) as lease, SchedulerStopController() as stopped:
+                if lease.guarded_wait(stopped.wait, 5.0):
+                    return
+                with lease.monitor(lambda: os._exit(75)):
+                    console.print_json(
+                        data={
+                            "event": "scheduler-active",
+                            "schedule": "06:00,18:00 Asia/Shanghai",
+                        }
+                    )
+                    GeminiScheduler(
+                        collect=lambda: _run_gemini_collection(
+                            backfill_days,
+                            database_url=database_url,
+                            api_key=service_configuration.provider.api_key,
+                            provider_budget=provider_budget,
+                            structured_output=True,
+                        ),
+                        now=lambda: datetime.now(UTC),
+                        wait=stopped.wait,
+                        status=status,
+                    ).run()
+        except RuntimeError as error:
+            raise typer.BadParameter(str(error)) from error
+        finally:
+            engine.dispose()
+        return
 
+    _local_mvp_configuration()
     console.print("Gemini scheduler active at 06:00 and 18:00 Asia/Shanghai.")
     with SchedulerStopController() as stopped:
         GeminiScheduler(
@@ -471,24 +685,68 @@ def collect_gemini(
 ) -> None:
     """Collect Gemini API Release Notes and prepare DeepSeek draft Stories."""
     try:
-        database_url = database_url_from_environment()
-        api_key = deepseek_api_key_from_environment()
-        with (
-            httpx.Client(timeout=30, trust_env=False) as source_client,
-            httpx.Client(timeout=180) as provider_client,
-        ):
-            summary = collect_gemini_release_notes(
-                database_url,
-                fetcher=HttpGeminiReleaseNotesFetcher(source_client),
-                provider=DeepSeekGeminiDraftProvider(
-                    provider_client,
-                    api_key=api_key,
-                ),
-                clock=SystemClock(),
-                backfill_days=backfill_days,
+        if os.getenv("DEEPSEEK_API_KEY_FILE"):
+            configuration = M1SchedulerConfiguration.from_environment(os.environ)
+            engine = create_database_engine(configuration.database.database_url)
+            try:
+                provider_budget = _persistent_provider_budget(
+                    engine,
+                    configuration.provider,
+                )
+                _run_gemini_collection(
+                    backfill_days,
+                    database_url=configuration.database.database_url,
+                    api_key=configuration.provider.api_key,
+                    provider_budget=provider_budget,
+                    structured_output=False,
+                )
+            finally:
+                engine.dispose()
+        else:
+            _run_gemini_collection(
+                backfill_days,
+                database_url=database_url_from_environment(),
+                api_key=deepseek_api_key_from_environment(),
+                structured_output=False,
             )
     except (GeminiCollectionError, ValueError) as error:
         raise typer.BadParameter(str(error)) from error
+
+
+def _run_gemini_collection(
+    backfill_days: int,
+    *,
+    database_url: str,
+    api_key: str,
+    provider_budget: PersistentMeteredProviderBudget | None = None,
+    structured_output: bool,
+) -> None:
+    with (
+        httpx.Client(timeout=30, trust_env=False) as source_client,
+        httpx.Client(timeout=180) as provider_client,
+    ):
+        summary = collect_gemini_release_notes(
+            database_url,
+            fetcher=HttpGeminiReleaseNotesFetcher(source_client),
+            provider=DeepSeekGeminiDraftProvider(
+                provider_client,
+                api_key=api_key,
+                budget=provider_budget,
+            ),
+            clock=SystemClock(),
+            backfill_days=backfill_days,
+        )
+    if structured_output:
+        console.print_json(
+            data={
+                "event": "gemini-collection-complete",
+                "collection_run_id": str(summary.collection_run_id),
+                "sections_collected": summary.sections_collected,
+                "document_versions_created": summary.document_versions_created,
+                "drafts_created": summary.drafts_created,
+            }
+        )
+        return
     console.print(
         f"[green]Completed Gemini Collection Run {summary.collection_run_id}:[/] "
         f"sections_collected={summary.sections_collected}; "
