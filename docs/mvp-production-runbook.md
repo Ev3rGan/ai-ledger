@@ -1,9 +1,9 @@
 # MVP M1 production runbook
 
-This is the supported Issue #54 procedure for one Linux host. It deploys the existing v1 Web and
-Gemini Scheduler behind Caddy automatic HTTPS, with PostgreSQL reachable only on an internal
-Compose network. It does not activate new sources, change acquisition, or add an administrator
-Web surface.
+This is the supported Issue #54 M1 procedure extended by Issue #55's five-source M2 collector. It
+keeps the existing v1 Web behind Caddy automatic HTTPS and PostgreSQL reachable only on an
+internal Compose network. M2 does not change the public security boundary, allowance ledger,
+backup/restore, rollback, secret handling, or add an administrator Web surface.
 
 ## Frozen release and host layout
 
@@ -62,8 +62,8 @@ the current Provider price and configured maximum tokens. Web and Scheduler atom
 that amount in the same PostgreSQL monthly ledger before every request attempt. The ledger never
 refunds a reservation, so retries and failed calls remain safely counted and all production
 metered calls stop before the configured aggregate cap can be exceeded.
-The file-backed `collect-gemini` operator command detects this production contract and uses the
-same ledger; it cannot bypass the cap.
+The file-backed `collect-gemini` and `collect-sources` operator commands detect this production
+contract and use the same ledger; neither can bypass the cap.
 
 ## Validate, start, and inspect
 
@@ -81,7 +81,9 @@ PostgreSQL, migrates to the sole Alembic head, and then waits for Web, Scheduler
 Caddy. The Scheduler holds a
 PostgreSQL advisory lock, so a second production Scheduler exits before collection. `status`
 shows database readiness and persisted recent Scheduler state through the private container CLI.
-There is no operator HTTP route.
+`operator source-status --production` additionally reports each approved source's recent result,
+cursor, health, and body-valid Document Versions pending draft generation. There is no operator
+HTTP route.
 
 The lock-holding database session is monitored every two seconds, including while source or
 Provider I/O is in progress. A replacement Scheduler holds a five-second activation grace. If a
@@ -153,3 +155,30 @@ Infrastructure ownership remains with the user. After purchasing or selecting th
 
 Any missing real domain/certificate, public browser path, Provider counter proof, restart
 persistence, isolated restore, rollback, or secret audit makes live M1 acceptance incomplete.
+
+## M2 live-source acceptance gate
+
+The bounded implementation probe on 2026-08-17 used only these public discovery URLs:
+
+- `https://the-decoder.com/feed/`
+- `https://techcrunch.com/category/artificial-intelligence/feed/`
+- `https://huggingface.co/blog/feed.xml`
+- `https://aibusiness.com/rss.xml`
+- `https://www.qbitai.com/feed/`
+
+All five behaved as XML/RSS Feed endpoints; representative public article reads on each approved
+host exposed substantive HTML body content through ordinary access. No login, challenge bypass,
+credentials, raw-body persistence, live database, or Provider call was used. This implementation
+probe is evidence for the common adapter shape, not live acceptance.
+
+Do not run `collect-sources`, start a live backfill, or let the M2 Scheduler reach a collection
+slot until the supervisor explicitly authorizes `M2_LIVE_ACCEPTANCE_READY`. After authorization,
+use only the five versioned Source Profiles and record URLs, response status/behavior, counters,
+and identifiers—not raw fetched bodies or credentials. Verify TechCrunch discovery uses only its
+AI category Feed; AI Business either creates a body-valid Document Version or records
+`access-blocked`; one forced source failure leaves useful results from the other sources; and a
+same-key replay plus a new-key unchanged-cursor run creates no duplicates. Run
+`operator source-status --production` before and after collection and preserve the M1 acceptance
+record above. A missing real Feed/article observation, real budgeted Provider draft, idempotency
+proof, source-isolation proof, or exact Candidate-to-Evidence provenance leaves M2 live acceptance
+incomplete.

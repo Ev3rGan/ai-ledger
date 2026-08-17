@@ -712,14 +712,40 @@ def _build_draft_records(
     tuple[EvidenceSpan, ...],
     tuple[StructuredTrace, ...],
 ]:
+    return build_draft_records(
+        document,
+        prepared,
+        occurred_at=occurred_at,
+        namespace="gemini",
+        stable_key=f"gemini-release:{document.candidate_id}",
+    )
+
+
+def build_draft_records(
+    document: DocumentVersion,
+    prepared: PreparedDraft,
+    *,
+    occurred_at: datetime,
+    namespace: str,
+    stable_key: str,
+    identity_key: str | None = None,
+) -> tuple[
+    Story,
+    tuple[Claim, ...],
+    tuple[EvidenceSpan, ...],
+    tuple[StructuredTrace, ...],
+]:
+    if not namespace or not stable_key:
+        raise ValueError("Draft identity requires a namespace and stable key")
+    draft_identity = identity_key or str(document.candidate_id)
     story_id = uuid5(
         NAMESPACE_URL,
-        f"ai-intel-agent:gemini-draft-story:{document.candidate_id}",
+        f"ai-intel-agent:{namespace}-draft-story:{draft_identity}",
     )
     story = Story(
         id=story_id,
         primary_document_version_id=document.id,
-        stable_key=f"gemini-release:{document.candidate_id}",
+        stable_key=stable_key,
         headline=prepared.headline,
         occurred_at=document.published_at or occurred_at,
         review_state=StoryReviewState.UNREVIEWED,
@@ -730,12 +756,12 @@ def _build_draft_records(
     for position, prepared_claim in enumerate(prepared.claims):
         claim_id = uuid5(
             NAMESPACE_URL,
-            f"ai-intel-agent:gemini-draft-claim:{story_id}:{position}",
+            f"ai-intel-agent:{namespace}-draft-claim:{story_id}:{position}",
         )
         start_offset = document.body.index(prepared_claim.evidence)
         evidence_span_id = uuid5(
             NAMESPACE_URL,
-            f"ai-intel-agent:gemini-draft-evidence:{claim_id}:{start_offset}:"
+            f"ai-intel-agent:{namespace}-draft-evidence:{claim_id}:{start_offset}:"
             f"{prepared_claim.evidence}",
         )
         claims.append(
@@ -763,9 +789,9 @@ def _build_draft_records(
             StructuredTrace(
                 id=uuid5(
                     NAMESPACE_URL,
-                    f"ai-intel-agent:gemini-draft-trace:{evidence_span_id}",
+                    f"ai-intel-agent:{namespace}-draft-trace:{evidence_span_id}",
                 ),
-                operation_key=f"gemini-draft:{story_id}:claim:{position}",
+                operation_key=f"{namespace}-draft:{story_id}:claim:{position}",
                 evidence_span_id=evidence_span_id,
                 occurred_at=occurred_at,
                 attributes={

@@ -8,7 +8,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Annotated
-from uuid import UUID
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -48,8 +48,16 @@ from ai_intel_agent.model_routing_evaluation import (
     load_protocol_configuration,
     run_model_routing_evaluation,
 )
+from ai_intel_agent.multisource_collection import (
+    HttpArticleAdapter,
+    HttpFeedDiscoveryAdapter,
+    collect_source_profiles,
+    load_source_profiles,
+    scheduled_operation_key,
+)
 from ai_intel_agent.persistence import (
     EditorialRepository,
+    MultiSourceCollectionRepository,
     PersistentMeteredProviderBudget,
     SchedulerStatusRepository,
     create_database_engine,
@@ -76,6 +84,7 @@ from ai_intel_agent.runtime import (
     M1SchedulerConfiguration,
     M1WebConfiguration,
     MvpChildProcesses,
+    PostgresCollectionLease,
     PostgresSchedulerLease,
     SchedulerStopController,
     configure_structured_logging,
@@ -194,6 +203,65 @@ def operator_status(
             "updated_at": snapshot.updated_at.isoformat(),
         }
     console.print_json(data={"database": "ready", "scheduler": scheduler})
+
+
+@operator_app.command("source-status")
+def operator_source_status(
+    production: Annotated[
+        bool,
+        typer.Option("--production", help="Load the M1 Docker-secret contract."),
+    ] = False,
+) -> None:
+    """Report current five-profile result, cursor, health, and pending drafts."""
+    try:
+        database_url = _operator_database_url(production)
+        profiles = load_source_profiles()
+        engine = create_database_engine(database_url)
+        try:
+            snapshots = MultiSourceCollectionRepository(engine).source_statuses(
+                {profile.id for profile in profiles}
+            )
+        finally:
+            engine.dispose()
+    except (OSError, ValueError) as error:
+        raise typer.BadParameter(str(error)) from error
+
+    snapshots_by_id = {
+        snapshot.source_definition_id: snapshot for snapshot in snapshots
+    }
+    sources: list[dict[str, object]] = []
+    for profile in profiles:
+        snapshot = snapshots_by_id.get(profile.id)
+        sources.append(
+            {
+                "host": profile.host,
+                "publisher": profile.publisher,
+                "recent_result": (
+                    snapshot.recent_result if snapshot is not None else None
+                ),
+                "cursor": snapshot.cursor_value if snapshot is not None else None,
+                "health": snapshot.health if snapshot is not None else "unknown",
+                "consecutive_failures": (
+                    snapshot.consecutive_failures if snapshot is not None else 0
+                ),
+                "last_collection_run_id": (
+                    str(snapshot.last_collection_run_id)
+                    if snapshot is not None
+                    else None
+                ),
+                "updated_at": (
+                    snapshot.updated_at.isoformat() if snapshot is not None else None
+                ),
+                "pending_drafts": (
+                    snapshot.pending_drafts if snapshot is not None else 0
+                ),
+            }
+        )
+    console.print_json(
+        data={
+            "sources": sources
+        }
+    )
 
 
 @operator_app.command("scheduler-health")
@@ -382,6 +450,85 @@ def schedule_gemini(
     with SchedulerStopController() as stopped:
         GeminiScheduler(
             collect=lambda: collect_gemini(backfill_days),
+            now=lambda: datetime.now(UTC),
+            wait=stopped.wait,
+        ).run()
+
+
+@app.command("schedule-sources")
+def schedule_sources(
+    backfill_limit: Annotated[
+        int,
+        typer.Option(
+            "--backfill-limit",
+            min=1,
+            max=100,
+            help="Collect at most this many unseen entries per source and run.",
+        ),
+    ] = 5,
+    production: Annotated[
+        bool,
+        typer.Option(
+            "--production",
+            help="Require M1 secret files, persistent status, and the singleton lease.",
+        ),
+    ] = False,
+) -> None:
+    """Collect the five approved Source Profiles twice daily until interrupted."""
+    if production:
+        try:
+            service_configuration = M1SchedulerConfiguration.from_environment(os.environ)
+        except ValueError as error:
+            raise typer.BadParameter(str(error)) from error
+        database_url = service_configuration.database.database_url
+        engine = create_database_engine(database_url)
+        provider_budget = _persistent_provider_budget(
+            engine,
+            service_configuration.provider,
+        )
+        configure_structured_logging()
+        status = SchedulerStatusRepository(engine)
+        try:
+            with PostgresSchedulerLease(engine) as lease, SchedulerStopController() as stopped:
+                if lease.guarded_wait(stopped.wait, 5.0):
+                    return
+                with lease.monitor(lambda: os._exit(75)):
+                    console.print_json(
+                        data={
+                            "event": "multisource-scheduler-active",
+                            "schedule": "06:00,18:00 Asia/Shanghai",
+                        }
+                    )
+                    GeminiScheduler(
+                        collect=lambda: _run_multisource_collection(
+                            backfill_limit,
+                            database_url=database_url,
+                            api_key=service_configuration.provider.api_key,
+                            operation_key=scheduled_operation_key(datetime.now(UTC)),
+                            provider_budget=provider_budget,
+                            structured_output=True,
+                        ),
+                        now=lambda: datetime.now(UTC),
+                        wait=stopped.wait,
+                        status=status,
+                    ).run()
+        except RuntimeError as error:
+            raise typer.BadParameter(str(error)) from error
+        finally:
+            engine.dispose()
+        return
+
+    configuration = _local_mvp_configuration()
+    console.print("Five-source scheduler active at 06:00 and 18:00 Asia/Shanghai.")
+    with SchedulerStopController() as stopped:
+        GeminiScheduler(
+            collect=lambda: _run_multisource_collection(
+                backfill_limit,
+                database_url=configuration.database_url,
+                api_key=deepseek_api_key_from_environment(),
+                operation_key=scheduled_operation_key(datetime.now(UTC)),
+                structured_output=False,
+            ),
             now=lambda: datetime.now(UTC),
             wait=stopped.wait,
         ).run()
@@ -753,6 +900,108 @@ def _run_gemini_collection(
         f"document_versions_created={summary.document_versions_created}; "
         f"drafts_created={summary.drafts_created}"
     )
+
+
+@app.command("collect-sources")
+def collect_sources(
+    backfill_limit: Annotated[
+        int,
+        typer.Option(
+            "--backfill-limit",
+            min=1,
+            max=100,
+            help="Collect at most this many unseen entries per source and run.",
+        ),
+    ] = 5,
+    operation_key: Annotated[
+        str | None,
+        typer.Option(
+            "--operation-key",
+            help="Replay-safe operation key; a unique manual key is generated by default.",
+        ),
+    ] = None,
+) -> None:
+    """Collect the five approved sources and prepare budgeted DeepSeek drafts."""
+    requested_key = operation_key or f"m2-manual:{uuid4()}"
+    try:
+        if os.getenv("DEEPSEEK_API_KEY_FILE"):
+            configuration = M1SchedulerConfiguration.from_environment(os.environ)
+            engine = create_database_engine(configuration.database.database_url)
+            try:
+                provider_budget = _persistent_provider_budget(
+                    engine,
+                    configuration.provider,
+                )
+                _run_multisource_collection(
+                    backfill_limit,
+                    database_url=configuration.database.database_url,
+                    api_key=configuration.provider.api_key,
+                    operation_key=requested_key,
+                    provider_budget=provider_budget,
+                    structured_output=False,
+                )
+            finally:
+                engine.dispose()
+        else:
+            _run_multisource_collection(
+                backfill_limit,
+                database_url=database_url_from_environment(),
+                api_key=deepseek_api_key_from_environment(),
+                operation_key=requested_key,
+                structured_output=False,
+            )
+    except (RuntimeError, ValueError) as error:
+        raise typer.BadParameter(str(error)) from error
+
+
+def _run_multisource_collection(
+    backfill_limit: int,
+    *,
+    database_url: str,
+    api_key: str,
+    operation_key: str,
+    provider_budget: PersistentMeteredProviderBudget | None = None,
+    structured_output: bool,
+) -> None:
+    profiles = load_source_profiles()
+    lease_engine = create_database_engine(database_url)
+    try:
+        with (
+            PostgresCollectionLease(lease_engine) as lease,
+            lease.monitor(lambda: os._exit(75)),
+            httpx.Client(timeout=30, trust_env=False) as source_client,
+            httpx.Client(timeout=180) as provider_client,
+        ):
+            summary = collect_source_profiles(
+                database_url,
+                profiles=profiles,
+                feed_adapter=HttpFeedDiscoveryAdapter(source_client),
+                article_adapter=HttpArticleAdapter(source_client),
+                provider=DeepSeekGeminiDraftProvider(
+                    provider_client,
+                    api_key=api_key,
+                    budget=provider_budget,
+                ),
+                clock=SystemClock(),
+                operation_key=operation_key,
+                backfill_limit=backfill_limit,
+            )
+    finally:
+        lease_engine.dispose()
+    payload = {
+        "event": "multisource-collection-complete",
+        "collection_run_id": str(summary.collection_run_id),
+        "status": summary.status.value,
+        "source_results": summary.source_results,
+        "candidates_processed": summary.candidates_processed,
+        "document_versions_created": summary.document_versions_created,
+        "drafts_created": summary.drafts_created,
+        "replayed": summary.replayed,
+    }
+    if structured_output:
+        console.print_json(data=payload)
+        return
+    console.print_json(data=payload)
 
 
 @app.command("audit-sources")

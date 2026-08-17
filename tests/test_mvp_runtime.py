@@ -368,7 +368,7 @@ def test_child_processes_start_supported_scheduler_and_serve_commands_and_stop_b
     processes.stop()
 
     assert [call[0] for call in factory.calls] == [
-        ["C:/Python/python.exe", "-m", "ai_intel_agent.cli", "schedule-gemini"],
+        ["C:/Python/python.exe", "-m", "ai_intel_agent.cli", "schedule-sources"],
         [
             "C:/Python/python.exe",
             "-m",
@@ -428,6 +428,8 @@ def test_cli_exposes_the_supported_local_start_and_scheduler_commands() -> None:
     assert result.exit_code == 0
     assert "start-local" in result.output
     assert "schedule-gemini" in result.output
+    assert "schedule-sources" in result.output
+    assert "collect-sources" in result.output
 
 
 def test_local_start_fails_before_docker_without_explicit_process_credentials(

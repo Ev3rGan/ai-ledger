@@ -22,6 +22,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     Uuid,
+    func,
     select,
     update,
 )
@@ -39,11 +40,14 @@ from ai_intel_agent.domain import (
     CollectionRun,
     Digest,
     DigestState,
+    DocumentVersion,
     EvidenceRelation,
     EvidenceRole,
     EvidenceSpan,
     SampleDigestPublication,
     SampleStory,
+    SourceCandidateCollectionResult,
+    SourceProfileState,
     Story,
     StoryReviewState,
     StructuredTrace,
@@ -256,13 +260,15 @@ class CollectionRunRecord(Base):
     status: Mapped[str] = mapped_column(String(32))
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    operation_key: Mapped[str | None] = mapped_column(String(255), unique=True)
 
 
 class SourceDefinitionCollectionResultRecord(Base):
     __tablename__ = "source_definition_collection_results"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('succeeded', 'failed')",
+            "status IN ('success', 'empty', 'invalid-format', 'access-blocked', "
+            "'temporary-failure', 'succeeded', 'failed')",
             name="ck_source_definition_collection_results_status",
         ),
         CheckConstraint(
@@ -270,9 +276,10 @@ class SourceDefinitionCollectionResultRecord(Base):
             name="ck_source_definition_collection_results_candidate_count",
         ),
         CheckConstraint(
-            "(status = 'succeeded' AND error_code IS NULL AND error_message IS NULL) "
-            "OR (status = 'failed' AND error_code IS NOT NULL "
-            "AND error_message IS NOT NULL)",
+            "(status IN ('success', 'empty', 'succeeded') AND error_code IS NULL "
+            "AND error_message IS NULL) OR (status IN ('invalid-format', "
+            "'access-blocked', 'temporary-failure', 'failed') "
+            "AND error_code IS NOT NULL AND error_message IS NOT NULL)",
             name="ck_source_definition_collection_results_error_shape",
         ),
     )
@@ -285,6 +292,71 @@ class SourceDefinitionCollectionResultRecord(Base):
     )
     status: Mapped[str] = mapped_column(String(32))
     candidate_count: Mapped[int] = mapped_column(Integer)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    error_message: Mapped[str | None] = mapped_column(Text)
+
+
+class SourceProfileStateRecord(Base):
+    __tablename__ = "source_profile_states"
+    __table_args__ = (
+        CheckConstraint(
+            "recent_result IN ('success', 'empty', 'invalid-format', "
+            "'access-blocked', 'temporary-failure')",
+            name="ck_source_profile_states_recent_result",
+        ),
+        CheckConstraint(
+            "health IN ('healthy', 'degraded', 'blocked')",
+            name="ck_source_profile_states_health",
+        ),
+        CheckConstraint(
+            "consecutive_failures >= 0",
+            name="ck_source_profile_states_consecutive_failures",
+        ),
+    )
+
+    source_definition_id: Mapped[UUID] = mapped_column(
+        ForeignKey("source_definitions.id"), primary_key=True
+    )
+    recent_result: Mapped[str] = mapped_column(String(32))
+    cursor_value: Mapped[str | None] = mapped_column(Text)
+    health: Mapped[str] = mapped_column(String(32))
+    consecutive_failures: Mapped[int] = mapped_column(Integer)
+    last_collection_run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("collection_runs.id")
+    )
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class SourceCandidateResultRecord(Base):
+    __tablename__ = "source_candidate_results"
+    __table_args__ = (
+        CheckConstraint(
+            "article_status IN ('body-valid', 'invalid-format', 'access-blocked', "
+            "'temporary-failure')",
+            name="ck_source_candidate_results_status",
+        ),
+        CheckConstraint(
+            "(article_status = 'body-valid' AND document_version_id IS NOT NULL "
+            "AND error_code IS NULL AND error_message IS NULL) OR "
+            "(article_status <> 'body-valid' AND document_version_id IS NULL "
+            "AND error_code IS NOT NULL AND error_message IS NOT NULL)",
+            name="ck_source_candidate_results_shape",
+        ),
+    )
+
+    collection_run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("collection_runs.id"), primary_key=True
+    )
+    source_definition_id: Mapped[UUID] = mapped_column(
+        ForeignKey("source_definitions.id"), primary_key=True
+    )
+    candidate_id: Mapped[UUID] = mapped_column(
+        ForeignKey("candidates.id"), primary_key=True
+    )
+    document_version_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("document_versions.id")
+    )
+    article_status: Mapped[str] = mapped_column(String(32))
     error_code: Mapped[str | None] = mapped_column(String(64))
     error_message: Mapped[str | None] = mapped_column(Text)
 
@@ -893,6 +965,7 @@ class FeedCollectionRepository:
                 status="running",
                 started_at=run.started_at,
                 completed_at=None,
+                operation_key=run.operation_key,
             )
             session.add(run_record)
             session.flush()
@@ -913,6 +986,321 @@ class FeedCollectionRepository:
             session.flush()
             run_record.status = run.status.value
             run_record.completed_at = run.completed_at
+
+
+@dataclass(frozen=True)
+class PersistedCollectionOperation:
+    collection_run_id: UUID
+    status: str
+    source_results: dict[str, str]
+    candidates_processed: int
+
+
+@dataclass(frozen=True)
+class SourceStatusSnapshot:
+    source_definition_id: UUID
+    name: str
+    publisher: str
+    recent_result: str
+    cursor_value: str | None
+    health: str
+    consecutive_failures: int
+    last_collection_run_id: UUID
+    updated_at: datetime
+    pending_drafts: int
+
+
+class MultiSourceCollectionRepository:
+    """Persist one body-gated multi-source run and its mutable source health."""
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+
+    def operation(self, operation_key: str) -> PersistedCollectionOperation | None:
+        with Session(self._engine) as session:
+            run = session.scalar(
+                select(CollectionRunRecord).where(
+                    CollectionRunRecord.operation_key == operation_key
+                )
+            )
+            if run is None:
+                return None
+            source_results = dict(
+                session.execute(
+                    select(
+                        SourceDefinitionRecord.name,
+                        SourceDefinitionCollectionResultRecord.status,
+                    )
+                    .join(
+                        SourceDefinitionRecord,
+                        SourceDefinitionRecord.id
+                        == SourceDefinitionCollectionResultRecord.source_definition_id,
+                    )
+                    .where(
+                        SourceDefinitionCollectionResultRecord.collection_run_id == run.id
+                    )
+                ).all()
+            )
+            candidates_processed = session.scalar(
+                select(func.count())
+                .select_from(SourceCandidateResultRecord)
+                .where(SourceCandidateResultRecord.collection_run_id == run.id)
+            )
+            return PersistedCollectionOperation(
+                collection_run_id=run.id,
+                status=run.status,
+                source_results=source_results,
+                candidates_processed=int(candidates_processed or 0),
+            )
+
+    def cursor_values(self, source_definition_ids: set[UUID]) -> dict[UUID, str]:
+        if not source_definition_ids:
+            return {}
+        with Session(self._engine) as session:
+            return {
+                source_definition_id: cursor_value
+                for source_definition_id, cursor_value in session.execute(
+                    select(
+                        SourceProfileStateRecord.source_definition_id,
+                        SourceProfileStateRecord.cursor_value,
+                    ).where(
+                        SourceProfileStateRecord.source_definition_id.in_(
+                            source_definition_ids
+                        ),
+                        SourceProfileStateRecord.cursor_value.is_not(None),
+                    )
+                )
+                if cursor_value is not None
+            }
+
+    def persist(
+        self,
+        run: CollectionRun,
+        source_definitions: tuple[ApprovedFeedSourceDefinition, ...],
+        candidate_results: tuple[SourceCandidateCollectionResult, ...],
+        states: tuple[SourceProfileState, ...],
+    ) -> bool:
+        definitions_by_id = {
+            source_definition.id: source_definition
+            for source_definition in source_definitions
+        }
+        with Session(self._engine) as session, session.begin():
+            if run.operation_key is None:
+                raise ValueError("A multi-source Collection Run requires an operation key")
+            for source_definition in source_definitions:
+                _persist_source_definition(session, source_definition)
+            inserted_run_id = session.scalar(
+                insert(CollectionRunRecord)
+                .values(
+                    id=run.id,
+                    retry_of_run_id=run.retry_of_run_id,
+                    status="running",
+                    started_at=run.started_at,
+                    completed_at=None,
+                    operation_key=run.operation_key,
+                )
+                .on_conflict_do_nothing(index_elements=["operation_key"])
+                .returning(CollectionRunRecord.id)
+            )
+            if inserted_run_id is None:
+                return False
+            run_record = session.get(CollectionRunRecord, inserted_run_id)
+            if run_record is None:
+                raise RuntimeError("Inserted Collection Run could not be loaded")
+            for result in run.source_definition_results:
+                if result.source_definition_id not in definitions_by_id:
+                    raise ValueError("Collection result has no Source Profile")
+                session.add(
+                    SourceDefinitionCollectionResultRecord(
+                        collection_run_id=run.id,
+                        source_definition_id=result.source_definition_id,
+                        status=result.status.value,
+                        candidate_count=result.candidate_count,
+                        error_code=result.error_code,
+                        error_message=result.error_message,
+                    )
+                )
+            for candidate_result in candidate_results:
+                self._persist_candidate_result(session, run.id, candidate_result)
+            session.flush()
+            for state in states:
+                if state.last_collection_run_id != run.id:
+                    raise ValueError("Source Profile state points to another Collection Run")
+                values = {
+                    "recent_result": state.recent_result.value,
+                    "cursor_value": state.cursor_value,
+                    "health": state.health.value,
+                    "consecutive_failures": state.consecutive_failures,
+                    "last_collection_run_id": state.last_collection_run_id,
+                    "updated_at": state.updated_at,
+                }
+                existing = session.get(SourceProfileStateRecord, state.source_definition_id)
+                if existing is None:
+                    session.add(
+                        SourceProfileStateRecord(
+                            source_definition_id=state.source_definition_id,
+                            **values,
+                        )
+                    )
+                else:
+                    for key, value in values.items():
+                        setattr(existing, key, value)
+            session.flush()
+            run_record.status = run.status.value
+            run_record.completed_at = run.completed_at
+            return True
+
+    @staticmethod
+    def _persist_candidate_result(
+        session: Session,
+        collection_run_id: UUID,
+        result: SourceCandidateCollectionResult,
+    ) -> None:
+        candidate = result.candidate
+        document = result.document_version
+        if document is not None:
+            _persist_collection_discovery(
+                session,
+                collection_run_id,
+                CollectionDiscovery(
+                    source_definition_id=result.source_definition_id,
+                    candidate=candidate,
+                    document_version=document,
+                ),
+            )
+        else:
+            session.execute(
+                insert(CandidateRecord)
+                .values(**candidate.__dict__)
+                .on_conflict_do_nothing()
+            )
+            persisted_candidate_id = session.scalar(
+                select(CandidateRecord.id).where(
+                    CandidateRecord.canonical_url == candidate.canonical_url
+                )
+            )
+            if persisted_candidate_id != candidate.id:
+                raise ValueError(
+                    f"Candidate URL {candidate.canonical_url} belongs to another identity"
+                )
+        session.add(
+            SourceCandidateResultRecord(
+                collection_run_id=collection_run_id,
+                source_definition_id=result.source_definition_id,
+                candidate_id=candidate.id,
+                document_version_id=document.id if document is not None else None,
+                article_status=result.status.value,
+                error_code=result.error_code,
+                error_message=result.error_message,
+            )
+        )
+
+    def source_statuses(
+        self,
+        source_definition_ids: set[UUID],
+    ) -> tuple[SourceStatusSnapshot, ...]:
+        if not source_definition_ids:
+            return ()
+        with Session(self._engine) as session:
+            rows = session.execute(
+                select(SourceProfileStateRecord, SourceDefinitionRecord)
+                .join(
+                    SourceDefinitionRecord,
+                    SourceDefinitionRecord.id
+                    == SourceProfileStateRecord.source_definition_id,
+                )
+                .where(
+                    SourceProfileStateRecord.source_definition_id.in_(
+                        source_definition_ids
+                    )
+                )
+                .order_by(SourceDefinitionRecord.name)
+            ).all()
+            snapshots: list[SourceStatusSnapshot] = []
+            for state, definition in rows:
+                pending_drafts = session.scalar(
+                    select(
+                        func.count(
+                            func.distinct(
+                                SourceCandidateResultRecord.document_version_id
+                            )
+                        )
+                    )
+                    .select_from(SourceCandidateResultRecord)
+                    .outerjoin(
+                        StoryRecord,
+                        StoryRecord.primary_document_version_id
+                        == SourceCandidateResultRecord.document_version_id,
+                    )
+                    .where(
+                        SourceCandidateResultRecord.source_definition_id
+                        == definition.id,
+                        SourceCandidateResultRecord.article_status == "body-valid",
+                        SourceCandidateResultRecord.document_version_id.is_not(None),
+                        StoryRecord.id.is_(None),
+                    )
+                )
+                snapshots.append(
+                    SourceStatusSnapshot(
+                        source_definition_id=definition.id,
+                        name=definition.name,
+                        publisher=definition.publisher,
+                        recent_result=state.recent_result,
+                        cursor_value=state.cursor_value,
+                        health=state.health,
+                        consecutive_failures=state.consecutive_failures,
+                        last_collection_run_id=state.last_collection_run_id,
+                        updated_at=state.updated_at,
+                        pending_drafts=int(pending_drafts or 0),
+                    )
+                )
+            return tuple(snapshots)
+
+    def pending_draft_documents(
+        self,
+        source_definition_ids: set[UUID],
+    ) -> tuple[DocumentVersion, ...]:
+        if not source_definition_ids:
+            return ()
+        pending_document_ids = (
+            select(SourceCandidateResultRecord.document_version_id)
+            .outerjoin(
+                StoryRecord,
+                StoryRecord.primary_document_version_id
+                == SourceCandidateResultRecord.document_version_id,
+            )
+            .where(
+                SourceCandidateResultRecord.source_definition_id.in_(
+                    source_definition_ids
+                ),
+                SourceCandidateResultRecord.article_status == "body-valid",
+                SourceCandidateResultRecord.document_version_id.is_not(None),
+                StoryRecord.id.is_(None),
+            )
+            .distinct()
+        )
+        with Session(self._engine) as session:
+            records = session.scalars(
+                select(DocumentVersionRecord)
+                .where(DocumentVersionRecord.id.in_(pending_document_ids))
+                .order_by(DocumentVersionRecord.observed_at, DocumentVersionRecord.id)
+            ).all()
+            return tuple(
+                DocumentVersion(
+                    id=record.id,
+                    candidate_id=record.candidate_id,
+                    source_url=record.source_url,
+                    title=record.title,
+                    body=record.body,
+                    content_hash=record.content_hash,
+                    observed_at=record.observed_at,
+                    published_at=record.published_at,
+                    published_at_raw=record.published_at_raw,
+                    updated_at=record.updated_at,
+                    updated_at_raw=record.updated_at_raw,
+                )
+                for record in records
+            )
 
 
 class GeminiDraftRepository:
@@ -946,6 +1334,17 @@ class GeminiDraftRepository:
                     )
                     .where(
                         DocumentVersionRecord.candidate_id == candidate_id
+                    )
+                )
+                is not None
+            )
+
+    def has_draft_for_document_version(self, document_version_id: UUID) -> bool:
+        with Session(self._engine) as session:
+            return (
+                session.scalar(
+                    select(StoryRecord.id).where(
+                        StoryRecord.primary_document_version_id == document_version_id
                     )
                 )
                 is not None
