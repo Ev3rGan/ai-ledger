@@ -6,8 +6,8 @@ from sqlalchemy import engine_from_config, pool
 
 from ai_intel_agent.persistence import (
     Base,
+    database_url_for_alembic_config,
     database_url_from_environment,
-    normalize_database_url,
 )
 from alembic import context
 
@@ -15,7 +15,7 @@ config = context.config
 if not config.get_main_option("sqlalchemy.url"):
     config.set_main_option(
         "sqlalchemy.url",
-        normalize_database_url(database_url_from_environment()),
+        database_url_for_alembic_config(database_url_from_environment()),
     )
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
