@@ -10,7 +10,7 @@ from urllib.parse import quote, urlsplit
 from xml.etree import ElementTree
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from ai_intel_agent.domain import EvidenceRelation, EvidenceRole, EvidenceState
@@ -23,6 +23,7 @@ from ai_intel_agent.publication import (
     PublicStory,
 )
 from ai_intel_agent.research import (
+    PersistentAnonymousResearchAllowance,
     ResearchProvider,
     ResearchRepository,
     stream_research_events,
@@ -56,10 +57,24 @@ def create_app(
     database_url: str,
     *,
     research_provider: ResearchProvider | None = None,
+    anonymous_research_daily_limit: int | None = None,
+    anonymous_identity_salt: bytes | None = None,
 ) -> FastAPI:
+    if (anonymous_research_daily_limit is None) != (anonymous_identity_salt is None):
+        raise ValueError("Anonymous Research limit and identity salt must be configured together")
     engine = create_database_engine(database_url)
     repository = PublicPublicationRepository(engine)
     research_repository = ResearchRepository(engine)
+    research_allowance = (
+        PersistentAnonymousResearchAllowance(
+            engine,
+            daily_limit=anonymous_research_daily_limit,
+            identity_salt=anonymous_identity_salt,
+        )
+        if anonymous_research_daily_limit is not None
+        and anonymous_identity_salt is not None
+        else None
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -73,6 +88,19 @@ def create_app(
         openapi_url=None,
         lifespan=lifespan,
     )
+
+    @app.get("/health/live", include_in_schema=False)
+    def health_live() -> dict[str, str]:
+        return {"status": "live"}
+
+    @app.get("/health/ready", include_in_schema=False)
+    def health_ready() -> JSONResponse:
+        try:
+            with engine.connect() as connection:
+                connection.exec_driver_sql("SELECT 1")
+        except Exception:  # noqa: BLE001 - readiness must fail closed for any database error.
+            return JSONResponse({"status": "not-ready"}, status_code=503)
+        return JSONResponse({"status": "ready"})
 
     @app.get("/", response_class=HTMLResponse, name="home")
     def home() -> HTMLResponse:
@@ -125,11 +153,16 @@ def create_app(
         return HTMLResponse(_render_page("Research", _render_research_page()))
 
     @app.post("/research/answer", name="research_answer")
-    def research_answer(payload: ResearchQuestion) -> StreamingResponse:
+    def research_answer(payload: ResearchQuestion, request: Request) -> StreamingResponse:
+        anonymous_client_id = request.headers.get("X-AI-Anonymous-Client")
+        if anonymous_client_id is None and request.client is not None:
+            anonymous_client_id = request.client.host
         events = stream_research_events(
             payload.question,
             repository=research_repository,
             provider=research_provider,
+            allowance=research_allowance,
+            anonymous_client_id=anonymous_client_id,
         )
         return StreamingResponse(
             (_encode_sse(event, data) for event, data in events),

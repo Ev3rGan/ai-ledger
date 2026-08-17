@@ -1,0 +1,247 @@
+name: ai-ledger-m1
+
+x-json-logging: &json-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+x-pgvector-image: &pgvector-image pgvector/pgvector:0.8.6-pg16-bookworm@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b
+
+x-app: &app
+  image: ${AI_INTEL_IMAGE:?set an immutable application image digest}
+  restart: unless-stopped
+  init: true
+  read_only: true
+  user: "10001:10001"
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  security_opt:
+    - no-new-privileges:true
+  group_add:
+    - "10001"
+  depends_on:
+    postgres:
+      condition: service_healthy
+  logging: *json-logging
+
+x-database-environment: &database-environment
+  AI_INTEL_PROJECT_ROOT: /opt/ai-ledger
+  AI_INTEL_DATABASE_HOST: postgres
+  AI_INTEL_DATABASE_PORT: "5432"
+  AI_INTEL_DATABASE_NAME: ${AI_INTEL_POSTGRES_DATABASE:?required}
+  AI_INTEL_DATABASE_USER: ${AI_INTEL_POSTGRES_USER:?required}
+  AI_INTEL_DATABASE_PASSWORD_FILE: /run/secrets/database-password
+
+x-provider-environment: &provider-environment
+  DEEPSEEK_API_KEY_FILE: /run/secrets/deepseek-api-key
+  AI_INTEL_PROVIDER_MONTHLY_BUDGET_CENTS: ${AI_INTEL_PROVIDER_MONTHLY_BUDGET_CENTS:-10000}
+  AI_INTEL_PROVIDER_REQUEST_RESERVATION_CENTS: ${AI_INTEL_PROVIDER_REQUEST_RESERVATION_CENTS:-100}
+
+services:
+  caddy:
+    image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      AI_INTEL_DOMAIN: ${AI_INTEL_DOMAIN:?required}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - edge
+    depends_on:
+      web:
+        condition: service_healthy
+    logging: *json-logging
+
+  postgres:
+    image: *pgvector-image
+    restart: unless-stopped
+    shm_size: 256mb
+    security_opt:
+      - no-new-privileges:true
+    group_add:
+      - "10001"
+    environment:
+      POSTGRES_DB: ${AI_INTEL_POSTGRES_DATABASE:?required}
+      POSTGRES_USER: ${AI_INTEL_POSTGRES_USER:?required}
+      POSTGRES_PASSWORD_FILE: /run/secrets/database-password
+    secrets:
+      - database-password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - database
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    logging: *json-logging
+
+  web:
+    <<: *app
+    command: ["serve", "--production", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      <<: [*database-environment, *provider-environment]
+      AI_INTEL_ANONYMOUS_ID_SALT_FILE: /run/secrets/anonymous-id-salt
+      AI_INTEL_ANONYMOUS_RESEARCH_DAILY_LIMIT: ${AI_INTEL_ANONYMOUS_RESEARCH_DAILY_LIMIT:-3}
+    secrets:
+      - database-password
+      - deepseek-api-key
+      - anonymous-id-salt
+    expose:
+      - "8000"
+    networks:
+      - edge
+      - database
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2).read()"
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+  scheduler:
+    <<: *app
+    command: ["schedule-gemini", "--production"]
+    environment:
+      <<: [*database-environment, *provider-environment]
+    secrets:
+      - database-password
+      - deepseek-api-key
+    networks:
+      - database
+    healthcheck:
+      test: ["CMD", "ai-intel-agent", "operator", "scheduler-health", "--production"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  backup:
+    image: *pgvector-image
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    group_add:
+      - "10001"
+    entrypoint: ["sh", "/opt/ai-ledger/backup.sh"]
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: ${AI_INTEL_POSTGRES_DATABASE:?required}
+      PGUSER: ${AI_INTEL_POSTGRES_USER:?required}
+      AI_INTEL_BACKUP_INTERVAL_SECONDS: ${AI_INTEL_BACKUP_INTERVAL_SECONDS:-86400}
+      AI_INTEL_BACKUP_RETENTION_DAYS: ${AI_INTEL_BACKUP_RETENTION_DAYS:-14}
+    secrets:
+      - database-password
+    volumes:
+      - ./backup.sh:/opt/ai-ledger/backup.sh:ro
+      - ${AI_INTEL_BACKUP_DIR:?required}:/backups
+      - ${AI_INTEL_OFFSITE_BACKUP_DIR:?required}:/offsite-backups
+    networks:
+      - database
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging: *json-logging
+
+  migrate:
+    <<: *app
+    profiles: ["ops"]
+    restart: "no"
+    command: ["operator", "migrate", "--production"]
+    environment: *database-environment
+    secrets:
+      - database-password
+    networks:
+      - database
+
+  restore-postgres:
+    image: *pgvector-image
+    profiles: ["restore"]
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+    group_add:
+      - "10001"
+    environment:
+      POSTGRES_DB: ${AI_INTEL_RESTORE_DATABASE:-ai_ledger_restore}
+      POSTGRES_USER: ${AI_INTEL_POSTGRES_USER:?required}
+      POSTGRES_PASSWORD_FILE: /run/secrets/database-password
+    secrets:
+      - database-password
+    volumes:
+      - restore-postgres-data:/var/lib/postgresql/data
+    networks:
+      - restore
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    logging: *json-logging
+
+  restore:
+    image: *pgvector-image
+    profiles: ["restore"]
+    restart: "no"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    group_add:
+      - "10001"
+    entrypoint: ["sh", "/opt/ai-ledger/restore.sh"]
+    environment:
+      PGHOST: restore-postgres
+      PGPORT: "5432"
+      PGDATABASE: ${AI_INTEL_RESTORE_DATABASE:-ai_ledger_restore}
+      PGUSER: ${AI_INTEL_POSTGRES_USER:?required}
+      AI_INTEL_RESTORE_FILE: ${AI_INTEL_RESTORE_FILE:-}
+    secrets:
+      - database-password
+    volumes:
+      - ./restore.sh:/opt/ai-ledger/restore.sh:ro
+      - ${AI_INTEL_BACKUP_DIR:?required}:/backups:ro
+    networks:
+      - restore
+    depends_on:
+      restore-postgres:
+        condition: service_healthy
+    logging: *json-logging
+
+networks:
+  edge: {}
+  database:
+    internal: true
+  restore:
+    internal: true
+
+volumes:
+  postgres-data: {}
+  restore-postgres-data: {}
+  caddy-data: {}
+  caddy-config: {}
+
+secrets:
+  database-password:
+    file: ${AI_INTEL_SECRETS_DIR:?required}/database-password
+  deepseek-api-key:
+    file: ${AI_INTEL_SECRETS_DIR:?required}/deepseek-api-key
+  anonymous-id-salt:
+    file: ${AI_INTEL_SECRETS_DIR:?required}/anonymous-id-salt

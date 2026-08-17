@@ -111,6 +111,10 @@ class GeminiDraftProvider(Protocol):
     def prepare(self, document: DocumentVersion) -> PreparedDraft: ...
 
 
+class MeteredProviderBudget(Protocol):
+    def reserve(self) -> bool: ...
+
+
 @dataclass(frozen=True)
 class DatedReleaseSection:
     heading: str
@@ -380,6 +384,10 @@ def load_gemini_draft_protocol() -> GeminiDraftProtocol:
 
 def deepseek_api_key_from_environment() -> str:
     api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    if not api_key and os.getenv("DEEPSEEK_API_KEY_FILE"):
+        from ai_intel_agent.runtime import injected_secret_from_environment
+
+        api_key = injected_secret_from_environment(os.environ, "DEEPSEEK_API_KEY")
     if not api_key:
         raise DraftPreparationError("Set DEEPSEEK_API_KEY for collect-gemini")
     return api_key
@@ -391,10 +399,12 @@ class DeepSeekGeminiDraftProvider:
         client: httpx.Client,
         *,
         api_key: str,
+        budget: MeteredProviderBudget | None = None,
         sleeper: Callable[[float], None] = sleep,
     ) -> None:
         self._client = client
         self._api_key = api_key
+        self._budget = budget
         self._sleeper = sleeper
         self._draft_protocol = load_gemini_draft_protocol()
         self._routing_protocol = load_protocol_configuration()
@@ -437,6 +447,10 @@ class DeepSeekGeminiDraftProvider:
         attempts = 0
         while attempts < self._routing_protocol.retry_policy.max_attempts:
             attempts += 1
+            if self._budget is not None and not self._budget.reserve():
+                raise DraftPreparationError(
+                    "Aggregate monthly Provider budget is exhausted"
+                )
             try:
                 response = self._client.post(
                     f"{self._candidate.base_url.rstrip('/')}/chat/completions",

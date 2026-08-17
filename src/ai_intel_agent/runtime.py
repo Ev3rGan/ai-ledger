@@ -1,21 +1,25 @@
 from __future__ import annotations
 
+import json
+import logging
 import os
 import signal
 import subprocess
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, time, timedelta
 from enum import StrEnum
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
 from time import sleep
 from types import FrameType
 from typing import Protocol, Self
 from zoneinfo import ZoneInfo
 
-from sqlalchemy.engine import make_url
+from sqlalchemy import text
+from sqlalchemy.engine import URL, Connection, Engine, make_url
 from sqlalchemy.exc import ArgumentError
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -31,6 +35,177 @@ else:
     CHILD_PROCESS_OPTIONS = {"start_new_session": True}
     CHILD_PROCESS_STOP_SIGNAL = signal.SIGTERM
     SCHEDULER_STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+
+
+class ServiceJsonFormatter(logging.Formatter):
+    """Render service stdout as stable one-record-per-line JSON."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict[str, object] = {
+            "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info is not None:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def configure_structured_logging() -> None:
+    handler = logging.StreamHandler()
+    handler.setFormatter(ServiceJsonFormatter())
+    root = logging.getLogger()
+    root.handlers[:] = [handler]
+    root.setLevel(logging.INFO)
+    for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        logger = logging.getLogger(logger_name)
+        logger.handlers.clear()
+        logger.propagate = True
+
+
+def injected_secret_from_environment(environment: Mapping[str, str], key: str) -> str:
+    path_value = environment.get(f"{key}_FILE", "").strip()
+    if not path_value:
+        raise ValueError(f"Set {key}_FILE to an injected secret file")
+    secret_path = Path(path_value)
+    try:
+        value = secret_path.read_text(encoding="utf-8").strip()
+    except OSError as error:
+        raise ValueError(f"Cannot read injected secret file for {key}") from error
+    if not value:
+        raise ValueError(f"Injected secret file for {key} must not be empty")
+    return value
+
+
+def production_database_url(environment: Mapping[str, str]) -> str:
+    required_values = {
+        key: environment.get(key, "").strip()
+        for key in (
+            "AI_INTEL_DATABASE_HOST",
+            "AI_INTEL_DATABASE_NAME",
+            "AI_INTEL_DATABASE_USER",
+        )
+    }
+    missing = [key for key, value in required_values.items() if not value]
+    if missing:
+        raise ValueError(f"Set {missing[0]} for the production service")
+    try:
+        port = int(environment.get("AI_INTEL_DATABASE_PORT", "5432"))
+    except ValueError as error:
+        raise ValueError("AI_INTEL_DATABASE_PORT must be an integer") from error
+    if not 1 <= port <= 65535:
+        raise ValueError("AI_INTEL_DATABASE_PORT must be between 1 and 65535")
+    password = injected_secret_from_environment(
+        environment, "AI_INTEL_DATABASE_PASSWORD"
+    )
+    return URL.create(
+        "postgresql+psycopg",
+        username=required_values["AI_INTEL_DATABASE_USER"],
+        password=password,
+        host=required_values["AI_INTEL_DATABASE_HOST"],
+        port=port,
+        database=required_values["AI_INTEL_DATABASE_NAME"],
+    ).render_as_string(hide_password=False)
+
+
+def bounded_integer_from_environment(
+    environment: Mapping[str, str],
+    key: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    try:
+        value = int(environment.get(key, ""))
+    except ValueError as error:
+        raise ValueError(f"{key} must be an integer") from error
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{key} must be between {minimum} and {maximum}")
+    return value
+
+
+@dataclass(frozen=True)
+class M1DatabaseConfiguration:
+    """The database-only production contract used by private operator commands."""
+
+    database_url: str = field(repr=False)
+
+    @classmethod
+    def from_environment(cls, environment: Mapping[str, str]) -> M1DatabaseConfiguration:
+        return cls(database_url=production_database_url(environment))
+
+
+@dataclass(frozen=True)
+class M1ProviderConfiguration:
+    """Provider credential and conservative aggregate monthly budget."""
+
+    api_key: str = field(repr=False)
+    monthly_budget_cents: int
+    request_reservation_cents: int
+
+    @classmethod
+    def from_environment(cls, environment: Mapping[str, str]) -> M1ProviderConfiguration:
+        monthly_budget_cents = bounded_integer_from_environment(
+            environment,
+            "AI_INTEL_PROVIDER_MONTHLY_BUDGET_CENTS",
+            minimum=1,
+            maximum=10_000,
+        )
+        request_reservation_cents = bounded_integer_from_environment(
+            environment,
+            "AI_INTEL_PROVIDER_REQUEST_RESERVATION_CENTS",
+            minimum=1,
+            maximum=monthly_budget_cents,
+        )
+        return cls(
+            api_key=injected_secret_from_environment(environment, "DEEPSEEK_API_KEY"),
+            monthly_budget_cents=monthly_budget_cents,
+            request_reservation_cents=request_reservation_cents,
+        )
+
+
+@dataclass(frozen=True)
+class M1WebConfiguration:
+    """Web-only production contract loaded from its three injected secrets."""
+
+    database: M1DatabaseConfiguration
+    provider: M1ProviderConfiguration
+    anonymous_identity_salt: bytes = field(repr=False)
+    anonymous_research_daily_limit: int
+
+    @classmethod
+    def from_environment(cls, environment: Mapping[str, str]) -> M1WebConfiguration:
+        daily_limit = bounded_integer_from_environment(
+            environment,
+            "AI_INTEL_ANONYMOUS_RESEARCH_DAILY_LIMIT",
+            minimum=1,
+            maximum=100,
+        )
+        identity_salt = injected_secret_from_environment(
+            environment, "AI_INTEL_ANONYMOUS_ID_SALT"
+        )
+        return cls(
+            database=M1DatabaseConfiguration.from_environment(environment),
+            provider=M1ProviderConfiguration.from_environment(environment),
+            anonymous_identity_salt=identity_salt.encode("utf-8"),
+            anonymous_research_daily_limit=daily_limit,
+        )
+
+
+@dataclass(frozen=True)
+class M1SchedulerConfiguration:
+    """Scheduler-only production contract without anonymous Web secrets."""
+
+    database: M1DatabaseConfiguration
+    provider: M1ProviderConfiguration
+
+    @classmethod
+    def from_environment(cls, environment: Mapping[str, str]) -> M1SchedulerConfiguration:
+        return cls(
+            database=M1DatabaseConfiguration.from_environment(environment),
+            provider=M1ProviderConfiguration.from_environment(environment),
+        )
 
 
 class LocalMvpState(StrEnum):
@@ -58,6 +233,35 @@ class GeminiSchedule:
         )
 
 
+class SchedulerStatusWriter(Protocol):
+    def waiting(self, *, next_run_at: datetime, observed_at: datetime) -> None: ...
+
+    def running(self, *, started_at: datetime) -> None: ...
+
+    def succeeded(self, *, completed_at: datetime) -> None: ...
+
+    def failed(self, *, completed_at: datetime) -> None: ...
+
+    def stopped(self, *, observed_at: datetime) -> None: ...
+
+
+class NullSchedulerStatus:
+    def waiting(self, *, next_run_at: datetime, observed_at: datetime) -> None:
+        pass
+
+    def running(self, *, started_at: datetime) -> None:
+        pass
+
+    def succeeded(self, *, completed_at: datetime) -> None:
+        pass
+
+    def failed(self, *, completed_at: datetime) -> None:
+        pass
+
+    def stopped(self, *, observed_at: datetime) -> None:
+        pass
+
+
 class GeminiScheduler:
     """Run collection at the next fixed Shanghai schedule slot until stopped."""
 
@@ -68,20 +272,124 @@ class GeminiScheduler:
         now: Callable[[], datetime],
         wait: Callable[[float], bool],
         schedule: GeminiSchedule | None = None,
+        status: SchedulerStatusWriter | None = None,
     ) -> None:
         self._collect = collect
         self._now = now
         self._wait = wait
         self._schedule = schedule or GeminiSchedule()
+        self._status = status or NullSchedulerStatus()
 
     def run(self) -> None:
         while True:
             current = self._now()
             due = self._schedule.next_after(current)
+            self._status.waiting(next_run_at=due, observed_at=current)
             delay = (due.astimezone(UTC) - current.astimezone(UTC)).total_seconds()
             if self._wait(max(0.0, delay)):
+                self._status.stopped(observed_at=self._now())
                 return
-            self._collect()
+            self._status.running(started_at=self._now())
+            try:
+                self._collect()
+            except BaseException:
+                self._status.failed(completed_at=self._now())
+                raise
+            self._status.succeeded(completed_at=self._now())
+
+
+class PostgresSchedulerLease:
+    """Hold the database advisory lock that makes one Scheduler effective."""
+
+    _LOCK_KEY = 6_607_056_341_054_001_049
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+        self._connection: Connection | None = None
+
+    def __enter__(self) -> Self:
+        connection = self._engine.connect()
+        acquired = connection.scalar(
+            text("SELECT pg_try_advisory_lock(:lock_key)"),
+            {"lock_key": self._LOCK_KEY},
+        )
+        if acquired is not True:
+            connection.close()
+            raise RuntimeError("A production Scheduler is already active")
+        connection.commit()
+        self._connection = connection
+        return self
+
+    def guarded_wait(
+        self,
+        stop_wait: Callable[[float], bool],
+        delay_seconds: float,
+        *,
+        check_interval_seconds: float = 30.0,
+    ) -> bool:
+        """Poll the lock-holding session so a database restart stops this worker."""
+        if check_interval_seconds <= 0:
+            raise ValueError("Scheduler lease check interval must be positive")
+        remaining = max(0.0, delay_seconds)
+        while remaining > 0:
+            interval = min(remaining, check_interval_seconds)
+            if stop_wait(interval):
+                return True
+            self.assert_held()
+            remaining -= interval
+        self.assert_held()
+        return False
+
+    def assert_held(self) -> None:
+        """Fail if the database session which owns the advisory lock was lost."""
+        connection = self._connection
+        if connection is None or connection.closed:
+            raise RuntimeError("Production Scheduler lease was lost")
+        try:
+            connection.exec_driver_sql("SELECT 1")
+            connection.commit()
+        except Exception as error:
+            raise RuntimeError("Production Scheduler lease was lost") from error
+
+    @contextmanager
+    def monitor(
+        self,
+        on_lost: Callable[[], None],
+        *,
+        check_interval_seconds: float = 2.0,
+    ) -> Iterator[None]:
+        """Continuously guard the lock, including while collection is blocked on I/O."""
+        if check_interval_seconds <= 0:
+            raise ValueError("Scheduler lease check interval must be positive")
+        finished = Event()
+
+        def watch() -> None:
+            while not finished.wait(check_interval_seconds):
+                try:
+                    self.assert_held()
+                except RuntimeError:
+                    on_lost()
+                    return
+
+        watcher = Thread(target=watch, name="scheduler-lease-monitor", daemon=True)
+        watcher.start()
+        try:
+            yield
+        finally:
+            finished.set()
+            watcher.join(timeout=check_interval_seconds * 2)
+
+    def __exit__(self, *_: object) -> None:
+        if self._connection is None:
+            return
+        try:
+            self._connection.execute(
+                text("SELECT pg_advisory_unlock(:lock_key)"),
+                {"lock_key": self._LOCK_KEY},
+            )
+        finally:
+            self._connection.close()
+            self._connection = None
 
 
 class SchedulerStopController:
