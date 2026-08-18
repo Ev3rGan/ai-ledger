@@ -116,8 +116,10 @@ bash deploy/m1/operate.sh audit-no-secrets
 ```
 
 `stop` retains PostgreSQL, Caddy, and restore volumes. `restart` recreates the required service
-set and waits for health. `validate` checks Caddy in a read-only, networkless one-off container;
-it never attaches a candidate container to the running Compose project. `upgrade` validates and
+set and waits for health. `validate` checks Caddy in a read-only, networkless, non-privileged
+one-off container after dropping all capabilities and adding back only `NET_BIND_SERVICE`, which
+the pinned Caddy binary's file capability requires even for config validation. It never attaches a
+candidate container to the running Compose project. `upgrade` validates and
 pulls the candidate first, then requires the existing edge to be either the verified legacy
 `172.19.0.0/16` network or the pinned `172.31.255.0/24` network. A missing, uninspectable, or other
 subnet aborts before backup or outage. After that preflight it creates and verifies a local and
