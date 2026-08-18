@@ -56,7 +56,8 @@ services:
       - caddy-data:/data
       - caddy-config:/config
     networks:
-      - edge
+      edge:
+        ipv4_address: 172.31.255.2
     depends_on:
       web:
         condition: service_healthy
@@ -97,6 +98,8 @@ services:
       AI_INTEL_SCHEDULE_BACKFILL_LIMIT: ${AI_INTEL_SCHEDULE_BACKFILL_LIMIT:?required}
       AI_INTEL_ANONYMOUS_ID_SALT_FILE: /run/secrets/anonymous-id-salt
       AI_INTEL_ANONYMOUS_RESEARCH_DAILY_LIMIT: ${AI_INTEL_ANONYMOUS_RESEARCH_DAILY_LIMIT:-3}
+      # Only Caddy owns public ports and this fixed edge address may set X-Forwarded-*.
+      FORWARDED_ALLOW_IPS: "172.31.255.2"
     secrets:
       - database-password
       - deepseek-api-key
@@ -230,7 +233,10 @@ services:
     logging: *json-logging
 
 networks:
-  edge: {}
+  edge:
+    ipam:
+      config:
+        - subnet: 172.31.255.0/24
   database:
     internal: true
   restore:
