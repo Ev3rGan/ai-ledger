@@ -759,6 +759,28 @@ class EditorialRepository:
             story_ids = session.scalars(statement).all()
             return tuple(self._story(session, story_id) for story_id in story_ids)
 
+    def pending_review_count(self) -> int:
+        with Session(self._engine) as session:
+            count = session.scalar(
+                select(func.count())
+                .select_from(StoryRecord)
+                .where(StoryRecord.review_state == StoryReviewState.UNREVIEWED.value)
+            )
+            return int(count or 0)
+
+    def latest_published_digest(self) -> Digest | None:
+        with Session(self._engine) as session:
+            record = session.scalar(
+                select(DigestRecord)
+                .where(DigestRecord.state == DigestState.PUBLISHED.value)
+                .order_by(
+                    DigestRecord.publication_date.desc(),
+                    DigestRecord.published_at.desc(),
+                )
+                .limit(1)
+            )
+            return self._digest(session, record) if record is not None else None
+
     def story(self, stable_key: str) -> StoryInspection | None:
         with Session(self._engine) as session:
             story_id = session.scalar(
@@ -1201,7 +1223,10 @@ class FeedCollectionRepository:
 @dataclass(frozen=True)
 class PersistedCollectionOperation:
     collection_run_id: UUID
+    operation_key: str
     status: str
+    started_at: datetime
+    completed_at: datetime | None
     source_results: dict[str, str]
     candidates_processed: int
 
@@ -1235,33 +1260,74 @@ class MultiSourceCollectionRepository:
             )
             if run is None:
                 return None
-            source_results = dict(
-                session.execute(
-                    select(
-                        SourceDefinitionRecord.name,
-                        SourceDefinitionCollectionResultRecord.status,
+            return self._operation_snapshot(session, run)
+
+    def latest_operation(
+        self,
+        source_definition_ids: set[UUID],
+    ) -> PersistedCollectionOperation | None:
+        if not source_definition_ids:
+            return None
+        with Session(self._engine) as session:
+            run = session.scalar(
+                select(CollectionRunRecord)
+                .join(
+                    SourceDefinitionCollectionResultRecord,
+                    SourceDefinitionCollectionResultRecord.collection_run_id
+                    == CollectionRunRecord.id,
+                )
+                .where(
+                    SourceDefinitionCollectionResultRecord.source_definition_id.in_(
+                        source_definition_ids
                     )
-                    .join(
-                        SourceDefinitionRecord,
-                        SourceDefinitionRecord.id
-                        == SourceDefinitionCollectionResultRecord.source_definition_id,
-                    )
-                    .where(
-                        SourceDefinitionCollectionResultRecord.collection_run_id == run.id
-                    )
-                ).all()
+                )
+                .order_by(
+                    CollectionRunRecord.started_at.desc(),
+                    CollectionRunRecord.id.desc(),
+                )
+                .limit(1)
             )
-            candidates_processed = session.scalar(
-                select(func.count())
-                .select_from(SourceCandidateResultRecord)
-                .where(SourceCandidateResultRecord.collection_run_id == run.id)
-            )
-            return PersistedCollectionOperation(
-                collection_run_id=run.id,
-                status=run.status,
-                source_results=source_results,
-                candidates_processed=int(candidates_processed or 0),
-            )
+            if run is None or run.operation_key is None:
+                return None
+            return self._operation_snapshot(session, run)
+
+    @staticmethod
+    def _operation_snapshot(
+        session: Session,
+        run: CollectionRunRecord,
+    ) -> PersistedCollectionOperation:
+        if run.operation_key is None:
+            raise ValueError("A multi-source Collection Run requires an operation key")
+        source_results = dict(
+            session.execute(
+                select(
+                    SourceDefinitionRecord.name,
+                    SourceDefinitionCollectionResultRecord.status,
+                )
+                .join(
+                    SourceDefinitionRecord,
+                    SourceDefinitionRecord.id
+                    == SourceDefinitionCollectionResultRecord.source_definition_id,
+                )
+                .where(
+                    SourceDefinitionCollectionResultRecord.collection_run_id == run.id
+                )
+            ).all()
+        )
+        candidates_processed = session.scalar(
+            select(func.count())
+            .select_from(SourceCandidateResultRecord)
+            .where(SourceCandidateResultRecord.collection_run_id == run.id)
+        )
+        return PersistedCollectionOperation(
+            collection_run_id=run.id,
+            operation_key=run.operation_key,
+            status=run.status,
+            started_at=run.started_at,
+            completed_at=run.completed_at,
+            source_results=source_results,
+            candidates_processed=int(candidates_processed or 0),
+        )
 
     def cursor_values(self, source_definition_ids: set[UUID]) -> dict[UUID, str]:
         if not source_definition_ids:

@@ -105,6 +105,7 @@ def production_environment(
         "AI_INTEL_ANONYMOUS_RESEARCH_DAILY_LIMIT": "1",
         "AI_INTEL_PROVIDER_MONTHLY_BUDGET_CENTS": "10000",
         "AI_INTEL_PROVIDER_REQUEST_RESERVATION_CENTS": "100",
+        "AI_INTEL_SCHEDULE_BACKFILL_LIMIT": "5",
     }
 
 
@@ -342,19 +343,54 @@ def test_production_configuration_reads_secrets_from_files_and_redacts_repr(
     assert "fixture-production-salt" not in repr(configuration)
 
 
-def test_private_operator_status_reports_database_and_recent_scheduler_only(
+def test_private_operator_status_reports_complete_operational_snapshot(
     m1_database_url: str,
 ) -> None:
+    release = "f" * 40
+    observed_at = datetime(2026, 8, 18, 0, 0, tzinfo=UTC)
+    engine = create_database_engine(m1_database_url)
+    try:
+        SchedulerStatusRepository(engine).waiting(
+            next_run_at=observed_at + timedelta(hours=6),
+            observed_at=observed_at,
+        )
+    finally:
+        engine.dispose()
     result = runner.invoke(
         app,
         ["operator", "status"],
-        env={"AI_INTEL_DATABASE_URL": m1_database_url},
+        env={
+            "AI_INTEL_DATABASE_URL": m1_database_url,
+            "AI_INTEL_RELEASE": release,
+        },
     )
 
     assert result.exit_code == 0
     payload = json.loads(result.output)
+    assert payload["release"] == release
     assert payload["database"] == "ready"
-    assert set(payload) == {"database", "scheduler"}
+    assert payload["scheduler"]["state"] == "waiting"
+    assert payload["scheduler"]["next_run_at"] == "2026-08-18T06:00:00+00:00"
+    assert payload["recent_collection"] is None
+    assert len(payload["sources"]) == 5
+    assert all(source["health"] == "unknown" for source in payload["sources"])
+    assert isinstance(payload["pending_reviews"], int)
+    if payload["latest_digest"] is not None:
+        assert set(payload["latest_digest"]) == {
+            "stable_key",
+            "publication_date",
+            "published_at",
+            "story_count",
+        }
+    assert set(payload) == {
+        "release",
+        "database",
+        "scheduler",
+        "recent_collection",
+        "sources",
+        "pending_reviews",
+        "latest_digest",
+    }
     assert "database_url" not in result.output
 
 
@@ -480,6 +516,32 @@ def test_manual_multisource_collection_in_production_cannot_bypass_provider_budg
     assert captured["operation_key"] == "test-production-collection"
 
 
+def test_production_collection_cannot_exceed_the_recorded_release_limit(
+    production_environment: dict[str, str],
+) -> None:
+    scheduler = runner.invoke(
+        app,
+        ["schedule-sources", "--production", "--backfill-limit", "6"],
+        env=production_environment,
+    )
+    manual = runner.invoke(
+        app,
+        [
+            "collect-sources",
+            "--operation-key",
+            "test-over-limit",
+            "--backfill-limit",
+            "6",
+        ],
+        env=production_environment,
+    )
+
+    assert scheduler.exit_code != 0
+    assert manual.exit_code != 0
+    assert "recorded production limit 5" in scheduler.output
+    assert "recorded production limit 5" in manual.output
+
+
 def test_service_log_formatter_emits_one_structured_json_record() -> None:
     record = logging.LogRecord(
         name="ai_intel_agent.service",
@@ -511,17 +573,27 @@ def test_versioned_linux_bundle_keeps_only_https_boundary_public() -> None:
         encoding="utf-8"
     )
     dockerignore = (project_root / ".dockerignore").read_text(encoding="utf-8")
+    release_example = (
+        project_root / "deploy" / "m1" / "release.env.example"
+    ).read_text(encoding="utf-8")
 
     assert "AI_INTEL_IMAGE:?" in compose
     assert all(f"  {service}:" in compose for service in ("caddy", "web", "scheduler", "postgres", "backup"))
     assert 'command: ["serve", "--production"' in compose
     assert 'command: ["schedule-sources", "--production"' in compose
+    assert "AI_INTEL_SCHEDULE_BACKFILL_LIMIT" in compose
+    assert "AI_INTEL_SCHEDULE_BACKFILL_LIMIT=5" in release_example
+    assert "AI_INTEL_RELEASE: ${AI_INTEL_RELEASE:?required}" in compose
     assert "80:80" in compose and "443:443" in compose
     postgres_block = compose.split("\n  postgres:\n", 1)[1].split("\n  web:\n", 1)[0]
     assert "ports:" not in postgres_block
     scheduler_block = compose.split("\n  scheduler:\n", 1)[1].split(
         "\n  backup:\n", 1
     )[0]
+    assert (
+        "AI_INTEL_SCHEDULE_BACKFILL_LIMIT: "
+        "${AI_INTEL_SCHEDULE_BACKFILL_LIMIT:?required}"
+    ) in scheduler_block
     assert "      - edge\n      - database" in scheduler_block
     assert "ports:" not in scheduler_block
     assert "internal: true" in compose
@@ -574,13 +646,49 @@ def test_operator_script_supports_lifecycle_backup_restore_and_rollback() -> Non
             "logs",
             "backup",
             "restore-isolated",
+            "operator",
         )
     )
     assert "@sha256:" in operator
     assert "AI_INTEL_RELEASE_DIR" in operator
     assert 'exec sh "$recorded_operator" "$@"' in operator
+    routing_block = operator.split('case "$operation" in', 1)[1].split("esac", 1)[0]
+    assert '"validate"|"start"|"upgrade"|"")' in routing_block
     assert "status --porcelain --untracked-files=all" in operator
     assert "mountpoint --quiet" in operator
+    assert "AI_INTEL_SCHEDULE_BACKFILL_LIMIT=[1-5]" in operator
+    compose_block = operator.split("compose() {", 1)[1].split("\n}\n", 1)[0]
+    assert '"COMPOSE_PROJECT_NAME=ai-ledger-m1"' in compose_block
+    for release_key in (
+        "AI_INTEL_IMAGE",
+        "AI_INTEL_RELEASE",
+        "AI_INTEL_DOMAIN",
+        "AI_INTEL_POSTGRES_DATABASE",
+        "AI_INTEL_POSTGRES_USER",
+        "AI_INTEL_SECRETS_DIR",
+        "AI_INTEL_BACKUP_DIR",
+        "AI_INTEL_OFFSITE_BACKUP_DIR",
+        "AI_INTEL_ANONYMOUS_RESEARCH_DAILY_LIMIT",
+        "AI_INTEL_PROVIDER_MONTHLY_BUDGET_CENTS",
+        "AI_INTEL_PROVIDER_REQUEST_RESERVATION_CENTS",
+        "AI_INTEL_SCHEDULE_BACKFILL_LIMIT",
+        "AI_INTEL_BACKUP_INTERVAL_SECONDS",
+        "AI_INTEL_BACKUP_RETENTION_DAYS",
+    ):
+        assert (
+            f'"{release_key}=$(release_value "$release_file" {release_key})"'
+            in compose_block
+        )
+    assert "docker image inspect" in operator
+    assert "org.opencontainers.image.revision" in operator
+    image_revision_block = operator.split("validate_image_revision() {", 1)[1].split(
+        "\n}\n", 1
+    )[0]
+    assert "AI_INTEL_SCHEDULE_BACKFILL_LIMIT" not in image_revision_block
+    candidate_contract_block = operator.split(
+        "validate_candidate_contract() {", 1
+    )[1].split("\n}\n", 1)[0]
+    assert "AI_INTEL_SCHEDULE_BACKFILL_LIMIT=[1-5]" in candidate_contract_block
     assert "operator migrate" in operator
     activate_block = operator.split("activate_release() {", 1)[1].split(
         "\n}\n\nstart_release()", 1
@@ -588,8 +696,24 @@ def test_operator_script_supports_lifecycle_backup_restore_and_rollback() -> Non
     assert activate_block.index("up --detach --wait postgres") < activate_block.index(
         'migrate "$release_file"'
     )
+    assert activate_block.index('compose "$release_file" pull') < activate_block.index(
+        'validate_image_revision "$release_file"'
+    )
+    assert activate_block.index(
+        'validate_image_revision "$release_file"'
+    ) < activate_block.index("up --detach --wait postgres")
     assert "restart caddy web scheduler backup postgres" in operator
     assert 'activate_release "$previous_release" 0' in operator
+    start_release_block = operator.split("start_release() {", 1)[1].split(
+        "\n}\n", 1
+    )[0]
+    assert 'validate_candidate_contract "$release_file"' in start_release_block
+    assert "validate_candidate_contract" not in activate_block
+    upgrade_block = operator.split('  "upgrade")', 1)[1].split('  "rollback")', 1)[0]
+    assert upgrade_block.index('compose "$current_release" run') < upgrade_block.index(
+        'start_release "$candidate"'
+    )
+    assert 'exec --no-TTY web ai-intel-agent "$@"' in operator
     assert "AI_INTEL_BACKUP_ONCE" in backup
     assert "pg_dump" in backup and "pg_restore --list" in backup
     assert "/offsite-backups" in backup and '"offsite_copy":"verified"' in backup

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from datetime import UTC, date, datetime
 from hashlib import sha256
@@ -327,6 +328,14 @@ def test_operator_explicitly_selects_and_orders_valid_multisource_digest_atomica
     assert published.exit_code == 0, published.output
     assert "published with 9 Stories" in published.output
     assert "".join(introduction.split()) in "".join(published.output.split())
+
+    operational_result = runner.invoke(app, ["operator", "status"], env=environment)
+    assert operational_result.exit_code == 0, operational_result.output
+    operational = json.loads(operational_result.output)
+    assert operational["latest_digest"]["publication_date"] == "2026-08-18"
+    assert operational["latest_digest"]["story_count"] == 9
+    assert operational["latest_digest"]["published_at"] is not None
+    assert operational["pending_reviews"] == 0
 
     preview_arguments = ["digest", "preview", "--date", "2026-08-19"]
     for story_key in selected_order:

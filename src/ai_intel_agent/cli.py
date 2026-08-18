@@ -51,6 +51,7 @@ from ai_intel_agent.model_routing_evaluation import (
 from ai_intel_agent.multisource_collection import (
     HttpArticleAdapter,
     HttpFeedDiscoveryAdapter,
+    SourceProfile,
     collect_source_profiles,
     load_source_profiles,
     scheduled_operation_key,
@@ -60,6 +61,7 @@ from ai_intel_agent.persistence import (
     MultiSourceCollectionRepository,
     PersistentMeteredProviderBudget,
     SchedulerStatusRepository,
+    SourceStatusSnapshot,
     create_database_engine,
     database_url_from_environment,
     upgrade_database,
@@ -87,6 +89,7 @@ from ai_intel_agent.runtime import (
     PostgresCollectionLease,
     PostgresSchedulerLease,
     SchedulerStopController,
+    bounded_integer_from_environment,
     configure_structured_logging,
     production_database_url,
 )
@@ -146,86 +149,24 @@ def _persistent_provider_budget(
     )
 
 
-@operator_app.command("migrate")
-def operator_migrate(
-    production: Annotated[
-        bool,
-        typer.Option("--production", help="Load the M1 Docker-secret contract."),
-    ] = False,
-) -> None:
-    """Apply every database migration to the sole Alembic head."""
-    try:
-        database_url = _operator_database_url(production)
-        upgrade_database(database_url)
-    except ValueError as error:
-        raise typer.BadParameter(str(error)) from error
-    console.print_json(data={"database": "migrated"})
+def _require_recorded_production_backfill_limit(backfill_limit: int) -> None:
+    recorded_limit = bounded_integer_from_environment(
+        os.environ,
+        "AI_INTEL_SCHEDULE_BACKFILL_LIMIT",
+        minimum=1,
+        maximum=5,
+    )
+    if backfill_limit > recorded_limit:
+        raise ValueError(
+            f"Backfill limit {backfill_limit} exceeds recorded production limit "
+            f"{recorded_limit}"
+        )
 
 
-@operator_app.command("status")
-def operator_status(
-    production: Annotated[
-        bool,
-        typer.Option("--production", help="Load the M1 Docker-secret contract."),
-    ] = False,
-) -> None:
-    """Report database readiness and recent Scheduler status without secrets."""
-    try:
-        database_url = _operator_database_url(production)
-        engine = create_database_engine(database_url)
-        try:
-            with engine.connect() as connection:
-                connection.exec_driver_sql("SELECT 1")
-            snapshot = SchedulerStatusRepository(engine).snapshot()
-        finally:
-            engine.dispose()
-    except (OSError, ValueError) as error:
-        raise typer.BadParameter(str(error)) from error
-
-    scheduler = None
-    if snapshot is not None:
-        scheduler = {
-            "state": snapshot.state,
-            "next_run_at": (
-                snapshot.next_run_at.isoformat() if snapshot.next_run_at is not None else None
-            ),
-            "last_started_at": (
-                snapshot.last_started_at.isoformat()
-                if snapshot.last_started_at is not None
-                else None
-            ),
-            "last_completed_at": (
-                snapshot.last_completed_at.isoformat()
-                if snapshot.last_completed_at is not None
-                else None
-            ),
-            "last_result": snapshot.last_result,
-            "updated_at": snapshot.updated_at.isoformat(),
-        }
-    console.print_json(data={"database": "ready", "scheduler": scheduler})
-
-
-@operator_app.command("source-status")
-def operator_source_status(
-    production: Annotated[
-        bool,
-        typer.Option("--production", help="Load the M1 Docker-secret contract."),
-    ] = False,
-) -> None:
-    """Report current five-profile result, cursor, health, and pending drafts."""
-    try:
-        database_url = _operator_database_url(production)
-        profiles = load_source_profiles()
-        engine = create_database_engine(database_url)
-        try:
-            snapshots = MultiSourceCollectionRepository(engine).source_statuses(
-                {profile.id for profile in profiles}
-            )
-        finally:
-            engine.dispose()
-    except (OSError, ValueError) as error:
-        raise typer.BadParameter(str(error)) from error
-
+def _source_status_payload(
+    profiles: tuple[SourceProfile, ...],
+    snapshots: tuple[SourceStatusSnapshot, ...],
+) -> list[dict[str, object]]:
     snapshots_by_id = {
         snapshot.source_definition_id: snapshot for snapshot in snapshots
     }
@@ -257,6 +198,137 @@ def operator_source_status(
                 ),
             }
         )
+    return sources
+
+
+@operator_app.command("migrate")
+def operator_migrate(
+    production: Annotated[
+        bool,
+        typer.Option("--production", help="Load the M1 Docker-secret contract."),
+    ] = False,
+) -> None:
+    """Apply every database migration to the sole Alembic head."""
+    try:
+        database_url = _operator_database_url(production)
+        upgrade_database(database_url)
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from error
+    console.print_json(data={"database": "migrated"})
+
+
+@operator_app.command("status")
+def operator_status(
+    production: Annotated[
+        bool,
+        typer.Option("--production", help="Load the M1 Docker-secret contract."),
+    ] = False,
+) -> None:
+    """Report the deployed release and one complete operational snapshot."""
+    try:
+        database_url = _operator_database_url(production)
+        profiles = load_source_profiles()
+        profile_ids = {profile.id for profile in profiles}
+        engine = create_database_engine(database_url)
+        try:
+            with engine.connect() as connection:
+                connection.exec_driver_sql("SELECT 1")
+            snapshot = SchedulerStatusRepository(engine).snapshot()
+            collection_repository = MultiSourceCollectionRepository(engine)
+            recent_collection = collection_repository.latest_operation(profile_ids)
+            sources = _source_status_payload(
+                profiles,
+                collection_repository.source_statuses(profile_ids),
+            )
+            editorial_repository = EditorialRepository(engine)
+            pending_reviews = editorial_repository.pending_review_count()
+            latest_digest = editorial_repository.latest_published_digest()
+        finally:
+            engine.dispose()
+    except (OSError, ValueError) as error:
+        raise typer.BadParameter(str(error)) from error
+
+    scheduler = None
+    if snapshot is not None:
+        scheduler = {
+            "state": snapshot.state,
+            "next_run_at": (
+                snapshot.next_run_at.isoformat() if snapshot.next_run_at is not None else None
+            ),
+            "last_started_at": (
+                snapshot.last_started_at.isoformat()
+                if snapshot.last_started_at is not None
+                else None
+            ),
+            "last_completed_at": (
+                snapshot.last_completed_at.isoformat()
+                if snapshot.last_completed_at is not None
+                else None
+            ),
+            "last_result": snapshot.last_result,
+            "updated_at": snapshot.updated_at.isoformat(),
+        }
+    collection = None
+    if recent_collection is not None:
+        collection = {
+            "id": str(recent_collection.collection_run_id),
+            "operation_key": recent_collection.operation_key,
+            "status": recent_collection.status,
+            "started_at": recent_collection.started_at.isoformat(),
+            "completed_at": (
+                recent_collection.completed_at.isoformat()
+                if recent_collection.completed_at is not None
+                else None
+            ),
+            "candidates_processed": recent_collection.candidates_processed,
+        }
+    publication = None
+    if latest_digest is not None:
+        publication = {
+            "stable_key": latest_digest.stable_key,
+            "publication_date": latest_digest.publication_date.isoformat(),
+            "published_at": (
+                latest_digest.published_at.isoformat()
+                if latest_digest.published_at is not None
+                else None
+            ),
+            "story_count": len(latest_digest.story_ids),
+        }
+    console.print_json(
+        data={
+            "release": os.environ.get("AI_INTEL_RELEASE"),
+            "database": "ready",
+            "scheduler": scheduler,
+            "recent_collection": collection,
+            "sources": sources,
+            "pending_reviews": pending_reviews,
+            "latest_digest": publication,
+        }
+    )
+
+
+@operator_app.command("source-status")
+def operator_source_status(
+    production: Annotated[
+        bool,
+        typer.Option("--production", help="Load the M1 Docker-secret contract."),
+    ] = False,
+) -> None:
+    """Report current five-profile result, cursor, health, and pending drafts."""
+    try:
+        database_url = _operator_database_url(production)
+        profiles = load_source_profiles()
+        engine = create_database_engine(database_url)
+        try:
+            snapshots = MultiSourceCollectionRepository(engine).source_statuses(
+                {profile.id for profile in profiles}
+            )
+        finally:
+            engine.dispose()
+    except (OSError, ValueError) as error:
+        raise typer.BadParameter(str(error)) from error
+
+    sources = _source_status_payload(profiles, snapshots)
     console.print_json(
         data={
             "sources": sources
@@ -477,6 +549,7 @@ def schedule_sources(
     """Collect the five approved Source Profiles twice daily until interrupted."""
     if production:
         try:
+            _require_recorded_production_backfill_limit(backfill_limit)
             service_configuration = M1SchedulerConfiguration.from_environment(os.environ)
         except ValueError as error:
             raise typer.BadParameter(str(error)) from error
@@ -1023,6 +1096,7 @@ def collect_sources(
     requested_key = operation_key or f"m2-manual:{uuid4()}"
     try:
         if os.getenv("DEEPSEEK_API_KEY_FILE"):
+            _require_recorded_production_backfill_limit(backfill_limit)
             configuration = M1SchedulerConfiguration.from_environment(os.environ)
             engine = create_database_engine(configuration.database.database_url)
             try:

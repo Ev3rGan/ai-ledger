@@ -93,6 +93,8 @@ services:
     command: ["serve", "--production", "--host", "0.0.0.0", "--port", "8000"]
     environment:
       <<: [*database-environment, *provider-environment]
+      AI_INTEL_RELEASE: ${AI_INTEL_RELEASE:?required}
+      AI_INTEL_SCHEDULE_BACKFILL_LIMIT: ${AI_INTEL_SCHEDULE_BACKFILL_LIMIT:?required}
       AI_INTEL_ANONYMOUS_ID_SALT_FILE: /run/secrets/anonymous-id-salt
       AI_INTEL_ANONYMOUS_RESEARCH_DAILY_LIMIT: ${AI_INTEL_ANONYMOUS_RESEARCH_DAILY_LIMIT:-3}
     secrets:
@@ -117,9 +119,10 @@ services:
 
   scheduler:
     <<: *app
-    command: ["schedule-sources", "--production"]
+    command: ["schedule-sources", "--production", "--backfill-limit", "${AI_INTEL_SCHEDULE_BACKFILL_LIMIT:-5}"]
     environment:
       <<: [*database-environment, *provider-environment]
+      AI_INTEL_SCHEDULE_BACKFILL_LIMIT: ${AI_INTEL_SCHEDULE_BACKFILL_LIMIT:?required}
     secrets:
       - database-password
       - deepseek-api-key
