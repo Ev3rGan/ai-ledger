@@ -74,7 +74,7 @@ validate_release() {
     printf '%s\n' 'release Compose config does not resolve a Caddy image' >&2
     exit 2
   }
-  docker run --rm --network none --read-only --cap-drop ALL \
+  docker run --rm --network none --read-only --cap-drop ALL --cap-add NET_BIND_SERVICE \
     --tmpfs /config --tmpfs /data \
     --env "AI_INTEL_DOMAIN=$(release_value "$release_file" AI_INTEL_DOMAIN)" \
     --volume "${release_dir}/deploy/m1/Caddyfile:/etc/caddy/Caddyfile:ro" \

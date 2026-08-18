@@ -178,6 +178,10 @@ case " $* " in
       *" caddy:fixture@sha256:cccc "*) ;;
       *) printf '%s\n' 'isolated validation did not select the Caddy image' >&2; exit 42 ;;
     esac
+    case "$*" in
+      *" --read-only --cap-drop ALL --cap-add NET_BIND_SERVICE "*) ;;
+      *) printf '%s\n' 'isolated validation did not grant only NET_BIND_SERVICE after dropping all capabilities' >&2; exit 43 ;;
+    esac
     printf '%s\n' 'standalone:caddy-validate' >>"$FAKE_EVENT_LOG"
     ;;
   *" image inspect "*)
