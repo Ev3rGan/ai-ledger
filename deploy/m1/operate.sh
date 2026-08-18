@@ -8,9 +8,13 @@ operation="${1:-}"
 edge_network="ai-ledger-m1_edge"
 legacy_edge_subnet="172.19.0.0/16"
 expected_edge_subnet="172.31.255.0/24"
+expected_edge_ip_range="172.31.255.128/25"
+legacy_edge_contract="${legacy_edge_subnet}|"
+expected_edge_contract="${expected_edge_subnet}|${expected_edge_ip_range}"
 edge_migration_required=0
 edge_migration_started=0
 prepared_release=""
+initial_edge_present=0
 
 case "$operation" in
   "validate"|"start"|"upgrade"|"") ;;
@@ -137,23 +141,28 @@ validate_candidate() {
   validate_image_revision "$release_file"
 }
 
-current_edge_subnet() {
+current_edge_contract() {
   edge_network_inspection="$(docker network inspect \
-    --format '{{range .IPAM.Config}}{{println .Subnet}}{{end}}' \
+    --format '{{range .IPAM.Config}}{{printf "%s|%s\n" .Subnet .IPRange}}{{end}}' \
     "$edge_network" 2>/dev/null)" || return 1
-  printf '%s\n' "$edge_network_inspection" | awk 'NF {print; exit}'
+  printf '%s\n' "$edge_network_inspection" | awk -F'|' '
+    NF {
+      if ($2 == "invalid Prefix") $2 = ""
+      print $1 "|" $2
+    }
+  '
 }
 
 preflight_edge_network() {
-  observed_edge_subnet="$(current_edge_subnet)" || {
+  observed_edge_contract="$(current_edge_contract)" || {
     printf '%s\n' "cannot inspect ${edge_network}; refusing upgrade" >&2
     return 1
   }
-  case "$observed_edge_subnet" in
-    "$expected_edge_subnet") edge_migration_required=0 ;;
-    "$legacy_edge_subnet") edge_migration_required=1 ;;
+  case "$observed_edge_contract" in
+    "$expected_edge_contract") edge_migration_required=0 ;;
+    "$legacy_edge_contract") edge_migration_required=1 ;;
     *)
-      printf '%s\n' "${edge_network} is not the verified legacy or fixed network; refusing upgrade" >&2
+      printf '%s\n' "${edge_network} does not match the verified legacy or fixed subnet and dynamic range; refusing upgrade" >&2
       return 1
       ;;
   esac
@@ -161,22 +170,50 @@ preflight_edge_network() {
 
 migrate_legacy_edge_network() {
   release_file="$1"
-  observed_edge_subnet="$(current_edge_subnet)" || {
+  observed_edge_contract="$(current_edge_contract)" || {
     printf '%s\n' "cannot re-inspect ${edge_network}; refusing edge mutation" >&2
     return 1
   }
-  if [ "$edge_migration_required" = "0" ] && [ "$observed_edge_subnet" = "$expected_edge_subnet" ]; then
+  if [ "$edge_migration_required" = "0" ] && [ "$observed_edge_contract" = "$expected_edge_contract" ]; then
     return 0
   fi
-  if [ "$edge_migration_required" != "1" ] || [ "$observed_edge_subnet" != "$legacy_edge_subnet" ]; then
+  if [ "$edge_migration_required" != "1" ] || [ "$observed_edge_contract" != "$legacy_edge_contract" ]; then
     printf '%s\n' "${edge_network} changed after preflight; refusing edge mutation" >&2
     return 1
   fi
 
   edge_migration_started=1
-  printf '%s\n' "migrating ${edge_network} from ${legacy_edge_subnet} to ${expected_edge_subnet}" >&2
+  printf '%s\n' "migrating ${edge_network} from ${legacy_edge_subnet} to ${expected_edge_subnet} with dynamic range ${expected_edge_ip_range}" >&2
   compose "$release_file" rm --stop --force caddy web scheduler || return 1
   docker network rm "$edge_network" >/dev/null || return 1
+}
+
+validate_target_edge_network() {
+  observed_edge_contract="$(current_edge_contract)" || {
+    printf '%s\n' "cannot inspect candidate ${edge_network}" >&2
+    return 1
+  }
+  test "$observed_edge_contract" = "$expected_edge_contract" || {
+    printf '%s\n' "candidate ${edge_network} does not use the required subnet and dynamic range" >&2
+    return 1
+  }
+}
+
+restore_legacy_edge_network() {
+  observed_edge_contract="$(current_edge_contract 2>/dev/null || true)"
+  if [ "$observed_edge_contract" = "$legacy_edge_contract" ]; then
+    return 0
+  fi
+  if docker network inspect "$edge_network" >/dev/null 2>&1; then
+    docker network rm "$edge_network" >/dev/null || return 1
+  fi
+  docker network create \
+    --driver bridge \
+    --subnet "$legacy_edge_subnet" \
+    --label com.docker.compose.project=ai-ledger-m1 \
+    --label com.docker.compose.network=edge \
+    "$edge_network" >/dev/null || return 1
+  test "$(current_edge_contract)" = "$legacy_edge_contract"
 }
 
 restore_current_runtime() {
@@ -184,13 +221,33 @@ restore_current_runtime() {
   recovery_failed=0
 
   compose "$candidate_file" rm --stop --force caddy web scheduler || recovery_failed=1
-  if [ "$edge_migration_started" = "1" ] && docker network inspect "$edge_network" >/dev/null 2>&1; then
-    docker network rm "$edge_network" >/dev/null || recovery_failed=1
+  if [ "$edge_migration_started" = "1" ]; then
+    restore_legacy_edge_network || recovery_failed=1
   fi
   compose "$current_release" up --detach --wait postgres web scheduler backup caddy || recovery_failed=1
 
   if [ "$recovery_failed" -ne 0 ]; then
     printf '%s\n' 'current release recovery did not complete cleanly' >&2
+    return 1
+  fi
+}
+
+cleanup_initial_runtime() {
+  release_file="$1"
+  cleanup_failed=0
+  compose "$release_file" rm --stop --force caddy web scheduler backup postgres || cleanup_failed=1
+  if [ "$initial_edge_present" = "0" ] && docker network inspect "$edge_network" >/dev/null 2>&1; then
+    edge_owner="$(docker network inspect \
+      --format '{{index .Labels "com.docker.compose.project"}}|{{index .Labels "com.docker.compose.network"}}' \
+      "$edge_network" 2>/dev/null || true)"
+    if [ "$edge_owner" = "ai-ledger-m1|edge" ]; then
+      docker network rm "$edge_network" >/dev/null || cleanup_failed=1
+    else
+      printf '%s\n' 'preserving an edge network not owned by this Compose project' >&2
+    fi
+  fi
+  if [ "$cleanup_failed" -ne 0 ]; then
+    printf '%s\n' 'failed initial start did not clean up completely' >&2
     return 1
   fi
 }
@@ -220,7 +277,8 @@ activate_release() {
 start_release() {
   release_file="$1"
   validate_candidate_contract "$release_file"
-  activate_release "$release_file" 1
+  activate_release "$release_file" 1 || return 1
+  validate_target_edge_network
 }
 
 record_current() {
@@ -243,8 +301,19 @@ case "$operation" in
     ;;
   "start")
     test "$#" -eq 2 || { usage; exit 2; }
-    start_release "$2"
-    record_current "$2"
+    test ! -f "$current_release" || {
+      printf '%s\n' 'a current release is already recorded; use upgrade' >&2
+      exit 2
+    }
+    if docker network inspect "$edge_network" >/dev/null 2>&1; then
+      initial_edge_present=1
+    fi
+    if start_release "$2"; then
+      record_current "$2"
+    else
+      cleanup_initial_runtime "$2" || true
+      exit 1
+    fi
     ;;
   "stop")
     require_current
