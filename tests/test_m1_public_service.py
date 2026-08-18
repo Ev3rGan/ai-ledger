@@ -556,6 +556,7 @@ def test_production_caddy_proxy_emits_https_absolute_rss_links(
     assert configured_caddy is not None
     assert configured_proxy.group("address") == caddy_address
     assert "subnet: 172.31.255.0/24" in compose
+    assert "ip_range: 172.31.255.128/25" in compose
 
     with TestClient(
         captured["app"],

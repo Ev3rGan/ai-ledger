@@ -35,6 +35,9 @@ def _bash_executable() -> Path:
         "upgrade_failure_recovery",
         "rollback_and_rerun",
         "rollback_failure_recovery",
+        "ipam_failure_retry",
+        "initial_start_failure_cleanup",
+        "initial_start_preserves_preexisting_edge",
     ),
 )
 def test_m1_operator_lifecycle(case_name: str) -> None:

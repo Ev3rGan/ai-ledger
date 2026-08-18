@@ -6,9 +6,11 @@ HTTPS and PostgreSQL reachable only on an internal Compose network. M4 does not 
 public security boundary, allowance ledger, backup/restore, rollback, secret handling, or add an
 administrator Web surface.
 
-The public edge network is pinned to `172.31.255.0/24`, with Caddy at `172.31.255.2`. Web has no
-published host port and configures Uvicorn to trust forwarded headers only from that Caddy address;
-do not widen this to arbitrary clients or all container addresses.
+The public edge network is pinned to `172.31.255.0/24`, with its dynamic allocation range limited
+to `172.31.255.128/25` and Caddy fixed at `172.31.255.2`. Keeping `.2` outside the dynamic range
+prevents Web or another dynamically addressed service from taking Caddy's address first. Web has
+no published host port and configures Uvicorn to trust forwarded headers only from that Caddy
+address; do not widen this to arbitrary clients or all container addresses.
 
 ## Frozen release and host layout
 
@@ -83,7 +85,11 @@ bash deploy/m1/operate.sh status
 
 `start` validates Caddy and Compose, pulls the recorded image digest, starts and waits for
 PostgreSQL, migrates to the sole Alembic head, and then waits for Web, Scheduler, backup, and
-Caddy. The Scheduler holds a
+Caddy. Use `start` only when no current release is recorded; an existing installation must use
+`upgrade`. If initial startup fails after creating runtime resources, the operator removes those
+unrecorded containers and a newly created, correctly labeled project edge while retaining the
+database volume. It preserves any edge network that existed before the attempt or is not labeled as
+owned by this Compose project. The Scheduler holds a
 PostgreSQL advisory lock, so a second production Scheduler exits before collection. `status`
 shows database readiness and persisted recent Scheduler state through the private container CLI.
 `operator source-status --production` additionally reports each approved source's recent result,
@@ -121,15 +127,21 @@ one-off container after dropping all capabilities and adding back only `NET_BIND
 the pinned Caddy binary's file capability requires even for config validation. It never attaches a
 candidate container to the running Compose project. `upgrade` validates and
 pulls the candidate first, then requires the existing edge to be either the verified legacy
-`172.19.0.0/16` network or the pinned `172.31.255.0/24` network. A missing, uninspectable, or other
-subnet aborts before backup or outage. After that preflight it creates and verifies a local and
-off-host logical backup. When it finds the verified legacy subnet, it rechecks that exact state and
-enters one bounded outage: remove only the
+`172.19.0.0/16` network with no dynamic range or the pinned `172.31.255.0/24` network with exact
+dynamic range `172.31.255.128/25`. A missing, uninspectable, extra, or mismatched subnet/range
+contract aborts before backup or outage. After that preflight it creates and verifies a local and
+off-host logical backup. When it finds the verified legacy contract, it rechecks that exact state
+and enters one bounded outage: remove only the
 current Caddy, Web, and Scheduler containers, remove the old edge network, then let the candidate
 Compose bundle create the pinned edge and wait for health. PostgreSQL and the backup service stay
-on the unchanged private database network. Any detach, network removal, migration, or candidate
-health failure leaves the release records unchanged and attempts to recreate the recorded current
-release and its edge connectivity. M1-M3 migrations are additive, so `rollback` runs the previous
+on the unchanged private database network. After candidate health succeeds, `upgrade` verifies the
+new edge subnet and dynamic range again before changing the release records. Any detach, network
+removal, migration, candidate health, or target network-contract failure leaves the release records
+unchanged and attempts to recreate the recorded current release and its edge connectivity. Because
+the legacy Compose file did not pin IPAM, recovery explicitly recreates its verified `172.19.0.0/16`
+edge with the Compose project/network labels before restarting it; this makes a later candidate
+retry deterministic instead of depending on Docker's next free dynamic subnet. M1-M3
+migrations are additive, so `rollback` runs the previous
 application image against the forward-compatible database without destructive schema downgrade;
 if that target is unhealthy, it restores the recorded current release without swapping records.
 
@@ -219,9 +231,9 @@ bash deploy/m1/operate.sh status
 ```
 
 `upgrade` refuses an invalid release, pulls and verifies it without joining the running project,
-requires the exact legacy-or-fixed edge preflight, creates the verified pre-change backup, migrates
-the verified legacy edge only inside the bounded outage described above, migrates the database,
-waits for all required services, and records
+requires the exact legacy-or-fixed subnet/range preflight, creates the verified pre-change backup,
+migrates the verified legacy edge only inside the bounded outage described above, migrates the
+database, waits for all required services, verifies the target subnet/range, and records
 current/previous only after the candidate is healthy. An already pinned edge is left intact, so a
 retry or later rollback/upgrade cycle does not rebuild it. Do not edit a recorded release file or
 checkout in place. A rebuilt image or changed configuration is a new candidate. The candidate
