@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 from collections.abc import Iterator
@@ -10,6 +11,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
+from xml.etree import ElementTree
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -18,9 +20,11 @@ from fastapi.testclient import TestClient
 from pg0 import Pg0
 from sqlalchemy.engine import make_url
 from typer.testing import CliRunner
+from uvicorn import Config
 
 import ai_intel_agent.cli as cli_module
 import ai_intel_agent.persistence as persistence_module
+import ai_intel_agent.web as web_module
 from ai_intel_agent.cli import app
 from ai_intel_agent.persistence import (
     PersistentMeteredProviderBudget,
@@ -440,6 +444,132 @@ def test_production_serve_wires_secret_files_and_persistent_allowance(
     )
     assert _sse_events(excess.text)[1][1]["code"] == "anonymous-allowance-exhausted"
     assert provider.calls == 1
+
+
+def test_production_caddy_proxy_emits_https_absolute_rss_links(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_root = Path(__file__).parents[1]
+    compose = (project_root / "deploy" / "m1" / "production.compose.yml").read_text(
+        encoding="utf-8"
+    )
+    caddy_block = compose.split("\n  caddy:\n", 1)[1].split("\n  postgres:\n", 1)[0]
+    web_block = compose.split("\n  web:\n", 1)[1].split("\n  scheduler:\n", 1)[0]
+    configured_proxy = re.search(
+        r'^      FORWARDED_ALLOW_IPS: "(?P<address>[^"]+)"$',
+        web_block,
+        flags=re.MULTILINE,
+    )
+    configured_caddy = re.search(
+        r"^        ipv4_address: (?P<address>[^\s]+)$",
+        caddy_block,
+        flags=re.MULTILINE,
+    )
+    caddy_address = (
+        configured_caddy.group("address")
+        if configured_caddy is not None
+        else "172.31.255.2"
+    )
+    environment: dict[str, str] = {}
+    monkeypatch.delenv("FORWARDED_ALLOW_IPS", raising=False)
+    if configured_proxy is not None:
+        environment["FORWARDED_ALLOW_IPS"] = configured_proxy.group("address")
+
+    captured: dict[str, object] = {}
+    engine = SimpleNamespace(dispose=lambda: None)
+    service_configuration = SimpleNamespace(
+        database=SimpleNamespace(
+            database_url="postgresql+psycopg://fixture@postgres/ai_ledger"
+        ),
+        provider=SimpleNamespace(
+            api_key="fixture-provider-key",
+            monthly_budget_cents=10_000,
+            request_reservation_cents=100,
+        ),
+        anonymous_research_daily_limit=1,
+        anonymous_identity_salt=b"fixture-production-salt",
+    )
+    public_story = SimpleNamespace(
+        stable_key="story:proxy-boundary",
+        headline="Proxy boundary",
+        summary="Published fixture",
+        primary_topic=None,
+        publisher="Fixture Publisher",
+        original_published_at=datetime(2026, 8, 18, tzinfo=UTC),
+    )
+    public_digest = SimpleNamespace(
+        stable_key="digest:2026-08-18",
+        publication_date=date(2026, 8, 18),
+        published_at=datetime(2026, 8, 18, tzinfo=UTC),
+        stories=(public_story,),
+    )
+    repository = SimpleNamespace(published_digests=lambda: (public_digest,))
+
+    def run_server(web_app: object, **arguments: object) -> None:
+        configuration = Config(web_app, **arguments)
+        configuration.load()
+        captured["app"] = configuration.loaded_app
+
+    monkeypatch.setattr(
+        cli_module,
+        "DeepSeekResearchProvider",
+        lambda *_args, **_kwargs: EvidenceEchoProvider(),
+    )
+    monkeypatch.setattr(
+        cli_module.M1WebConfiguration,
+        "from_environment",
+        lambda _: service_configuration,
+    )
+    monkeypatch.setattr(cli_module, "configure_structured_logging", lambda: None)
+    monkeypatch.setattr(cli_module, "create_database_engine", lambda _: engine)
+    monkeypatch.setattr(web_module, "create_database_engine", lambda _: engine)
+    monkeypatch.setattr(web_module, "PublicPublicationRepository", lambda _: repository)
+    monkeypatch.setattr(sys.modules["uvicorn"], "run", run_server)
+
+    result = runner.invoke(
+        app,
+        ["serve", "--production"],
+        env=environment,
+    )
+
+    assert result.exit_code == 0, result.output
+    with TestClient(
+        captured["app"],
+        base_url="http://public.example",
+        client=(caddy_address, 43100),
+    ) as client:
+        rss = client.get(
+            "/rss.xml",
+            headers={"X-Forwarded-Proto": "https"},
+        )
+
+    channel = ElementTree.fromstring(rss.content).find("channel")
+    assert channel is not None
+    absolute_urls = [channel.findtext("link") or ""]
+    for item in channel.findall("item"):
+        absolute_urls.append(item.findtext("link") or "")
+        absolute_urls.extend(
+            re.findall(r'href="(https?://[^"]+)"', item.findtext("description") or "")
+        )
+    assert absolute_urls and all(url.startswith("https://") for url in absolute_urls), absolute_urls
+    assert configured_proxy is not None
+    assert configured_caddy is not None
+    assert configured_proxy.group("address") == caddy_address
+    assert "subnet: 172.31.255.0/24" in compose
+
+    with TestClient(
+        captured["app"],
+        base_url="http://public.example",
+        client=("198.51.100.23", 43100),
+    ) as client:
+        spoofed = client.get(
+            "/rss.xml",
+            headers={"X-Forwarded-Proto": "https"},
+        )
+
+    spoofed_channel = ElementTree.fromstring(spoofed.content).find("channel")
+    assert spoofed_channel is not None
+    assert (spoofed_channel.findtext("link") or "").startswith("http://")
 
 
 def test_production_scheduler_fails_before_collection_when_lease_is_held(

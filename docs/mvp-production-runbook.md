@@ -6,6 +6,10 @@ HTTPS and PostgreSQL reachable only on an internal Compose network. M4 does not 
 public security boundary, allowance ledger, backup/restore, rollback, secret handling, or add an
 administrator Web surface.
 
+The public edge network is pinned to `172.31.255.0/24`, with Caddy at `172.31.255.2`. Web has no
+published host port and configures Uvicorn to trust forwarded headers only from that Caddy address;
+do not widen this to arbitrary clients or all container addresses.
+
 ## Frozen release and host layout
 
 Accept only a clean commit reviewed against its exact `origin/main` base. Build and publish one
