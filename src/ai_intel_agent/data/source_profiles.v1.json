@@ -1,0 +1,60 @@
+{
+  "version": "mvp-v2-m2-source-profiles-2026-08-17.v1",
+  "profiles": [
+    {
+      "host": "the-decoder.com",
+      "publisher": "THE DECODER",
+      "feed_url": "https://the-decoder.com/feed/",
+      "allowed_hosts": ["the-decoder.com"],
+      "allowed_path_prefixes": ["/"],
+      "language": "English",
+      "topic_scope": ["Models", "Research", "Products and Tools", "Business", "Policy and Safety"],
+      "cursor_policy": "Latest feed publication or update timestamp plus canonical URL.",
+      "health_policy": "Healthy after success or empty; blocked on explicit access controls; degraded on invalid format or temporary failure."
+    },
+    {
+      "host": "techcrunch.com",
+      "publisher": "TechCrunch",
+      "feed_url": "https://techcrunch.com/category/artificial-intelligence/feed/",
+      "allowed_hosts": ["techcrunch.com"],
+      "allowed_path_prefixes": ["/"],
+      "language": "English",
+      "topic_scope": ["Models", "Products and Tools", "Business", "Applications", "Policy and Safety"],
+      "cursor_policy": "Latest AI-category feed publication or update timestamp plus canonical URL.",
+      "health_policy": "Healthy after success or empty; blocked on explicit access controls; degraded on invalid format or temporary failure."
+    },
+    {
+      "host": "huggingface.co",
+      "publisher": "Hugging Face",
+      "feed_url": "https://huggingface.co/blog/feed.xml",
+      "allowed_hosts": ["huggingface.co"],
+      "allowed_path_prefixes": ["/blog/"],
+      "language": "Multilingual, commonly English",
+      "topic_scope": ["Models", "Research", "Products and Tools", "Community", "Policy and Safety"],
+      "cursor_policy": "Latest feed publication or update timestamp plus canonical URL.",
+      "health_policy": "Healthy after success or empty; blocked on explicit access controls; degraded on invalid format or temporary failure."
+    },
+    {
+      "host": "aibusiness.com",
+      "publisher": "AI Business",
+      "feed_url": "https://aibusiness.com/rss.xml",
+      "allowed_hosts": ["aibusiness.com"],
+      "allowed_path_prefixes": ["/"],
+      "language": "English",
+      "topic_scope": ["Business", "Applications", "Industry and Infrastructure", "Policy and Safety"],
+      "cursor_policy": "Latest feed publication or update timestamp plus canonical URL.",
+      "health_policy": "Healthy after a body-valid success or empty; blocked when article access is challenged or no valid body is available; degraded on invalid format or temporary failure."
+    },
+    {
+      "host": "qbitai.com",
+      "publisher": "量子位",
+      "feed_url": "https://www.qbitai.com/feed/",
+      "allowed_hosts": ["qbitai.com", "www.qbitai.com"],
+      "allowed_path_prefixes": ["/"],
+      "language": "Chinese",
+      "topic_scope": ["Models", "Research", "Products and Tools", "Business", "Applications", "Industry and Infrastructure", "Community"],
+      "cursor_policy": "Latest feed publication or update timestamp plus canonical URL.",
+      "health_policy": "Healthy after success or empty; blocked on explicit access controls; degraded on invalid format or temporary failure."
+    }
+  ]
+}

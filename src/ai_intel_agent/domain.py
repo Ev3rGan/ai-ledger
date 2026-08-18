@@ -45,8 +45,26 @@ class CollectionRunStatus(StrEnum):
 
 
 class SourceDefinitionCollectionStatus(StrEnum):
+    SUCCESS = "success"
+    EMPTY = "empty"
+    INVALID_FORMAT = "invalid-format"
+    ACCESS_BLOCKED = "access-blocked"
+    TEMPORARY_FAILURE = "temporary-failure"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+
+
+class SourceProfileHealth(StrEnum):
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+    BLOCKED = "blocked"
+
+
+class ArticleCollectionStatus(StrEnum):
+    BODY_VALID = "body-valid"
+    INVALID_FORMAT = "invalid-format"
+    ACCESS_BLOCKED = "access-blocked"
+    TEMPORARY_FAILURE = "temporary-failure"
 
 
 class AuditAction(StrEnum):
@@ -135,6 +153,7 @@ class CollectionRun:
     started_at: datetime
     completed_at: datetime
     source_definition_results: tuple[SourceDefinitionCollectionResult, ...]
+    operation_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -142,6 +161,27 @@ class CollectionDiscovery:
     source_definition_id: UUID
     candidate: Candidate
     document_version: DocumentVersion
+
+
+@dataclass(frozen=True)
+class SourceCandidateCollectionResult:
+    source_definition_id: UUID
+    candidate: Candidate
+    status: ArticleCollectionStatus
+    document_version: DocumentVersion | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+
+
+@dataclass(frozen=True)
+class SourceProfileState:
+    source_definition_id: UUID
+    recent_result: SourceDefinitionCollectionStatus
+    cursor_value: str | None
+    health: SourceProfileHealth
+    consecutive_failures: int
+    last_collection_run_id: UUID
+    updated_at: datetime
 
 
 @dataclass(frozen=True)

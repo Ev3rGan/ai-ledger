@@ -392,6 +392,112 @@ class PostgresSchedulerLease:
             self._connection = None
 
 
+class PostgresCollectionLease:
+    """Prevent scheduled and manual multi-source collections from overlapping."""
+
+    _LOCK_KEY = 6_607_056_341_054_002_055
+
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        monitor_check_interval_seconds: float = 2.0,
+        activation_grace_seconds: float = 2.5,
+    ) -> None:
+        if monitor_check_interval_seconds <= 0:
+            raise ValueError("Collection lease check interval must be positive")
+        if activation_grace_seconds <= monitor_check_interval_seconds:
+            raise ValueError(
+                "Collection lease activation grace must exceed its check interval"
+            )
+        self._engine = engine
+        self._connection: Connection | None = None
+        self._monitor_check_interval_seconds = monitor_check_interval_seconds
+        self._activation_grace_seconds = activation_grace_seconds
+
+    def __enter__(self) -> Self:
+        connection = self._engine.connect()
+        acquired = connection.scalar(
+            text("SELECT pg_try_advisory_lock(:lock_key)"),
+            {"lock_key": self._LOCK_KEY},
+        )
+        if acquired is not True:
+            connection.close()
+            raise RuntimeError("Another multi-source Collection is already active")
+        connection.commit()
+        self._connection = connection
+        sleep(self._activation_grace_seconds)
+        try:
+            self.assert_held()
+        except RuntimeError:
+            connection.close()
+            self._connection = None
+            raise
+        return self
+
+    def assert_held(self) -> None:
+        """Fail if the database session which owns the advisory lock was lost."""
+        connection = self._connection
+        if connection is None or connection.closed:
+            raise RuntimeError("Multi-source Collection lease was lost")
+        try:
+            connection.exec_driver_sql("SELECT 1")
+            connection.commit()
+        except Exception as error:
+            raise RuntimeError("Multi-source Collection lease was lost") from error
+
+    @contextmanager
+    def monitor(
+        self,
+        on_lost: Callable[[], None],
+        *,
+        check_interval_seconds: float | None = None,
+    ) -> Iterator[None]:
+        """Continuously guard the lock while collection is blocked on I/O."""
+        interval = (
+            self._monitor_check_interval_seconds
+            if check_interval_seconds is None
+            else check_interval_seconds
+        )
+        if interval <= 0:
+            raise ValueError("Collection lease check interval must be positive")
+        if interval >= self._activation_grace_seconds:
+            raise ValueError(
+                "Collection lease check interval must be shorter than activation grace"
+            )
+        finished = Event()
+
+        def watch() -> None:
+            while not finished.wait(interval):
+                try:
+                    self.assert_held()
+                except RuntimeError:
+                    on_lost()
+                    return
+
+        watcher = Thread(target=watch, name="collection-lease-monitor", daemon=True)
+        watcher.start()
+        try:
+            yield
+        finally:
+            finished.set()
+            watcher.join(timeout=interval * 2)
+
+    def __exit__(self, *_: object) -> None:
+        if self._connection is None:
+            return
+        connection = self._connection
+        self._connection = None
+        try:
+            if not connection.closed and not connection.invalidated:
+                connection.execute(
+                    text("SELECT pg_advisory_unlock(:lock_key)"),
+                    {"lock_key": self._LOCK_KEY},
+                )
+        finally:
+            connection.close()
+
+
 class SchedulerStopController:
     """Translate process stop signals into the scheduler's cooperative wait event."""
 
@@ -581,7 +687,7 @@ class MvpChildProcesses:
                 self._python_executable,
                 "-m",
                 "ai_intel_agent.cli",
-                "schedule-gemini",
+                "schedule-sources",
             ],
             [
                 self._python_executable,

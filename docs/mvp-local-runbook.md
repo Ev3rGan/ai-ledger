@@ -1,8 +1,7 @@
 # Local MVP runbook
 
-This runbook is the supported Windows-local path for Issue #48. It integrates the existing
-M1-M3 commands; it does not replace their collection, editorial, publication, Web, or Research
-behavior.
+This runbook is the supported Windows-local path for the M1 service plus the M2 five-source
+collector. It does not replace the existing editorial, publication, Web, or Research behavior.
 
 ## Prerequisites and process-only configuration
 
@@ -29,7 +28,7 @@ Use the full `uv.exe` path documented in `AGENTS.md` if `uv` is not on `PATH`. T
 
 1. starts the `ai-ledger-mvp` Compose PostgreSQL/pgvector service and waits for health;
 2. applies every Alembic migration to `head`;
-3. starts `schedule-gemini` for 06:00 and 18:00 Asia/Shanghai;
+3. starts `schedule-sources` for 06:00 and 18:00 Asia/Shanghai;
 4. starts the formal `serve` command on `http://127.0.0.1:8000`;
 5. remains in the foreground as the owner of the Web and scheduler processes.
 
@@ -53,7 +52,8 @@ Keep `start-local` running in its owning terminal. In supervisor-launched operat
 with only the environment keys needed by each command, run:
 
 ```powershell
-uv run ai-intel-agent collect-gemini
+uv run ai-intel-agent collect-sources --operation-key <supervisor-recorded-key>
+uv run ai-intel-agent operator source-status
 uv run ai-intel-agent story list
 uv run ai-intel-agent story show <stable-key>
 uv run ai-intel-agent story accept <stable-key> --actor m4-operator
@@ -72,9 +72,15 @@ Observe these public URLs through a real browser session:
 
 Ask one question directly supported by the published Claim and exact Evidence. Verify the SSE
 answer and click its Story, Claim, and Evidence links. Then ask an unrelated unsupported question
-and verify explicit insufficient-Evidence refusal with zero citations. Run `collect-gemini` again
-against the same database and verify the summary and operator views show no duplicate Candidate,
-Document Version, Story, Claim, or Evidence for unchanged source content.
+and verify explicit insufficient-Evidence refusal with zero citations. Run `collect-sources` again
+with the same operation key and verify the summary reports a replay and the operator views show no
+duplicate Candidate, Document Version, Story, Claim, or Evidence. Then run with a new operation key
+and unchanged Feed cursors and verify all five source results are `empty`.
+
+`collect-sources` is a live backfill and Provider command. Do not run it merely to validate the
+release: it requires explicit M2 live-acceptance authorization, an isolated or approved target
+database, and an approved real Provider budget. Automated acceptance uses deterministic Feed,
+article, and Provider fakes instead.
 
 ## Acceptance record
 
@@ -83,8 +89,8 @@ database URL:
 
 - exact clean commit and branch;
 - Compose image tag and Alembic head;
-- Gemini source-contract, draft-protocol, model-route, and Research protocol versions;
-- dated live source section identity and canonical public URL;
+- Source Profile, draft-protocol, model-route, and Research protocol versions;
+- each approved Feed URL, article canonical URL, and per-source result without copied body text;
 - collection-run identity and idempotency counters;
 - Story stable key plus Claim and Evidence UUIDs;
 - Digest date and public Home, Digest, Story, Browse, RSS, and Research URLs;

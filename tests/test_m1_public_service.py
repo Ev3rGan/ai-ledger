@@ -415,7 +415,7 @@ def test_production_scheduler_fails_before_collection_when_lease_is_held(
         with PostgresSchedulerLease(engine):
             result = runner.invoke(
                 app,
-                ["schedule-gemini", "--production"],
+                ["schedule-sources", "--production"],
                 env=production_environment,
             )
     finally:
@@ -450,6 +450,34 @@ def test_manual_collection_in_production_cannot_bypass_provider_budget(
         captured["provider_budget"],
         PersistentMeteredProviderBudget,
     )
+
+
+def test_manual_multisource_collection_in_production_cannot_bypass_provider_budget(
+    production_environment: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def capture_collection(
+        _backfill_limit: int,
+        **arguments: object,
+    ) -> None:
+        captured.update(arguments)
+
+    monkeypatch.setattr(cli_module, "_run_multisource_collection", capture_collection)
+
+    result = runner.invoke(
+        app,
+        ["collect-sources", "--operation-key", "test-production-collection"],
+        env=production_environment,
+    )
+
+    assert result.exit_code == 0
+    assert isinstance(
+        captured["provider_budget"],
+        PersistentMeteredProviderBudget,
+    )
+    assert captured["operation_key"] == "test-production-collection"
 
 
 def test_service_log_formatter_emits_one_structured_json_record() -> None:
@@ -487,7 +515,7 @@ def test_versioned_linux_bundle_keeps_only_https_boundary_public() -> None:
     assert "AI_INTEL_IMAGE:?" in compose
     assert all(f"  {service}:" in compose for service in ("caddy", "web", "scheduler", "postgres", "backup"))
     assert 'command: ["serve", "--production"' in compose
-    assert 'command: ["schedule-gemini", "--production"' in compose
+    assert 'command: ["schedule-sources", "--production"' in compose
     assert "80:80" in compose and "443:443" in compose
     postgres_block = compose.split("\n  postgres:\n", 1)[1].split("\n  web:\n", 1)[0]
     assert "ports:" not in postgres_block

@@ -117,7 +117,7 @@ services:
 
   scheduler:
     <<: *app
-    command: ["schedule-gemini", "--production"]
+    command: ["schedule-sources", "--production"]
     environment:
       <<: [*database-environment, *provider-environment]
     secrets:
