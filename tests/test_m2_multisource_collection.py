@@ -800,6 +800,32 @@ def test_five_source_collection_is_idempotent_blocked_safe_and_exactly_traceable
     assert status_by_host["techcrunch.com"]["pending_drafts"] == 0
     assert status_by_host["techcrunch.com"]["cursor"] is not None
 
+    operational_result = runner.invoke(
+        app,
+        ["operator", "status"],
+        env={"AI_INTEL_DATABASE_URL": m2_database_url},
+    )
+    assert operational_result.exit_code == 0, operational_result.output
+    operational = json.loads(operational_result.output)
+    assert operational["recent_collection"] == {
+        "id": str(first.collection_run_id),
+        "operation_key": "m2-backfill:fixture-2026-08-17",
+        "status": "partial",
+        "started_at": "2026-08-17T02:00:00+00:00",
+        "completed_at": "2026-08-17T02:00:00+00:00",
+        "candidates_processed": 5,
+    }
+    assert operational["pending_reviews"] == 4
+    assert {
+        source["host"]: source["health"] for source in operational["sources"]
+    } == {
+        "the-decoder.com": "healthy",
+        "techcrunch.com": "healthy",
+        "huggingface.co": "healthy",
+        "aibusiness.com": "blocked",
+        "qbitai.com": "healthy",
+    }
+
 
 @pytest.mark.postgres
 def test_one_source_failure_yields_a_partial_run_without_losing_other_sources(
@@ -1272,6 +1298,16 @@ def test_provider_failure_leaves_a_visible_pending_draft_and_retries_it(
     first_by_host = {
         item["host"]: item for item in json.loads(first_status.output)["sources"]
     }
+    first_operational = runner.invoke(
+        app,
+        ["operator", "status"],
+        env={"AI_INTEL_DATABASE_URL": m2_database_url},
+    )
+    assert first_operational.exit_code == 0, first_operational.output
+    first_operational_by_host = {
+        item["host"]: item
+        for item in json.loads(first_operational.output)["sources"]
+    }
 
     second = collect_source_profiles(
         m2_database_url,
@@ -1295,6 +1331,8 @@ def test_provider_failure_leaves_a_visible_pending_draft_and_retries_it(
     assert first.document_versions_created == 1
     assert first.drafts_created == 0
     assert first_by_host["huggingface.co"]["pending_drafts"] == 1
+    assert first_operational_by_host["huggingface.co"]["health"] == "healthy"
+    assert first_operational_by_host["huggingface.co"]["pending_drafts"] == 1
     assert second.candidates_processed == 0
     assert second.drafts_created == 1
     assert second_by_host["huggingface.co"]["pending_drafts"] == 0

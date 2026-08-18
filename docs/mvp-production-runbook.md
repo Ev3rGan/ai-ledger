@@ -1,9 +1,10 @@
-# MVP M1 production runbook
+# Public multi-source v2 production runbook
 
-This is the supported Issue #54 M1 procedure extended by Issue #55's five-source M2 collector. It
-keeps the existing v1 Web behind Caddy automatic HTTPS and PostgreSQL reachable only on an
-internal Compose network. M2 does not change the public security boundary, allowance ledger,
-backup/restore, rollback, secret handling, or add an administrator Web surface.
+This is the supported Issue #57 M4 procedure integrating the M1 service, M2 five-source
+collector, and M3 editorial/publication loop. It keeps the public Web behind Caddy automatic
+HTTPS and PostgreSQL reachable only on an internal Compose network. M4 does not change the
+public security boundary, allowance ledger, backup/restore, rollback, secret handling, or add an
+administrator Web surface.
 
 ## Frozen release and host layout
 
@@ -111,10 +112,11 @@ bash deploy/m1/operate.sh audit-no-secrets
 ```
 
 `stop` retains PostgreSQL, Caddy, and restore volumes. `restart` recreates the required service
-set and waits for health. `upgrade` migrates before switching the recorded release and restores
-the current release automatically if the candidate fails to become healthy. M1 migrations are
-additive, so `rollback` runs the previous application image against the forward-compatible
-database without destructive schema downgrade.
+set and waits for health. `upgrade` first creates and verifies a local and off-host logical
+backup, then migrates before switching the recorded release, and restores the current release
+automatically if the candidate fails to become healthy. M1-M3 migrations are additive, so
+`rollback` runs the previous application image against the forward-compatible database without
+destructive schema downgrade.
 
 Before validation, mount an authorized off-host filesystem or object-storage gateway at
 `AI_INTEL_OFFSITE_BACKUP_DIR`; `validate` refuses an ordinary host directory. The backup service
@@ -182,3 +184,190 @@ same-key replay plus a new-key unchanged-cursor run creates no duplicates. Run
 record above. A missing real Feed/article observation, real budgeted Provider draft, idempotency
 proof, source-isolation proof, or exact Candidate-to-Evidence provenance leaves M2 live acceptance
 incomplete.
+
+## M4 frozen Release Candidate
+
+Freeze one candidate before any live acceptance. The checkout must be clean at one reviewed
+40-character commit, the image must be built from that checkout, and the release file must pin
+the resulting `@sha256:` digest. Record `AI_INTEL_SCHEDULE_BACKFILL_LIMIT=5` (or a smaller
+reviewed value) in that immutable release file. Keep the previous release file and image
+available until M4 acceptance and the public preview are complete.
+
+Run `validate` before the change. Use `upgrade`, not an ad-hoc Compose invocation, when a current
+release exists:
+
+```bash
+export AI_INTEL_STATE_DIR=/etc/ai-ledger-m1/state
+bash deploy/m1/operate.sh validate /etc/ai-ledger-m1/releases/<candidate>.env
+bash deploy/m1/operate.sh upgrade /etc/ai-ledger-m1/releases/<candidate>.env
+bash deploy/m1/operate.sh status
+```
+
+`upgrade` refuses an invalid release, creates the verified pre-change backup, migrates, waits for
+all required services, and records current/previous only after the candidate is healthy. Do not
+edit a recorded release file or checkout in place. A rebuilt image or changed configuration is a
+new candidate. The candidate `upgrade` command deliberately does not dispatch to the recorded
+older operator: this ensures the new pre-migration backup guard is active on the first M3-to-M4
+upgrade. `validate` pulls the pinned application image and verifies that its
+`org.opencontainers.image.revision` label exactly matches `AI_INTEL_RELEASE`; status reports that
+validated commit. Lifecycle commands also override ambient release-contract variables with the
+values from the recorded release file and fix the Compose project name, so an exported shell
+variable cannot substitute a different image, release, domain, database, budget, or schedule.
+Release validation rejects a scheduled limit outside `1-5`, and both production Scheduler and
+manual collection refuse a requested limit above that recorded value.
+
+## Normal operator loop
+
+`operate.sh operator` is the supported private CLI boundary. It executes inside the recorded
+Web container and therefore reads and writes the same PostgreSQL state that public Web and
+Research use. It does not add an operator HTTP route.
+
+Start each operation by saving the secret-free status JSON:
+
+```bash
+bash deploy/m1/operate.sh operator operator status --production
+bash deploy/m1/operate.sh operator operator source-status --production
+bash deploy/m1/operate.sh operator story list --state unreviewed
+```
+
+The combined status reports the deployed commit, database readiness, Scheduler state and next
+execution, latest multi-source Collection Run, all five source health snapshots, pending review
+count, and latest published Digest. It never reports the database URL, credentials, source body,
+Evidence text, or Provider response.
+
+Inspect every draft before deciding. Acceptance requires operator-authored reader metadata;
+rejection remains explicit:
+
+```bash
+bash deploy/m1/operate.sh operator story show <stable-key>
+bash deploy/m1/operate.sh operator story accept <stable-key> \
+  --summary '<reviewed summary>' \
+  --why-it-matters '<reviewed significance>' \
+  --topic <Topic> \
+  --actor m4-operator
+bash deploy/m1/operate.sh operator story reject <stable-key> --actor m4-operator
+```
+
+Select 8-12 accepted Stories from at least three Publishers. Repeat `--story` in the intended
+order for both preview and publish; publish exactly what was previewed:
+
+```bash
+bash deploy/m1/operate.sh operator digest preview --date <Asia-Shanghai-date> \
+  --story <first-key> --story <second-key> --story <...>
+bash deploy/m1/operate.sh operator digest publish --date <Asia-Shanghai-date> \
+  --introduction '<reviewed daily introduction>' \
+  --story <first-key> --story <second-key> --story <...> \
+  --actor m4-operator
+```
+
+After publication, rerun status and inspect the public HTTPS Home, linked Digest, every selected
+Story's expandable Evidence and canonical source, Browse, RSS, and Research. The database and
+public projection, not CLI prose copied into an acceptance report, are the source of truth.
+
+## Bounded backfill to incremental schedule
+
+Initial backfill and subsequent scheduled collection use the same five versioned Source Profiles,
+body gate, cursor, canonical identity, operation-key idempotency, and Provider budget. A backfill
+requires an explicit supervisor-approved unique operation key and a limit no greater than the
+recorded scheduled limit:
+
+```bash
+bash deploy/m1/operate.sh operator collect-sources \
+  --operation-key m4-backfill:<supervisor-recorded-identifier> \
+  --backfill-limit <1-5>
+```
+
+Record the before/after status and Provider-call allowance. Replaying the same key must return the
+same Collection Run without new logical records. Stop manual backfill when the approved content
+and Provider budget target is reached. Do not reset cursors or manufacture rows to reach a count.
+
+The Scheduler then owns ongoing collection at 06:00 and 18:00 Asia/Shanghai. At the next real
+window, record status before and after, confirm a new slot-derived operation key, confirm only
+eligible unseen entries were processed up to the frozen per-source limit, and compare Candidate,
+Document Version, Story, Claim, and Evidence counts for duplicates. Keep the Scheduler active
+across the entire window; do not substitute a manual invocation for this acceptance.
+
+## Failure operations
+
+### Source failure
+
+A source-level `invalid-format`, `access-blocked`, or `temporary-failure` is not a service outage.
+Use combined status and logs to verify the other Source Profiles completed, public historical
+Digest/Story URLs remain available, and Research still reads only accepted published knowledge.
+Never replace a blocked article body with Feed summary text, bypass an access control, edit a
+cursor, or add a sixth source. A temporary source may retry at the next scheduled window; a
+supervisor-approved manual retry must use a new recorded operation key and the bounded limit.
+
+### Provider failure or budget refusal
+
+A Provider error or budget refusal must leave acquired body-valid Documents and pending draft
+work visible without publishing partial generated content. The supported operational signal is a
+healthy or completed source result with `pending_drafts` above zero and no corresponding new
+draft; do not expect source health to identify a Provider incident. Save the before/after combined
+status, confirm Web and prior publications remain healthy, and have the supervisor distinguish an
+outage from an exhausted approved budget at the existing secret/Provider boundary. Do not print a
+credential, Provider response, or ledger internals, and do not raise a budget or change Provider
+routes during incident handling. After the existing Provider route is healthy and the supervisor
+authorizes paid work, let the next schedule retry pending drafts or run one bounded new-key
+collection. Verify `pending_drafts` returns to zero only after a persisted draft exists, then
+review the generated Story/Claim/Evidence normally; never hand-promote a Feed summary or
+unverified model response.
+
+### Service failure
+
+Use `status` and `logs`, then `restart`. Preserve the PostgreSQL volume and public URLs. Do not use
+Compose commands that remove volumes. If restart cannot restore health, use application rollback
+below; restore data only from a verified backup and only after diagnosing a data failure.
+
+## Backup, isolated restore, and application rollback
+
+Create a manual checkpoint before a risky operator action even though `upgrade` already requires
+one:
+
+```bash
+bash deploy/m1/operate.sh backup
+bash deploy/m1/operate.sh restore-isolated ai-ledger-<UTC timestamp>.dump
+```
+
+Accept the backup only when the command reports a verified local archive and verified off-host
+copy with the same basename. `restore-isolated` must target the dedicated restore volume and
+internal restore network; compare schema head and recorded row counts there without connecting
+Web, Scheduler, or Caddy to it. Never test restoration over the production database.
+
+Application rollback is:
+
+```bash
+bash deploy/m1/operate.sh rollback
+bash deploy/m1/operate.sh status
+```
+
+Rollback activates the recorded previous immutable bundle without a destructive schema
+downgrade. Verify Home, the published Digest and Story URLs, database row counts, Scheduler next
+run, and anonymous allowance boundary. If the old application cannot operate against the current
+forward-compatible schema, stop and restore service from the candidate; do not improvise a schema
+downgrade.
+
+## M4 live acceptance record
+
+The supervisor owns secret injection, Provider budget authorization, and timing. Record only
+commit/image digests, protocol/profile versions, timestamps, public URLs, non-secret operation
+keys, row counts, status/result codes, and pass/fail observations. Do not record environment
+values, source bodies, Evidence text, model responses, or anonymous-client identifiers.
+
+M4 is incomplete until one frozen candidate proves all of the following in the same deployed
+state:
+
+- all five Feeds and the body gate, with AI Business body-valid or explicitly blocked;
+- real DeepSeek draft preparation and the operator review/order/publish loop;
+- one public Digest with 8-12 real Stories from at least three Publishers;
+- anonymous HTTPS Home → Digest → Story/source, Browse, RSS, and Research;
+- supported Research, insufficient-Evidence refusal, and allowance rejection with no excess
+  Provider call;
+- one real scheduled window with incremental work, no duplicate logical records, and isolated
+  source failure;
+- restart persistence, verified isolated restore, application rollback, status output, and
+  secret audit.
+
+Keep the final accepted public version running for the anonymous in-app Browser preview. Do not
+commit, push, open or merge a PR, remove acceptance resources, or replace that version until the
+user confirms the preview.

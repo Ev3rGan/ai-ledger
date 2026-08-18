@@ -7,7 +7,7 @@ previous_release="${state_dir}/previous.env"
 operation="${1:-}"
 
 case "$operation" in
-  "validate"|"start"|"") ;;
+  "validate"|"start"|"upgrade"|"") ;;
   *)
     if [ -f "$current_release" ]; then
       recorded_dir="$(awk -F= '$1 == "AI_INTEL_RELEASE_DIR" {print substr($0, index($0, "=") + 1)}' "$current_release")"
@@ -25,7 +25,7 @@ exec 9>"${state_dir}/operate.lock"
 flock 9
 
 usage() {
-  printf '%s\n' 'usage: operate.sh validate RELEASE_ENV | start RELEASE_ENV | stop | restart | upgrade RELEASE_ENV | rollback | status | logs | backup | restore-isolated BACKUP_BASENAME | audit-no-secrets'
+  printf '%s\n' 'usage: operate.sh validate RELEASE_ENV | start RELEASE_ENV | stop | restart | upgrade RELEASE_ENV | rollback | status | logs | backup | restore-isolated BACKUP_BASENAME | operator COMMAND... | audit-no-secrets'
 }
 
 validate_release() {
@@ -73,7 +73,50 @@ compose() {
   release_file="$1"
   shift
   release_dir="$(release_value "$release_file" AI_INTEL_RELEASE_DIR)"
-  docker compose --env-file "$release_file" --file "${release_dir}/deploy/m1/production.compose.yml" "$@"
+  env \
+    "COMPOSE_PROJECT_NAME=ai-ledger-m1" \
+    "AI_INTEL_IMAGE=$(release_value "$release_file" AI_INTEL_IMAGE)" \
+    "AI_INTEL_RELEASE=$(release_value "$release_file" AI_INTEL_RELEASE)" \
+    "AI_INTEL_DOMAIN=$(release_value "$release_file" AI_INTEL_DOMAIN)" \
+    "AI_INTEL_POSTGRES_DATABASE=$(release_value "$release_file" AI_INTEL_POSTGRES_DATABASE)" \
+    "AI_INTEL_POSTGRES_USER=$(release_value "$release_file" AI_INTEL_POSTGRES_USER)" \
+    "AI_INTEL_SECRETS_DIR=$(release_value "$release_file" AI_INTEL_SECRETS_DIR)" \
+    "AI_INTEL_BACKUP_DIR=$(release_value "$release_file" AI_INTEL_BACKUP_DIR)" \
+    "AI_INTEL_OFFSITE_BACKUP_DIR=$(release_value "$release_file" AI_INTEL_OFFSITE_BACKUP_DIR)" \
+    "AI_INTEL_ANONYMOUS_RESEARCH_DAILY_LIMIT=$(release_value "$release_file" AI_INTEL_ANONYMOUS_RESEARCH_DAILY_LIMIT)" \
+    "AI_INTEL_PROVIDER_MONTHLY_BUDGET_CENTS=$(release_value "$release_file" AI_INTEL_PROVIDER_MONTHLY_BUDGET_CENTS)" \
+    "AI_INTEL_PROVIDER_REQUEST_RESERVATION_CENTS=$(release_value "$release_file" AI_INTEL_PROVIDER_REQUEST_RESERVATION_CENTS)" \
+    "AI_INTEL_SCHEDULE_BACKFILL_LIMIT=$(release_value "$release_file" AI_INTEL_SCHEDULE_BACKFILL_LIMIT)" \
+    "AI_INTEL_BACKUP_INTERVAL_SECONDS=$(release_value "$release_file" AI_INTEL_BACKUP_INTERVAL_SECONDS)" \
+    "AI_INTEL_BACKUP_RETENTION_DAYS=$(release_value "$release_file" AI_INTEL_BACKUP_RETENTION_DAYS)" \
+    docker compose --env-file "$release_file" --file "${release_dir}/deploy/m1/production.compose.yml" "$@"
+}
+
+validate_image_revision() {
+  release_file="$1"
+  image_ref="$(release_value "$release_file" AI_INTEL_IMAGE)"
+  release_sha="$(release_value "$release_file" AI_INTEL_RELEASE)"
+  image_revision="$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$image_ref")"
+  test "$image_revision" = "$release_sha" || {
+    printf '%s\n' 'application image revision label does not match AI_INTEL_RELEASE' >&2
+    exit 2
+  }
+}
+
+validate_candidate_contract() {
+  release_file="$1"
+  grep -Eq '^AI_INTEL_SCHEDULE_BACKFILL_LIMIT=[1-5]$' "$release_file" || {
+    printf '%s\n' 'AI_INTEL_SCHEDULE_BACKFILL_LIMIT must be between 1 and 5' >&2
+    exit 2
+  }
+}
+
+validate_candidate() {
+  release_file="$1"
+  validate_candidate_contract "$release_file"
+  validate_release "$release_file"
+  compose "$release_file" pull web
+  validate_image_revision "$release_file"
 }
 
 migrate() {
@@ -86,6 +129,7 @@ activate_release() {
   run_migrations="$2"
   validate_release "$release_file" || return 1
   compose "$release_file" pull || return 1
+  validate_image_revision "$release_file" || return 1
   compose "$release_file" up --detach --wait postgres || return 1
   if [ "$run_migrations" = "1" ]; then
     migrate "$release_file" || return 1
@@ -95,6 +139,7 @@ activate_release() {
 
 start_release() {
   release_file="$1"
+  validate_candidate_contract "$release_file"
   activate_release "$release_file" 1
 }
 
@@ -114,7 +159,7 @@ require_current() {
 case "$operation" in
   "validate")
     test "$#" -eq 2 || { usage; exit 2; }
-    validate_release "$2"
+    validate_candidate "$2"
     ;;
   "start")
     test "$#" -eq 2 || { usage; exit 2; }
@@ -134,6 +179,7 @@ case "$operation" in
     test "$#" -eq 2 || { usage; exit 2; }
     require_current
     candidate="$2"
+    compose "$current_release" run --rm --no-deps --env AI_INTEL_BACKUP_ONCE=1 backup
     if start_release "$candidate"; then
       install -m 600 "$current_release" "$previous_release"
       record_current "$candidate"
@@ -170,6 +216,12 @@ case "$operation" in
     case "$2" in ""|*/*|*..*) printf '%s\n' 'invalid backup basename' >&2; exit 2;; esac
     compose "$current_release" --profile restore up --detach --wait restore-postgres
     AI_INTEL_RESTORE_FILE="$2" compose "$current_release" --profile restore run --rm --no-deps restore
+    ;;
+  "operator")
+    test "$#" -ge 2 || { usage; exit 2; }
+    require_current
+    shift
+    compose "$current_release" exec --no-TTY web ai-intel-agent "$@"
     ;;
   "audit-no-secrets")
     require_current
