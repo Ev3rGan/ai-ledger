@@ -23,6 +23,7 @@ from typer.testing import CliRunner
 import ai_intel_agent.cli as cli_module
 from ai_intel_agent.cli import app
 from ai_intel_agent.domain import DigestState, StoryReviewState
+from ai_intel_agent.editorial import DigestPublicationContract
 from ai_intel_agent.persistence import (
     CandidateRecord,
     ClaimRecord,
@@ -30,6 +31,7 @@ from ai_intel_agent.persistence import (
     DigestStoryRecord,
     DocumentVersionRecord,
     EvidenceSpanRecord,
+    StoryPresentationRecord,
     StoryRecord,
     create_database_engine,
     upgrade_database,
@@ -124,6 +126,16 @@ def _persist_research_story(
                 )
             )
             session.execute(
+                insert(StoryPresentationRecord).values(
+                    story_id=story_id,
+                    summary=f"{HEADLINE} · {identity} 的已审核读者摘要。",
+                    why_it_matters=(
+                        f"这条 {identity} 信息帮助开发者理解 Gemini 发布与采用影响。"
+                    ),
+                    primary_topic="Models",
+                )
+            )
+            session.execute(
                 insert(ClaimRecord).values(
                     id=claim_id,
                     story_id=story_id,
@@ -148,10 +160,14 @@ def _persist_research_story(
             session.execute(
                 insert(DigestRecord).values(
                     id=digest_id,
-                    stable_key=f"digest:{identity}",
+                    stable_key=f"research-digest:{identity}",
                     publication_date=now.date(),
                     state=DigestState.DRAFT.value,
                     published_at=None,
+                    introduction=None,
+                    publication_contract=(
+                        DigestPublicationContract.LEGACY_FIXTURE.value
+                    ),
                 )
             )
             if review_state is StoryReviewState.ACCEPTED:
@@ -293,7 +309,7 @@ def test_deepseek_research_provider_uses_streaming_without_tools_or_reasoning() 
 
 
 @pytest.mark.postgres
-def test_research_page_exposes_only_the_minimal_streaming_interface(
+def test_research_page_explains_curated_capabilities_and_offers_fill_only_examples(
     research_database_url: str,
 ) -> None:
     with TestClient(create_app(research_database_url)) as client:
@@ -307,6 +323,28 @@ def test_research_page_exposes_only_the_minimal_streaming_interface(
     assert 'id="research-refusal"' in response.text
     assert 'id="research-citations"' in response.text
     assert 'fetch("/research/answer"' in response.text
+    assert "支持什么" in response.text
+    assert "如何提问" in response.text
+    assert "仅检索已接受且已发布的知识" in response.text
+    assert "证据不足时会明确拒答" in response.text
+    assert "不会联网搜索" in response.text
+    assert response.text.count('class="research-example"') >= 3
+    assert "Anthropic 的年化营收运行率是多少？" in response.text
+    assert "约束感知 GPU 分配器将利用率提升到多少？" in response.text
+    assert "OpenAI 在俄亥俄州规划了多大规模的数据中心？" in response.text
+    assert 'type="button"' in response.text
+    assert "question.value = button.dataset.question" in response.text
+    assert "question.focus()" in response.text
+    assert "requestSubmit" not in response.text
+    assert "form.submit" not in response.text
+    for unsupported_claim in (
+        "Hybrid",
+        "Reranker",
+        "多跳",
+        "比较分析",
+        "时间线",
+    ):
+        assert unsupported_claim not in response.text
     assert 'block.split("\\n")' in response.text
     assert 'buffer.indexOf("\\n\\n")' in response.text
     assert "会话历史" not in response.text

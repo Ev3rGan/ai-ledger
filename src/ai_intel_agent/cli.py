@@ -21,7 +21,7 @@ from ai_intel_agent.collection import (
     SystemClock,
     collect_feed_source_definitions,
 )
-from ai_intel_agent.domain import SourceDefinitionCollectionStatus, StoryReviewState
+from ai_intel_agent.domain import SourceDefinitionCollectionStatus, StoryReviewState, Topic
 from ai_intel_agent.editorial import EditorialStateError, StoryInspection
 from ai_intel_agent.extraction_benchmark import (
     BenchmarkConfigurationError,
@@ -609,6 +609,18 @@ def _print_story(story: StoryInspection) -> None:
     console.print(f"Story: {story.headline}", markup=False)
     console.print(f"Stable key: {story.stable_key}", markup=False)
     console.print(f"Review state: {story.review_state.value}", markup=False)
+    console.print(f"Publisher: {story.publisher}", markup=False)
+    if story.original_published_at is not None:
+        console.print(
+            f"Original publication time: {story.original_published_at.isoformat()}",
+            markup=False,
+        )
+    if story.summary is not None:
+        console.print(f"Summary: {story.summary}", markup=False)
+    if story.why_it_matters is not None:
+        console.print(f"Why it matters: {story.why_it_matters}", markup=False)
+    if story.primary_topic is not None:
+        console.print(f"Primary topic: {story.primary_topic.value}", markup=False)
     for position, claim in enumerate(story.claims, start=1):
         console.print(f"Claim {position}: {claim.text}", markup=False)
         for evidence_span in claim.evidence_spans:
@@ -630,17 +642,39 @@ def _print_story(story: StoryInspection) -> None:
 
 
 @story_app.command("list")
-def list_stories() -> None:
+def list_stories(
+    publisher: Annotated[
+        str | None,
+        typer.Option("--source", help="Filter by exact Publisher name."),
+    ] = None,
+    publication_date: Annotated[
+        str | None,
+        typer.Option("--date", help="Filter by original publication date."),
+    ] = None,
+    state: Annotated[
+        StoryReviewState | None,
+        typer.Option("--state", help="Filter by Story review state."),
+    ] = None,
+) -> None:
     """List persisted Stories for operator review."""
     with _editorial_repository() as repository:
-        stories = repository.stories()
+        stories = repository.stories(
+            publisher=publisher,
+            publication_date=(
+                _parse_iso_date(publication_date) if publication_date is not None else None
+            ),
+            review_state=state,
+        )
     if not stories:
         console.print("No persisted Stories.")
         return
     for story in stories:
         console.print(
-            f"{story.stable_key}\t{story.review_state.value}\t{story.headline}",
+            f"{story.stable_key}\t{story.review_state.value}\t{story.publisher}\t"
+            f"{story.original_published_at.date().isoformat() if story.original_published_at else '-'}\t"
+            f"{story.headline}",
             markup=False,
+            soft_wrap=True,
         )
 
 
@@ -658,6 +692,10 @@ def _review_story(
     stable_key: str,
     decision: StoryReviewState,
     actor: str,
+    *,
+    summary: str | None = None,
+    why_it_matters: str | None = None,
+    primary_topic: Topic | None = None,
 ) -> None:
     with _editorial_repository() as repository:
         try:
@@ -666,6 +704,9 @@ def _review_story(
                 decision,
                 actor_identifier=actor,
                 occurred_at=datetime.now(UTC),
+                summary=summary,
+                why_it_matters=why_it_matters,
+                primary_topic=primary_topic,
             )
         except (EditorialStateError, ValueError) as error:
             raise typer.BadParameter(str(error)) from error
@@ -677,12 +718,34 @@ def _review_story(
 @story_app.command("accept")
 def accept_story(
     stable_key: str,
+    summary: Annotated[
+        str,
+        typer.Option("--summary", help="Operator-authored reader summary."),
+    ],
+    why_it_matters: Annotated[
+        str,
+        typer.Option(
+            "--why-it-matters",
+            help="Operator-authored explanation of reader significance.",
+        ),
+    ],
+    topic: Annotated[
+        Topic,
+        typer.Option("--topic", help="Primary reader-facing Topic."),
+    ],
     actor: Annotated[
         str, typer.Option("--actor", help="Identifier recorded in the audit event.")
     ] = "local-operator",
 ) -> None:
     """Accept one unreviewed Story."""
-    _review_story(stable_key, StoryReviewState.ACCEPTED, actor)
+    _review_story(
+        stable_key,
+        StoryReviewState.ACCEPTED,
+        actor,
+        summary=summary,
+        why_it_matters=why_it_matters,
+        primary_topic=topic,
+    )
 
 
 @story_app.command("reject")
@@ -696,13 +759,17 @@ def reject_story(
     _review_story(stable_key, StoryReviewState.REJECTED, actor)
 
 
+def _parse_iso_date(value: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except ValueError as error:
+        raise typer.BadParameter("Date must use YYYY-MM-DD form") from error
+
+
 def _digest_date(publication_date: str | None) -> date:
     if publication_date is None:
         return datetime.now(ZoneInfo("Asia/Shanghai")).date()
-    try:
-        return date.fromisoformat(publication_date)
-    except ValueError as error:
-        raise typer.BadParameter("Digest date must use YYYY-MM-DD form") from error
+    return _parse_iso_date(publication_date)
 
 
 @digest_app.command("preview")
@@ -711,23 +778,52 @@ def preview_digest(
         str | None,
         typer.Option("--date", help="Digest publication date in YYYY-MM-DD form."),
     ] = None,
+    story: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--story",
+            help="Story stable key; repeat in the intended Digest order.",
+        ),
+    ] = None,
 ) -> None:
     """Preview accepted Stories that are not already in a Digest."""
     with _editorial_repository() as repository:
-        preview = repository.preview_digest(_digest_date(publication_date))
+        try:
+            preview = repository.preview_digest(
+                _digest_date(publication_date),
+                story_keys=tuple(story) if story is not None else None,
+            )
+        except (EditorialStateError, ValueError) as error:
+            raise typer.BadParameter(str(error)) from error
     console.print(f"Digest preview: {preview.publication_date.isoformat()}", markup=False)
     if not preview.stories:
         console.print("No accepted Stories are eligible.")
         return
-    for story in preview.stories:
-        console.print(f"{story.stable_key}\t{story.headline}", markup=False)
+    for item in preview.stories:
+        console.print(
+            f"{item.stable_key}\t{item.headline}", markup=False, soft_wrap=True
+        )
 
 
 @digest_app.command("publish")
 def publish_digest_command(
     publication_date: Annotated[
-        str | None,
+        str,
         typer.Option("--date", help="Digest publication date in YYYY-MM-DD form."),
+    ],
+    introduction: Annotated[
+        str,
+        typer.Option(
+            "--introduction",
+            help="Operator-authored daily Digest introduction.",
+        ),
+    ],
+    story: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--story",
+            help="Story stable key; repeat in the intended Digest order.",
+        ),
     ] = None,
     actor: Annotated[
         str, typer.Option("--actor", help="Identifier recorded in audit events.")
@@ -738,6 +834,8 @@ def publish_digest_command(
         try:
             digest = repository.publish_digest(
                 _digest_date(publication_date),
+                introduction=introduction,
+                story_keys=tuple(story or ()),
                 actor_identifier=actor,
                 published_at=datetime.now(UTC),
             )
@@ -745,7 +843,7 @@ def publish_digest_command(
             raise typer.BadParameter(str(error)) from error
     console.print(
         f"Digest {digest.publication_date.isoformat()} published with "
-        f"{len(digest.story_ids)} Story.",
+        f"{len(digest.story_ids)} Stories. {introduction.strip()}",
         markup=False,
     )
 

@@ -51,10 +51,12 @@ from ai_intel_agent.domain import (
     Story,
     StoryReviewState,
     StructuredTrace,
+    Topic,
 )
 from ai_intel_agent.editorial import (
     ClaimInspection,
     DigestPreview,
+    DigestPublicationContract,
     EditorialStateError,
     EvidenceSpanInspection,
     StoryInspection,
@@ -115,6 +117,33 @@ class StoryRecord(Base):
     review_state: Mapped[str] = mapped_column(String(32))
 
 
+class StoryPresentationRecord(Base):
+    __tablename__ = "story_presentations"
+    __table_args__ = (
+        CheckConstraint(
+            "length(btrim(summary)) BETWEEN 20 AND 1000",
+            name="ck_story_presentations_summary_length",
+        ),
+        CheckConstraint(
+            "length(btrim(why_it_matters)) BETWEEN 20 AND 1000",
+            name="ck_story_presentations_why_length",
+        ),
+        CheckConstraint(
+            "primary_topic IN ('Models', 'Research', 'Products and Tools', "
+            "'Industry and Infrastructure', 'Business', 'Applications', "
+            "'Policy and Safety', 'Community')",
+            name="ck_story_presentations_primary_topic",
+        ),
+    )
+
+    story_id: Mapped[UUID] = mapped_column(
+        ForeignKey("stories.id"), primary_key=True
+    )
+    summary: Mapped[str] = mapped_column(Text)
+    why_it_matters: Mapped[str] = mapped_column(Text)
+    primary_topic: Mapped[str] = mapped_column(String(64))
+
+
 class ClaimRecord(Base):
     __tablename__ = "claims"
     __table_args__ = (UniqueConstraint("story_id", "position"),)
@@ -171,6 +200,10 @@ class DigestRecord(Base):
             "state IN ('draft', 'published')",
             name="ck_digests_state",
         ),
+        CheckConstraint(
+            "publication_contract IN ('legacy-fixture', 'm3-multisource')",
+            name="ck_digests_publication_contract",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
@@ -178,6 +211,11 @@ class DigestRecord(Base):
     publication_date: Mapped[date] = mapped_column(Date)
     state: Mapped[str] = mapped_column(String(32))
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    introduction: Mapped[str | None] = mapped_column(Text)
+    publication_contract: Mapped[str] = mapped_column(
+        String(32),
+        server_default=DigestPublicationContract.M3_MULTISOURCE.value,
+    )
 
 
 class DigestStoryRecord(Base):
@@ -687,13 +725,38 @@ class EditorialRepository:
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
 
-    def stories(self) -> tuple[StoryInspection, ...]:
+    def stories(
+        self,
+        *,
+        publisher: str | None = None,
+        publication_date: date | None = None,
+        review_state: StoryReviewState | None = None,
+    ) -> tuple[StoryInspection, ...]:
         with Session(self._engine) as session:
-            story_ids = session.scalars(
-                select(StoryRecord.id).order_by(
-                    StoryRecord.occurred_at.desc(), StoryRecord.stable_key
+            statement = (
+                select(StoryRecord.id)
+                .join(
+                    DocumentVersionRecord,
+                    DocumentVersionRecord.id
+                    == StoryRecord.primary_document_version_id,
                 )
-            ).all()
+                .join(
+                    CandidateRecord,
+                    CandidateRecord.id == DocumentVersionRecord.candidate_id,
+                )
+                .order_by(StoryRecord.occurred_at.desc(), StoryRecord.stable_key)
+            )
+            if publisher is not None:
+                statement = statement.where(CandidateRecord.publisher == publisher)
+            if publication_date is not None:
+                statement = statement.where(
+                    func.date(DocumentVersionRecord.published_at) == publication_date
+                )
+            if review_state is not None:
+                statement = statement.where(
+                    StoryRecord.review_state == review_state.value
+                )
+            story_ids = session.scalars(statement).all()
             return tuple(self._story(session, story_id) for story_id in story_ids)
 
     def story(self, stable_key: str) -> StoryInspection | None:
@@ -710,6 +773,9 @@ class EditorialRepository:
         *,
         actor_identifier: str,
         occurred_at: datetime,
+        summary: str | None = None,
+        why_it_matters: str | None = None,
+        primary_topic: Topic | None = None,
     ) -> StoryInspection:
         with Session(self._engine) as session, session.begin():
             record = session.scalar(
@@ -732,14 +798,46 @@ class EditorialRepository:
                 actor_identifier=actor_identifier,
                 now=occurred_at,
             )
+            if decision is StoryReviewState.ACCEPTED:
+                if summary is None or why_it_matters is None or primary_topic is None:
+                    raise EditorialStateError(
+                        "Accepting a Story requires summary, why-it-matters, and topic"
+                    )
+                record_summary = summary.strip()
+                record_why = why_it_matters.strip()
+                if not 20 <= len(record_summary) <= 1000:
+                    raise EditorialStateError(
+                        "Story summary must contain between 20 and 1000 characters"
+                    )
+                if not 20 <= len(record_why) <= 1000:
+                    raise EditorialStateError(
+                        "Story why-it-matters must contain between 20 and 1000 characters"
+                    )
+                session.add(
+                    StoryPresentationRecord(
+                        story_id=record.id,
+                        summary=record_summary,
+                        why_it_matters=record_why,
+                        primary_topic=primary_topic.value,
+                    )
+                )
             record.review_state = reviewed.review_state.value
             _persist_audit_event(session, event)
             session.flush()
             return self._story(session, record.id)
 
-    def preview_digest(self, publication_date: date) -> DigestPreview:
+    def preview_digest(
+        self,
+        publication_date: date,
+        *,
+        story_keys: tuple[str, ...] | None = None,
+    ) -> DigestPreview:
         with Session(self._engine) as session:
-            story_ids = self._eligible_story_ids(session)
+            story_ids = (
+                self._eligible_story_ids(session)
+                if story_keys is None
+                else self._selected_story_ids(session, story_keys)
+            )
             return DigestPreview(
                 publication_date=publication_date,
                 stories=tuple(self._story(session, story_id) for story_id in story_ids),
@@ -749,6 +847,8 @@ class EditorialRepository:
         self,
         publication_date: date,
         *,
+        introduction: str,
+        story_keys: tuple[str, ...],
         actor_identifier: str,
         published_at: datetime,
     ) -> Digest:
@@ -758,9 +858,32 @@ class EditorialRepository:
             if existing is not None:
                 if existing.state != DigestState.PUBLISHED.value:
                     raise EditorialStateError("An existing Digest is not published")
+                existing_story_keys = tuple(
+                    session.scalars(
+                        select(StoryRecord.stable_key)
+                        .join(
+                            DigestStoryRecord,
+                            DigestStoryRecord.story_id == StoryRecord.id,
+                        )
+                        .where(DigestStoryRecord.digest_id == existing.id)
+                        .order_by(DigestStoryRecord.position)
+                    )
+                )
+                if (
+                    existing.introduction != introduction.strip()
+                    or existing_story_keys != story_keys
+                ):
+                    raise EditorialStateError(
+                        "Published Digest retry must use the original introduction and order"
+                    )
                 return self._digest(session, existing)
 
-            story_ids = self._eligible_story_ids(session, lock=True)
+            normalized_introduction = introduction.strip()
+            if not 20 <= len(normalized_introduction) <= 2000:
+                raise EditorialStateError(
+                    "Digest introduction must contain between 20 and 2000 characters"
+                )
+            story_ids = self._selected_story_ids(session, story_keys, lock=True)
             draft = compose_digest(publication_date, story_ids)
             published, events = publish_digest(
                 draft,
@@ -774,6 +897,10 @@ class EditorialRepository:
                     publication_date=draft.publication_date,
                     state=draft.state.value,
                     published_at=draft.published_at,
+                    introduction=normalized_introduction,
+                    publication_contract=(
+                        DigestPublicationContract.M3_MULTISOURCE.value
+                    ),
                 )
             )
             session.flush()
@@ -795,6 +922,66 @@ class EditorialRepository:
             _persist_audit_event(session, events[1])
             session.flush()
             return published
+
+    @staticmethod
+    def _selected_story_ids(
+        session: Session,
+        story_keys: tuple[str, ...],
+        *,
+        lock: bool = False,
+    ) -> tuple[UUID, ...]:
+        if len(story_keys) != len(set(story_keys)):
+            raise EditorialStateError("Digest Story selection cannot contain duplicates")
+        if not 8 <= len(story_keys) <= 12:
+            raise EditorialStateError("A Digest requires between 8 and 12 Stories")
+
+        statement = select(StoryRecord).where(StoryRecord.stable_key.in_(story_keys))
+        if lock:
+            statement = statement.with_for_update()
+        records = {record.stable_key: record for record in session.scalars(statement)}
+        selected_ids: list[UUID] = []
+        publishers: set[str] = set()
+        for stable_key in story_keys:
+            record = records.get(stable_key)
+            if record is None:
+                raise EditorialStateError(f"Story {stable_key!r} does not exist")
+            if record.review_state != StoryReviewState.ACCEPTED.value:
+                raise EditorialStateError(
+                    f"Story {stable_key!r} is not accepted"
+                )
+            if session.get(StoryPresentationRecord, record.id) is None:
+                raise EditorialStateError(
+                    f"Story {stable_key!r} has no reviewed reader presentation"
+                )
+            if session.scalar(
+                select(DigestStoryRecord.story_id).where(
+                    DigestStoryRecord.story_id == record.id
+                )
+            ) is not None:
+                raise EditorialStateError(
+                    f"Story {stable_key!r} already belongs to a Digest"
+                )
+            publisher = session.scalar(
+                select(CandidateRecord.publisher)
+                .join(
+                    DocumentVersionRecord,
+                    DocumentVersionRecord.candidate_id == CandidateRecord.id,
+                )
+                .where(
+                    DocumentVersionRecord.id == record.primary_document_version_id
+                )
+            )
+            if publisher is None:
+                raise EditorialStateError(
+                    f"Story {stable_key!r} has no primary Publisher"
+                )
+            selected_ids.append(record.id)
+            publishers.add(publisher)
+        if len(publishers) < 3:
+            raise EditorialStateError(
+                "A Digest requires Stories from at least three Publishers"
+            )
+        return tuple(selected_ids)
 
     @staticmethod
     def _eligible_story_ids(session: Session, *, lock: bool = False) -> tuple[UUID, ...]:
@@ -838,6 +1025,20 @@ class EditorialRepository:
         story = session.get(StoryRecord, story_id)
         if story is None:
             raise ValueError(f"Story {story_id} does not exist")
+        source = session.execute(
+            select(
+                CandidateRecord.publisher,
+                DocumentVersionRecord.published_at,
+            )
+            .join(
+                DocumentVersionRecord,
+                DocumentVersionRecord.candidate_id == CandidateRecord.id,
+            )
+            .where(
+                DocumentVersionRecord.id == story.primary_document_version_id
+            )
+        ).one()
+        presentation = session.get(StoryPresentationRecord, story.id)
         claims: list[ClaimInspection] = []
         claim_records = session.scalars(
             select(ClaimRecord)
@@ -883,6 +1084,15 @@ class EditorialRepository:
             headline=story.headline,
             review_state=StoryReviewState(story.review_state),
             claims=tuple(claims),
+            publisher=source.publisher,
+            original_published_at=source.published_at,
+            summary=presentation.summary if presentation is not None else None,
+            why_it_matters=(
+                presentation.why_it_matters if presentation is not None else None
+            ),
+            primary_topic=(
+                Topic(presentation.primary_topic) if presentation is not None else None
+            ),
         )
 
 
@@ -1520,6 +1730,17 @@ def _persist_sample_story(session: Session, sample: SampleStory) -> None:
         if record_type is TraceRecord:
             values["attributes"] = dict(values["attributes"])
         session.execute(insert(record_type).values(**values).on_conflict_do_nothing())
+    if session.get(StoryPresentationRecord, sample.story.id) is None:
+        session.execute(
+            insert(StoryPresentationRecord).values(
+                story_id=sample.story.id,
+                summary=f"{sample.story.headline}：{sample.claim.text}",
+                why_it_matters=(
+                    f"这条信息帮助读者理解 {sample.story.headline} 对 AI 开发与研究的影响。"
+                ),
+                primary_topic=Topic.PRODUCTS_AND_TOOLS.value,
+            )
+        )
 
 
 def _transition_story_record(session: Session, event: AuditEvent) -> None:
@@ -1551,6 +1772,7 @@ def _compose_digest_record(
             publication_date=digest.publication_date,
             state=DigestState.DRAFT.value,
             published_at=None,
+            publication_contract=DigestPublicationContract.LEGACY_FIXTURE.value,
         )
     )
     for position, story_id in enumerate(digest.story_ids):
@@ -1607,6 +1829,8 @@ def _verify_existing_publication(
         and existing.publication_date == digest.publication_date
         and existing.state == digest.state.value
         and existing.published_at == digest.published_at
+        and existing.publication_contract
+        == DigestPublicationContract.LEGACY_FIXTURE.value
     )
     actual_story_ids = tuple(
         session.scalars(

@@ -4,9 +4,9 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from uuid import UUID
 
-from sqlalchemy import Select, select
+from sqlalchemy import Select, func, select
 from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from ai_intel_agent.domain import (
     DigestState,
@@ -14,7 +14,9 @@ from ai_intel_agent.domain import (
     EvidenceRole,
     EvidenceState,
     StoryReviewState,
+    Topic,
 )
+from ai_intel_agent.editorial import DigestPublicationContract
 from ai_intel_agent.persistence import (
     CandidateRecord,
     ClaimRecord,
@@ -22,6 +24,7 @@ from ai_intel_agent.persistence import (
     DigestStoryRecord,
     DocumentVersionRecord,
     EvidenceSpanRecord,
+    StoryPresentationRecord,
     StoryRecord,
 )
 
@@ -77,6 +80,12 @@ class PublicStory:
     id: UUID
     stable_key: str
     headline: str
+    summary: str | None
+    why_it_matters: str | None
+    primary_topic: Topic | None
+    publisher: str
+    canonical_url: str
+    original_published_at: datetime | None
     claims: tuple[PublicClaim, ...]
 
 
@@ -85,6 +94,7 @@ class PublicDigest:
     stable_key: str
     publication_date: date
     published_at: datetime
+    introduction: str
     stories: tuple[PublicStory, ...]
 
 
@@ -101,6 +111,12 @@ class _StoryBuilder:
     id: UUID
     stable_key: str
     headline: str
+    summary: str | None
+    why_it_matters: str | None
+    primary_topic: Topic | None
+    publisher: str
+    canonical_url: str
+    original_published_at: datetime | None
     claims: list[_ClaimBuilder] = field(default_factory=list)
     claims_by_id: dict[UUID, _ClaimBuilder] = field(default_factory=dict)
 
@@ -135,15 +151,36 @@ class PublicPublicationRepository:
             stories = self._load_public_stories(session, stable_key=stable_key)
             return stories[0] if stories else None
 
-    def browse_published_stories(self) -> tuple[PublicStory, ...]:
+    def browse_published_stories(
+        self,
+        *,
+        keyword: str | None = None,
+        publisher: str | None = None,
+        topic: Topic | None = None,
+        publication_date: date | None = None,
+    ) -> tuple[PublicStory, ...]:
         with Session(self._engine) as session:
-            return self._load_public_stories(session)
+            return self._load_public_stories(
+                session,
+                keyword=keyword,
+                publisher=publisher,
+                topic=topic,
+                publication_date=publication_date,
+            )
 
     @staticmethod
     def _published_digests_statement() -> Select[tuple[DigestRecord]]:
         return (
             select(DigestRecord)
-            .where(DigestRecord.state == DigestState.PUBLISHED.value)
+            .where(
+                DigestRecord.state == DigestState.PUBLISHED.value,
+                DigestRecord.publication_contract.in_(
+                    (
+                        DigestPublicationContract.LEGACY_FIXTURE.value,
+                        DigestPublicationContract.M3_MULTISOURCE.value,
+                    )
+                ),
+            )
             .order_by(DigestRecord.publication_date.desc())
         )
 
@@ -156,6 +193,7 @@ class PublicPublicationRepository:
             stable_key=record.stable_key,
             publication_date=record.publication_date,
             published_at=record.published_at,
+            introduction=record.introduction or "",
             stories=self._load_public_stories(session, digest_id=record.id),
         )
 
@@ -165,36 +203,69 @@ class PublicPublicationRepository:
         *,
         digest_id: UUID | None = None,
         stable_key: str | None = None,
+        keyword: str | None = None,
+        publisher: str | None = None,
+        topic: Topic | None = None,
+        publication_date: date | None = None,
     ) -> tuple[PublicStory, ...]:
+        primary_document = aliased(DocumentVersionRecord)
+        primary_candidate = aliased(CandidateRecord)
+        evidence_document = aliased(DocumentVersionRecord)
+        evidence_candidate = aliased(CandidateRecord)
         statement = (
             select(
                 StoryRecord.id.label("story_id"),
                 StoryRecord.stable_key,
                 StoryRecord.headline,
+                StoryPresentationRecord.summary,
+                StoryPresentationRecord.why_it_matters,
+                StoryPresentationRecord.primary_topic,
+                primary_candidate.publisher.label("primary_publisher"),
+                primary_candidate.canonical_url.label("primary_canonical_url"),
+                primary_document.published_at.label("original_published_at"),
                 ClaimRecord.id.label("claim_id"),
                 ClaimRecord.text.label("claim_text"),
                 EvidenceSpanRecord.id.label("evidence_id"),
                 EvidenceSpanRecord.exact_text,
                 EvidenceSpanRecord.role,
                 EvidenceSpanRecord.relation,
-                CandidateRecord.canonical_url,
-                CandidateRecord.publisher,
+                evidence_candidate.canonical_url,
+                evidence_candidate.publisher,
             )
             .join(DigestStoryRecord, DigestStoryRecord.story_id == StoryRecord.id)
             .join(DigestRecord, DigestRecord.id == DigestStoryRecord.digest_id)
+            .outerjoin(
+                StoryPresentationRecord,
+                StoryPresentationRecord.story_id == StoryRecord.id,
+            )
+            .join(
+                primary_document,
+                primary_document.id == StoryRecord.primary_document_version_id,
+            )
+            .join(
+                primary_candidate,
+                primary_candidate.id == primary_document.candidate_id,
+            )
             .outerjoin(ClaimRecord, ClaimRecord.story_id == StoryRecord.id)
             .outerjoin(
                 EvidenceSpanRecord, EvidenceSpanRecord.claim_id == ClaimRecord.id
             )
             .outerjoin(
-                DocumentVersionRecord,
-                DocumentVersionRecord.id == EvidenceSpanRecord.document_version_id,
+                evidence_document,
+                evidence_document.id == EvidenceSpanRecord.document_version_id,
             )
             .outerjoin(
-                CandidateRecord, CandidateRecord.id == DocumentVersionRecord.candidate_id
+                evidence_candidate,
+                evidence_candidate.id == evidence_document.candidate_id,
             )
             .where(
                 DigestRecord.state == DigestState.PUBLISHED.value,
+                DigestRecord.publication_contract.in_(
+                    (
+                        DigestPublicationContract.LEGACY_FIXTURE.value,
+                        DigestPublicationContract.M3_MULTISOURCE.value,
+                    )
+                ),
                 StoryRecord.review_state == StoryReviewState.ACCEPTED.value,
             )
             .order_by(
@@ -208,6 +279,37 @@ class PublicPublicationRepository:
             statement = statement.where(DigestRecord.id == digest_id)
         if stable_key is not None:
             statement = statement.where(StoryRecord.stable_key == stable_key)
+        if keyword is not None and (normalized_keyword := keyword.strip()):
+            pattern = f"%{normalized_keyword}%"
+            search_claim = aliased(ClaimRecord)
+            matching_claim = (
+                select(search_claim.id)
+                .where(
+                    search_claim.story_id == StoryRecord.id,
+                    search_claim.text.ilike(pattern),
+                )
+                .correlate(StoryRecord)
+                .exists()
+            )
+            statement = statement.where(
+                StoryRecord.headline.ilike(pattern)
+                | StoryPresentationRecord.summary.ilike(pattern)
+                | StoryPresentationRecord.why_it_matters.ilike(pattern)
+                | matching_claim
+            )
+        if publisher is not None and publisher.strip():
+            statement = statement.where(
+                primary_candidate.publisher == publisher.strip()
+            )
+        if topic is not None:
+            statement = statement.where(
+                StoryPresentationRecord.primary_topic == topic.value
+            )
+        if publication_date is not None:
+            statement = statement.where(
+                primary_document.published_at.is_not(None),
+                func.date(primary_document.published_at) == publication_date,
+            )
 
         builders: dict[UUID, _StoryBuilder] = {}
         for row in session.execute(statement):
@@ -217,6 +319,16 @@ class PublicPublicationRepository:
                     id=row.story_id,
                     stable_key=row.stable_key,
                     headline=row.headline,
+                    summary=row.summary,
+                    why_it_matters=row.why_it_matters,
+                    primary_topic=(
+                        Topic(row.primary_topic)
+                        if row.primary_topic is not None
+                        else None
+                    ),
+                    publisher=row.primary_publisher,
+                    canonical_url=row.primary_canonical_url,
+                    original_published_at=row.original_published_at,
                 ),
             )
             if row.claim_id is None:
@@ -244,6 +356,12 @@ class PublicPublicationRepository:
                 id=story.id,
                 stable_key=story.stable_key,
                 headline=story.headline,
+                summary=story.summary,
+                why_it_matters=story.why_it_matters,
+                primary_topic=story.primary_topic,
+                publisher=story.publisher,
+                canonical_url=story.canonical_url,
+                original_published_at=story.original_published_at,
                 claims=tuple(
                     PublicClaim(
                         id=claim.id,
