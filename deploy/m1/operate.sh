@@ -5,6 +5,12 @@ state_dir="${AI_INTEL_STATE_DIR:-/etc/ai-ledger-m1/state}"
 current_release="${state_dir}/current.env"
 previous_release="${state_dir}/previous.env"
 operation="${1:-}"
+edge_network="ai-ledger-m1_edge"
+legacy_edge_subnet="172.19.0.0/16"
+expected_edge_subnet="172.31.255.0/24"
+edge_migration_required=0
+edge_migration_started=0
+prepared_release=""
 
 case "$operation" in
   "validate"|"start"|"upgrade"|"") ;;
@@ -60,7 +66,19 @@ validate_release() {
     exit 2
   }
   compose "$release_file" config --quiet
-  compose "$release_file" run --rm --no-deps caddy caddy validate --config /etc/caddy/Caddyfile
+  caddy_image="$(
+    compose "$release_file" config caddy |
+      awk '$1 == "caddy:" {in_caddy=1; next} in_caddy && $1 == "image:" {print $2; exit}'
+  )"
+  test -n "$caddy_image" || {
+    printf '%s\n' 'release Compose config does not resolve a Caddy image' >&2
+    exit 2
+  }
+  docker run --rm --network none --read-only --cap-drop ALL \
+    --tmpfs /config --tmpfs /data \
+    --env "AI_INTEL_DOMAIN=$(release_value "$release_file" AI_INTEL_DOMAIN)" \
+    --volume "${release_dir}/deploy/m1/Caddyfile:/etc/caddy/Caddyfile:ro" \
+    --entrypoint caddy "$caddy_image" validate --config /etc/caddy/Caddyfile
 }
 
 release_value() {
@@ -115,8 +133,66 @@ validate_candidate() {
   release_file="$1"
   validate_candidate_contract "$release_file"
   validate_release "$release_file"
-  compose "$release_file" pull web
+  compose "$release_file" pull
   validate_image_revision "$release_file"
+}
+
+current_edge_subnet() {
+  edge_network_inspection="$(docker network inspect \
+    --format '{{range .IPAM.Config}}{{println .Subnet}}{{end}}' \
+    "$edge_network" 2>/dev/null)" || return 1
+  printf '%s\n' "$edge_network_inspection" | awk 'NF {print; exit}'
+}
+
+preflight_edge_network() {
+  observed_edge_subnet="$(current_edge_subnet)" || {
+    printf '%s\n' "cannot inspect ${edge_network}; refusing upgrade" >&2
+    return 1
+  }
+  case "$observed_edge_subnet" in
+    "$expected_edge_subnet") edge_migration_required=0 ;;
+    "$legacy_edge_subnet") edge_migration_required=1 ;;
+    *)
+      printf '%s\n' "${edge_network} is not the verified legacy or fixed network; refusing upgrade" >&2
+      return 1
+      ;;
+  esac
+}
+
+migrate_legacy_edge_network() {
+  release_file="$1"
+  observed_edge_subnet="$(current_edge_subnet)" || {
+    printf '%s\n' "cannot re-inspect ${edge_network}; refusing edge mutation" >&2
+    return 1
+  }
+  if [ "$edge_migration_required" = "0" ] && [ "$observed_edge_subnet" = "$expected_edge_subnet" ]; then
+    return 0
+  fi
+  if [ "$edge_migration_required" != "1" ] || [ "$observed_edge_subnet" != "$legacy_edge_subnet" ]; then
+    printf '%s\n' "${edge_network} changed after preflight; refusing edge mutation" >&2
+    return 1
+  fi
+
+  edge_migration_started=1
+  printf '%s\n' "migrating ${edge_network} from ${legacy_edge_subnet} to ${expected_edge_subnet}" >&2
+  compose "$release_file" rm --stop --force caddy web scheduler || return 1
+  docker network rm "$edge_network" >/dev/null || return 1
+}
+
+restore_current_runtime() {
+  candidate_file="$1"
+  recovery_failed=0
+
+  compose "$candidate_file" rm --stop --force caddy web scheduler || recovery_failed=1
+  if [ "$edge_migration_started" = "1" ] && docker network inspect "$edge_network" >/dev/null 2>&1; then
+    docker network rm "$edge_network" >/dev/null || recovery_failed=1
+  fi
+  compose "$current_release" up --detach --wait postgres web scheduler backup caddy || recovery_failed=1
+
+  if [ "$recovery_failed" -ne 0 ]; then
+    printf '%s\n' 'current release recovery did not complete cleanly' >&2
+    return 1
+  fi
 }
 
 migrate() {
@@ -127,9 +203,13 @@ migrate() {
 activate_release() {
   release_file="$1"
   run_migrations="$2"
-  validate_release "$release_file" || return 1
-  compose "$release_file" pull || return 1
-  validate_image_revision "$release_file" || return 1
+  if [ "$prepared_release" = "$release_file" ]; then
+    prepared_release=""
+  else
+    validate_release "$release_file" || return 1
+    compose "$release_file" pull || return 1
+    validate_image_revision "$release_file" || return 1
+  fi
   compose "$release_file" up --detach --wait postgres || return 1
   if [ "$run_migrations" = "1" ]; then
     migrate "$release_file" || return 1
@@ -179,23 +259,40 @@ case "$operation" in
     test "$#" -eq 2 || { usage; exit 2; }
     require_current
     candidate="$2"
+    validate_candidate "$candidate"
+    preflight_edge_network
     compose "$current_release" run --rm --no-deps --env AI_INTEL_BACKUP_ONCE=1 backup
+    if ! migrate_legacy_edge_network "$current_release"; then
+      if [ "$edge_migration_started" = "1" ]; then
+        restore_current_runtime "$candidate" || true
+      fi
+      exit 1
+    fi
+    prepared_release="$candidate"
     if start_release "$candidate"; then
       install -m 600 "$current_release" "$previous_release"
       record_current "$candidate"
     else
-      compose "$current_release" up --detach --wait postgres web scheduler backup caddy
+      restore_current_runtime "$candidate" || true
       exit 1
     fi
     ;;
   "rollback")
     require_current
     test -f "$previous_release" || { printf '%s\n' 'no previous release is recorded' >&2; exit 2; }
-    activate_release "$previous_release" 0
-    temporary="${state_dir}/rollback.env"
-    install -m 600 "$current_release" "$temporary"
-    install -m 600 "$previous_release" "$current_release"
-    mv "$temporary" "$previous_release"
+    if activate_release "$previous_release" 0; then
+      temporary="${state_dir}/rollback.env"
+      install -m 600 "$current_release" "$temporary"
+      install -m 600 "$previous_release" "$current_release"
+      mv "$temporary" "$previous_release"
+    else
+      printf '%s\n' 'rollback target failed; restoring the recorded current release' >&2
+      activate_release "$current_release" 0 || {
+        printf '%s\n' 'recorded current release recovery failed' >&2
+        exit 1
+      }
+      exit 1
+    fi
     ;;
   "status")
     require_current

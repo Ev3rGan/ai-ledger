@@ -116,11 +116,20 @@ bash deploy/m1/operate.sh audit-no-secrets
 ```
 
 `stop` retains PostgreSQL, Caddy, and restore volumes. `restart` recreates the required service
-set and waits for health. `upgrade` first creates and verifies a local and off-host logical
-backup, then migrates before switching the recorded release, and restores the current release
-automatically if the candidate fails to become healthy. M1-M3 migrations are additive, so
-`rollback` runs the previous application image against the forward-compatible database without
-destructive schema downgrade.
+set and waits for health. `validate` checks Caddy in a read-only, networkless one-off container;
+it never attaches a candidate container to the running Compose project. `upgrade` validates and
+pulls the candidate first, then requires the existing edge to be either the verified legacy
+`172.19.0.0/16` network or the pinned `172.31.255.0/24` network. A missing, uninspectable, or other
+subnet aborts before backup or outage. After that preflight it creates and verifies a local and
+off-host logical backup. When it finds the verified legacy subnet, it rechecks that exact state and
+enters one bounded outage: remove only the
+current Caddy, Web, and Scheduler containers, remove the old edge network, then let the candidate
+Compose bundle create the pinned edge and wait for health. PostgreSQL and the backup service stay
+on the unchanged private database network. Any detach, network removal, migration, or candidate
+health failure leaves the release records unchanged and attempts to recreate the recorded current
+release and its edge connectivity. M1-M3 migrations are additive, so `rollback` runs the previous
+application image against the forward-compatible database without destructive schema downgrade;
+if that target is unhealthy, it restores the recorded current release without swapping records.
 
 Before validation, mount an authorized off-host filesystem or object-storage gateway at
 `AI_INTEL_OFFSITE_BACKUP_DIR`; `validate` refuses an ordinary host directory. The backup service
@@ -207,11 +216,15 @@ bash deploy/m1/operate.sh upgrade /etc/ai-ledger-m1/releases/<candidate>.env
 bash deploy/m1/operate.sh status
 ```
 
-`upgrade` refuses an invalid release, creates the verified pre-change backup, migrates, waits for
-all required services, and records current/previous only after the candidate is healthy. Do not
-edit a recorded release file or checkout in place. A rebuilt image or changed configuration is a
-new candidate. The candidate `upgrade` command deliberately does not dispatch to the recorded
-older operator: this ensures the new pre-migration backup guard is active on the first M3-to-M4
+`upgrade` refuses an invalid release, pulls and verifies it without joining the running project,
+requires the exact legacy-or-fixed edge preflight, creates the verified pre-change backup, migrates
+the verified legacy edge only inside the bounded outage described above, migrates the database,
+waits for all required services, and records
+current/previous only after the candidate is healthy. An already pinned edge is left intact, so a
+retry or later rollback/upgrade cycle does not rebuild it. Do not edit a recorded release file or
+checkout in place. A rebuilt image or changed configuration is a new candidate. The candidate
+`upgrade` command deliberately does not dispatch to the recorded older operator: this ensures the
+new pre-migration backup guard and edge migration recovery are active on the first M3-to-M4
 upgrade. `validate` pulls the pinned application image and verifies that its
 `org.opencontainers.image.revision` label exactly matches `AI_INTEL_RELEASE`; status reports that
 validated commit. Lifecycle commands also override ambient release-contract variables with the
