@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import date, datetime
+from enum import StrEnum
 from typing import Protocol
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -17,6 +18,7 @@ from ai_intel_agent.domain import (
     SampleStory,
     Story,
     StoryReviewState,
+    Topic,
 )
 
 
@@ -42,6 +44,11 @@ class StoryInspection:
     headline: str
     review_state: StoryReviewState
     claims: tuple[ClaimInspection, ...]
+    publisher: str
+    original_published_at: datetime | None
+    summary: str | None
+    why_it_matters: str | None
+    primary_topic: Topic | None
 
 
 @dataclass(frozen=True)
@@ -62,6 +69,11 @@ class Administrator(Protocol):
 
 class EditorialStateError(ValueError):
     pass
+
+
+class DigestPublicationContract(StrEnum):
+    LEGACY_FIXTURE = "legacy-fixture"
+    M3_MULTISOURCE = "m3-multisource"
 
 
 def _id(name: str) -> UUID:

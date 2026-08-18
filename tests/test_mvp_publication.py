@@ -71,6 +71,7 @@ def _persist_m1_draft(
     identity: str = "real",
     stable_key: str = STORY_KEY,
     headline: str = HEADLINE,
+    publisher: str = "Google",
 ) -> None:
     body = "August 12, 2026\n" + "\n".join(
         evidence for _, evidence in CLAIMS_AND_EVIDENCE
@@ -90,7 +91,7 @@ def _persist_m1_draft(
         id=_id(f"{identity}:candidate"),
         title="Gemini API Release Notes — August 12, 2026",
         canonical_url=f"{CANONICAL_URL}-{identity}",
-        publisher="Google",
+        publisher=publisher,
         discovered_at=datetime(2026, 8, 14, tzinfo=UTC),
     )
     document = DocumentVersion(
@@ -155,6 +156,32 @@ def _persist_m1_draft(
         engine.dispose()
 
 
+def _accept_with_reader_metadata(
+    database_url: str,
+    stable_key: str,
+    *,
+    topic: str,
+) -> None:
+    accepted = runner.invoke(
+        app,
+        [
+            "story",
+            "accept",
+            stable_key,
+            "--summary",
+            f"{stable_key} 的读者摘要由 operator 明确输入并审核。",
+            "--why-it-matters",
+            f"{stable_key} 会影响开发者的模型评估、采用或迁移计划。",
+            "--topic",
+            topic,
+            "--actor",
+            "m3-operator",
+        ],
+        env={"AI_INTEL_DATABASE_URL": database_url},
+    )
+    assert accepted.exit_code == 0, accepted.output
+
+
 @pytest.mark.postgres
 def test_operator_lists_and_shows_the_persisted_m1_draft(mvp_database_url: str) -> None:
     _persist_m1_draft(mvp_database_url)
@@ -197,27 +224,49 @@ def test_operator_reviews_and_publishes_only_the_accepted_story(
         stable_key=draft_key,
         headline="不应公开的 draft Story",
     )
+    selected_keys = [STORY_KEY]
+    publishers_and_topics = (
+        ("TechCrunch", "Models"),
+        ("Hugging Face", "Research"),
+        ("The Decoder", "Business"),
+    )
+    for position in range(8):
+        publisher, topic = publishers_and_topics[position % len(publishers_and_topics)]
+        stable_key = f"gemini-release-notes:selected-{position}"
+        _persist_m1_draft(
+            mvp_database_url,
+            identity=f"selected-{position}",
+            stable_key=stable_key,
+            headline=f"{publisher} 已审核 Story {position}",
+            publisher=publisher,
+        )
+        _accept_with_reader_metadata(mvp_database_url, stable_key, topic=topic)
+        selected_keys.append(stable_key)
     environment = {"AI_INTEL_DATABASE_URL": mvp_database_url}
 
-    accepted = runner.invoke(
-        app,
-        ["story", "accept", STORY_KEY, "--actor", "m2-operator"],
-        env=environment,
-    )
+    _accept_with_reader_metadata(mvp_database_url, STORY_KEY, topic="Models")
     rejected = runner.invoke(
         app,
         ["story", "reject", rejected_key, "--actor", "m2-operator"],
         env=environment,
     )
 
-    assert accepted.exit_code == 0, accepted.output
-    assert "accepted" in accepted.output
     assert rejected.exit_code == 0, rejected.output
     assert "rejected" in rejected.output
 
     preview = runner.invoke(
         app,
-        ["digest", "preview", "--date", "2026-08-15"],
+        [
+            "digest",
+            "preview",
+            "--date",
+            "2026-08-15",
+            *[
+                option
+                for stable_key in selected_keys
+                for option in ("--story", stable_key)
+            ],
+        ],
         env=environment,
     )
 
@@ -234,8 +283,15 @@ def test_operator_reviews_and_publishes_only_the_accepted_story(
             "publish",
             "--date",
             "2026-08-15",
+            "--introduction",
+            "本期 Digest 汇集三家以上发布者的九条已审核 AI 进展。",
             "--actor",
-            "m2-operator",
+            "m3-operator",
+            *[
+                option
+                for stable_key in selected_keys
+                for option in ("--story", stable_key)
+            ],
         ],
         env=environment,
     )
@@ -260,16 +316,18 @@ def test_operator_reviews_and_publishes_only_the_accepted_story(
         assert '/stories/gemini-release-notes%3A2026-08-12' in digest.text
         assert HEADLINE in digest.text
         assert "Google" in digest.text
-        assert f"{CANONICAL_URL}-real" in digest.text
-        assert bounded_evidence in digest.text
+        assert f"{CANONICAL_URL}-real" not in digest.text
+        assert bounded_evidence not in digest.text
         assert CLAIMS_AND_EVIDENCE[1][1] not in digest.text
-        for claim, _ in CLAIMS_AND_EVIDENCE:
-            assert claim in digest.text
+        assert digest.text.count('class="story-card"') == 9
 
         story = client.get(f"/stories/{STORY_KEY}")
         assert story.status_code == 200
         assert HEADLINE in story.text
         assert bounded_evidence in story.text
+        assert f"{CANONICAL_URL}-real" in story.text
+        for claim, _ in CLAIMS_AND_EVIDENCE:
+            assert claim in story.text
         assert client.get(f"/stories/{rejected_key}").status_code == 404
         assert client.get(f"/stories/{draft_key}").status_code == 404
 

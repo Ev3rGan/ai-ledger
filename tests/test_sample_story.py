@@ -23,6 +23,7 @@ from ai_intel_agent.domain import (
     EvidenceRole,
     StoryReviewState,
 )
+from ai_intel_agent.editorial import DigestPublicationContract
 from ai_intel_agent.persistence import (
     AuditEventRecord,
     CandidateRecord,
@@ -119,6 +120,7 @@ def _publish_story_record(
             publication_date=publication_date,
             state=DigestState.DRAFT.value,
             published_at=None,
+            publication_contract=DigestPublicationContract.LEGACY_FIXTURE.value,
         )
     )
     session.execute(
@@ -448,21 +450,14 @@ def test_anonymous_visitor_reads_published_digest_through_web_and_rss(
     private_source_text = (
         "示例发布者宣布：其 AI Agent 现在会记录任务轨迹，以便复现实验结果。"
     )
-    public_values = (
-        headline,
-        claim,
-        evidence_excerpt,
-        evidence_state,
-        evidence_role,
-        source_url,
-    )
+    card_values = (headline, claim, "示例发布者", "Products and Tools")
 
     with TestClient(create_app(postgres_url)) as client:
         home = client.get("/")
         assert 'href="/digests/2026-08-12"' in home.text
         assert 'href="/stories/sample-story-v1"' in home.text
         assert 'href="/browse"' in home.text
-        assert 'href="/rss.xml"' in home.text
+        assert 'href="/rss"' in home.text
 
         digest = client.get("/digests/2026-08-12")
         assert 'href="/stories/sample-story-v1"' in digest.text
@@ -470,15 +465,32 @@ def test_anonymous_visitor_reads_published_digest_through_web_and_rss(
         story = client.get("/stories/sample-story-v1")
         browse = client.get("/browse")
 
-        for response in (home, digest, story, browse):
+        for response in (home, digest, browse):
             assert response.status_code == 200
-            assert all(value in response.text for value in public_values)
-            assert "<strong>发布者：</strong>示例发布者" in response.text
-            assert "<strong>原文链接：</strong>" in response.text
-            assert "<strong>来源：</strong>" not in response.text
+            assert all(value in response.text for value in card_values)
+            assert evidence_excerpt not in response.text
+            assert source_url not in response.text
             assert private_source_text not in response.text
             assert "证据不足的 AI 性能声明" not in response.text
             assert "等待审核的 AI 工具候选" not in response.text
+
+        assert story.status_code == 200
+        assert all(
+            value in story.text
+            for value in (
+                *card_values,
+                evidence_excerpt,
+                evidence_state,
+                evidence_role,
+                source_url,
+                "为什么重要",
+                "关键事实",
+                "来源与依据",
+            )
+        )
+        assert "Evidence Role" not in story.text
+        assert "Evidence Relation" not in story.text
+        assert private_source_text not in story.text
 
         rss = client.get("/rss.xml")
 
@@ -492,7 +504,9 @@ def test_anonymous_visitor_reads_published_digest_through_web_and_rss(
     assert len(items) == 1
     assert items[0].findtext("link") == "http://testserver/digests/2026-08-12"
     description = items[0].findtext("description") or ""
-    assert all(value in description for value in public_values)
+    assert all(value in description for value in card_values)
+    assert evidence_excerpt not in description
+    assert source_url not in description
 
 
 @pytest.mark.postgres
@@ -539,21 +553,26 @@ def test_public_surfaces_use_canonical_links_and_bounded_evidence_excerpts(
         session.commit()
 
     with TestClient(create_app(postgres_url)) as client:
-        responses = (
+        card_responses = (
             client.get("/"),
             client.get("/digests/2026-08-13"),
-            client.get("/stories/sample-story-v1"),
             client.get("/browse"),
             client.get("/rss.xml"),
         )
+        story = client.get("/stories/sample-story-v1")
 
-    for response in responses:
+    for response in card_responses:
         assert response.status_code == 200
-        assert canonical_url in response.text
+        assert canonical_url not in response.text
         assert redirected_source_url not in response.text
-        assert expected_excerpt in response.text
         assert private_text not in response.text
         assert "不得公开的原文结尾" not in response.text
+    assert story.status_code == 200
+    assert canonical_url in story.text
+    assert redirected_source_url not in story.text
+    assert expected_excerpt in story.text
+    assert private_text not in story.text
+    assert "不得公开的原文结尾" not in story.text
 
 
 @pytest.mark.postgres
@@ -582,6 +601,7 @@ def test_public_surfaces_fail_closed_when_a_digest_contains_a_rejected_story(
                 publication_date=publication_date,
                 state=DigestState.DRAFT.value,
                 published_at=None,
+                publication_contract=DigestPublicationContract.LEGACY_FIXTURE.value,
             )
         )
         session.execute(

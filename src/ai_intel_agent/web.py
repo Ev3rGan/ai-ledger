@@ -6,14 +6,15 @@ from contextlib import asynccontextmanager
 from datetime import date
 from email.utils import format_datetime
 from html import escape
+from typing import Annotated
 from urllib.parse import quote, urlsplit
 from xml.etree import ElementTree
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from ai_intel_agent.domain import EvidenceRelation, EvidenceRole, EvidenceState
+from ai_intel_agent.domain import EvidenceRelation, EvidenceRole, EvidenceState, Topic
 from ai_intel_agent.persistence import create_database_engine
 from ai_intel_agent.publication import (
     PublicClaim,
@@ -104,15 +105,40 @@ def create_app(
 
     @app.get("/", response_class=HTMLResponse, name="home")
     def home() -> HTMLResponse:
-        digest = repository.latest_digest()
-        if digest is None:
-            content = "<h1>AI Intelligence</h1><p>暂无已发布 Digest。</p>"
-        else:
+        digests = repository.published_digests()
+        if not digests:
             content = (
-                "<h1>AI Intelligence</h1>"
-                f'<p><a href="/digests/{digest.publication_date.isoformat()}">'
-                f"阅读 {digest.publication_date.isoformat()} Digest</a></p>"
-                + _render_linked_stories(digest.stories, _relative_story_url)
+                '<section class="hero"><p class="eyebrow">AI Intelligence</p>'
+                "<h1>今日 AI Digest</h1><p>暂无已发布 Digest。</p></section>"
+                + _render_entry_points()
+            )
+        else:
+            digest = digests[0]
+            publishers = sorted({story.publisher for story in digest.stories})
+            coverage = "".join(
+                f'<li class="badge">{escape(publisher)}</li>'
+                for publisher in publishers
+            )
+            recent = "".join(
+                f'<li><a href="/digests/{item.publication_date.isoformat()}">'
+                f"{item.publication_date.isoformat()}</a></li>"
+                for item in digests[1:6]
+            ) or "<li>暂无更早的 Digest。</li>"
+            content = (
+                '<section class="hero"><p class="eyebrow">AI Intelligence</p>'
+                "<h1>今日 AI Digest</h1>"
+                f'<p class="digest-date">{digest.publication_date.isoformat()}</p>'
+                f'<p class="lede">{escape(digest.introduction)}</p>'
+                f'<a class="primary-action" href="/digests/{digest.publication_date.isoformat()}">'
+                "阅读完整 Digest</a></section>"
+                '<section aria-labelledby="coverage-heading"><h2 id="coverage-heading">来源覆盖</h2>'
+                f'<ul class="badge-list">{coverage}</ul></section>'
+                '<section aria-labelledby="latest-heading"><h2 id="latest-heading">今日重点</h2>'
+                f'<div class="story-grid">{_render_story_cards(digest.stories, _relative_story_url)}</div>'
+                "</section>"
+                '<section aria-labelledby="recent-heading"><h2 id="recent-heading">近期 Digest</h2>'
+                f'<ul class="digest-list">{recent}</ul></section>'
+                + _render_entry_points()
             )
         return HTMLResponse(_render_page("AI Intelligence", content))
 
@@ -126,8 +152,13 @@ def create_app(
         if digest is None:
             raise HTTPException(status_code=404, detail="Digest not found")
         content = (
-            f"<h1>Digest · {digest.publication_date.isoformat()}</h1>"
-            + _render_linked_stories(digest.stories, _relative_story_url)
+            '<header class="page-header"><p class="eyebrow">Daily Digest</p>'
+            f"<h1>{digest.publication_date.isoformat()} AI Digest</h1>"
+            f'<p class="lede">{escape(digest.introduction)}</p>'
+            f'<p class="muted">共 {len(digest.stories)} 条已审核进展</p></header>'
+            '<div class="story-grid">'
+            + _render_story_cards(digest.stories, _relative_story_url)
+            + "</div>"
         )
         return HTMLResponse(_render_page(f"Digest {publication_date.isoformat()}", content))
 
@@ -138,13 +169,48 @@ def create_app(
         story = repository.published_story(stable_key)
         if story is None:
             raise HTTPException(status_code=404, detail="Story not found")
-        return HTMLResponse(_render_page(story.headline, _render_story(story)))
+        return HTMLResponse(_render_page(story.headline, _render_story_detail(story)))
 
     @app.get("/browse", response_class=HTMLResponse, name="browse")
-    def browse() -> HTMLResponse:
-        stories = repository.browse_published_stories()
-        content = "<h1>Browse</h1>" + _render_linked_stories(
-            stories, _relative_story_url
+    def browse(
+        q: str | None = None,
+        publisher: Annotated[str | None, Query(alias="source")] = None,
+        topic: Annotated[Topic | None, Query(alias="topic")] = None,
+        publication_date: Annotated[date | None, Query(alias="date")] = None,
+    ) -> HTMLResponse:
+        stories = repository.browse_published_stories(
+            keyword=q,
+            publisher=publisher,
+            topic=topic,
+            publication_date=publication_date,
+        )
+        all_stories = repository.browse_published_stories()
+        form = _render_browse_form(
+            q=q,
+            publisher=publisher,
+            topic=topic,
+            publication_date=publication_date,
+            sources=tuple(sorted({story.publisher for story in all_stories})),
+            topics=tuple(
+                sorted(
+                    {
+                        story.primary_topic
+                        for story in all_stories
+                        if story.primary_topic is not None
+                    },
+                    key=lambda item: item.value,
+                )
+            ),
+        )
+        results = (
+            f'<div class="story-grid">{_render_story_cards(stories, _relative_story_url)}</div>'
+            if stories
+            else '<p class="empty-state">没有符合这些条件的已发布 Story。</p>'
+        )
+        content = (
+            '<header class="page-header"><p class="eyebrow">Published knowledge</p>'
+            '<h1>Browse</h1><p class="lede">按关键词、发布者、主题和原始发布日期查找已发布内容。</p>'
+            f"</header>{form}<p class=\"muted\">找到 {len(stories)} 条 Story</p>{results}"
         )
         return HTMLResponse(_render_page("Browse", content))
 
@@ -170,6 +236,10 @@ def create_app(
             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
         )
 
+    @app.get("/rss", response_class=HTMLResponse, name="rss_page")
+    def rss_page() -> HTMLResponse:
+        return HTMLResponse(_render_page("RSS 订阅", _render_rss_page()))
+
     @app.get("/rss.xml", name="rss")
     def rss(request: Request) -> Response:
         body = _render_rss(
@@ -182,7 +252,10 @@ def create_app(
                 request.url_for("story_page", stable_key=value)
             ),
         )
-        return Response(content=body, media_type="application/rss+xml")
+        return Response(
+            content=body,
+            headers={"Content-Type": "application/rss+xml; charset=utf-8"},
+        )
 
     return app
 
@@ -193,30 +266,91 @@ def _render_page(title: str, content: str) -> str:
         '<html lang="zh-CN"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
         f"<title>{escape(title)}</title>"
-        "<style>body{font-family:system-ui,sans-serif;line-height:1.6;max-width:52rem;"
-        "margin:2rem auto;padding:0 1rem}nav{display:flex;gap:1rem}article{border-top:1px "
-        "solid #bbb;margin-top:1.5rem;padding-top:1rem}blockquote{margin-left:0;padding-left:1rem;"
-        "border-left:3px solid #777}a{color:#075985}</style></head><body>"
-        '<nav><a href="/">首页</a><a href="/browse">Browse</a>'
-        '<a href="/research">Research</a>'
-        '<a href="/rss.xml">RSS</a></nav><main>'
+        "<style>"
+        ":root{color-scheme:light;--ink:#172033;--muted:#5f6b7a;--line:#d9e0e8;"
+        "--paper:#fff;--wash:#f4f7fa;--accent:#0b6bcb;--accent-dark:#084e96;"
+        "--radius:1rem}*{box-sizing:border-box}html{background:var(--wash)}"
+        "body{font-family:Inter,ui-sans-serif,system-ui,-apple-system,sans-serif;"
+        "line-height:1.65;color:var(--ink);max-width:72rem;margin:0 auto;padding:0 1.5rem 4rem}"
+        "a{color:var(--accent);text-underline-offset:.18em}a:hover{color:var(--accent-dark)}"
+        ".site-nav{display:flex;align-items:center;justify-content:space-between;gap:1rem;"
+        "padding:1.1rem 0;border-bottom:1px solid var(--line);flex-wrap:wrap}"
+        ".brand{font-weight:800;color:var(--ink);text-decoration:none}.nav-links{display:flex;"
+        "gap:1rem;flex-wrap:wrap}.nav-links a{font-weight:650;text-decoration:none}"
+        "main{padding-top:2.25rem}.hero,.page-header{max-width:52rem;margin-bottom:2.5rem}"
+        ".eyebrow{text-transform:uppercase;letter-spacing:.12em;font-size:.78rem;font-weight:800;"
+        "color:var(--accent);margin:0 0 .5rem}h1{font-size:clamp(2.2rem,7vw,4.6rem);line-height:1.02;"
+        "letter-spacing:-.045em;margin:.2rem 0 1rem}h2{font-size:clamp(1.4rem,3vw,2rem);"
+        "line-height:1.2;margin:2.4rem 0 1rem}h3{line-height:1.3}.lede{font-size:clamp(1.08rem,"
+        "2vw,1.3rem);color:#334155;max-width:48rem}.muted,.digest-date{color:var(--muted)}"
+        ".primary-action{display:inline-block;background:var(--accent);color:#fff;text-decoration:none;"
+        "font-weight:750;padding:.75rem 1rem;border-radius:.65rem;margin-top:.6rem}"
+        ".badge-list{display:flex;gap:.55rem;flex-wrap:wrap;list-style:none;padding:0}.badge{background:#e6f1fc;"
+        "color:#084e96;border-radius:999px;padding:.25rem .7rem;font-size:.9rem;font-weight:700}"
+        ".story-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}"
+        ".story-card{background:var(--paper);border:1px solid var(--line);border-radius:var(--radius);"
+        "padding:1.25rem;box-shadow:0 10px 30px rgba(23,32,51,.05);min-width:0}"
+        ".story-card h2{font-size:1.3rem;margin:.35rem 0 .7rem;letter-spacing:-.015em}"
+        ".story-card p{margin:.55rem 0}.story-meta{display:flex;gap:.5rem;flex-wrap:wrap;"
+        "color:var(--muted);font-size:.88rem}.story-meta span+span:before{content:'·';margin-right:.5rem}"
+        ".topic{color:var(--accent-dark);font-weight:750}.story-detail{max-width:52rem}"
+        ".story-summary{font-size:1.28rem;color:#334155}.importance{background:#eaf3fc;"
+        "border-radius:var(--radius);padding:1rem 1.25rem;margin:1.5rem 0}.importance h2{margin:.1rem 0 .4rem}"
+        ".source-link{display:inline-block;font-weight:750;margin-top:.5rem}.key-fact{background:var(--paper);"
+        "border:1px solid var(--line);border-radius:var(--radius);padding:1rem 1.25rem;margin:1rem 0}"
+        ".key-fact h3{margin:.1rem 0 .6rem}.source-details{border-top:1px solid var(--line);"
+        "margin-top:1rem;padding-top:.75rem}.source-details summary{cursor:pointer;font-weight:750;"
+        "color:var(--accent-dark)}.evidence-item{padding:.75rem 0}.evidence-item blockquote{margin:.5rem 0;"
+        "padding:.75rem 1rem;border-left:3px solid var(--accent);background:var(--wash);"
+        "overflow-wrap:anywhere}.source-meta{color:var(--muted);font-size:.9rem}"
+        ".digest-list{padding-left:1.2rem}.entry-grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem}"
+        ".entry-card{background:#172033;color:#fff;border-radius:var(--radius);padding:1.25rem}"
+        ".entry-card a{color:#9ed0ff;font-weight:750}.browse-form{display:grid;"
+        "grid-template-columns:minmax(12rem,2fr) repeat(3,minmax(9rem,1fr)) auto;gap:.75rem;"
+        "align-items:end;background:var(--paper);border:1px solid var(--line);border-radius:var(--radius);"
+        "padding:1rem;margin-bottom:1rem}.browse-form label{display:grid;gap:.35rem;font-weight:700;"
+        "font-size:.88rem}.browse-form input,.browse-form select,.browse-form button{width:100%;"
+        "min-height:2.75rem;border:1px solid #9aa7b5;border-radius:.55rem;padding:.55rem .65rem;"
+        "font:inherit}.browse-form button{background:var(--accent);color:#fff;border-color:var(--accent);"
+        "font-weight:750;cursor:pointer}.empty-state{padding:2rem;background:var(--paper);"
+        "border:1px dashed #9aa7b5;border-radius:var(--radius)}textarea,button{font:inherit}"
+        ".capability-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:1rem}"
+        ".capability-card,.research-panel,.subscription-card{background:var(--paper);border:1px solid var(--line);"
+        "border-radius:var(--radius);padding:1.25rem;box-shadow:0 10px 30px rgba(23,32,51,.05)}"
+        ".capability-card h3,.research-panel h2,.subscription-card h2{margin:.1rem 0 .55rem}"
+        ".boundary-note{margin:1.25rem 0;padding:1rem 1.25rem;border-left:4px solid var(--accent);"
+        "background:#eaf3fc;border-radius:.25rem var(--radius) var(--radius) .25rem}"
+        ".boundary-note h2{font-size:1.1rem;margin:0 0 .3rem}.boundary-note p{margin:0}"
+        ".research-examples{display:flex;gap:.65rem;flex-wrap:wrap;margin-bottom:1.5rem}"
+        ".research-example{border:1px solid #8db7df;border-radius:999px;background:#f3f8fd;color:var(--accent-dark);"
+        "padding:.55rem .8rem;font-weight:700;cursor:pointer;text-align:left}"
+        ".research-example:hover,.research-example:focus-visible{background:#dcecff;border-color:var(--accent)}"
+        ".research-panel{max-width:52rem;margin-top:1rem}#research-form{display:grid;gap:.75rem}"
+        "#research-form label{font-weight:750}#research-question{width:100%;padding:.75rem;border:1px solid #9aa7b5;"
+        "border-radius:.55rem;resize:vertical}#research-form button[type=submit]{justify-self:start;background:var(--accent);"
+        "color:#fff;border:0;border-radius:.65rem;padding:.65rem 1rem;font-weight:750;cursor:pointer}"
+        ".research-results{margin-top:1rem}.research-results p:empty,.research-results ul:empty{display:none}"
+        ".rss-address{display:block;margin:.8rem 0;padding:.75rem;background:var(--wash);border:1px solid var(--line);"
+        "border-radius:.55rem;overflow-wrap:anywhere}.rss-actions{display:flex;gap:1rem;flex-wrap:wrap;margin-top:1.5rem}"
+        "@media (max-width: 56rem){.browse-form{grid-template-columns:1fr 1fr}.browse-form button{grid-column:1/-1}}"
+        "@media (max-width: 42rem){body{padding:0 1rem 3rem}.site-nav{align-items:flex-start}"
+        ".story-grid,.entry-grid,.browse-form,.capability-grid{grid-template-columns:1fr}h1{font-size:2.45rem}"
+        ".story-card,.key-fact{padding:1rem}.nav-links{gap:.75rem}.browse-form button{grid-column:auto}}"
+        "</style></head><body>"
+        '<nav class="site-nav"><a class="brand" href="/">AI Intelligence</a>'
+        '<div class="nav-links"><a href="/">首页</a><a href="/browse">Browse</a>'
+        '<a href="/research">Research</a><a href="/rss">RSS</a></div></nav><main>'
         f"{content}</main></body></html>"
     )
 
 
-def _render_story(
-    story: PublicStory, *, headline_url: str | None = None
-) -> str:
-    headline = escape(story.headline)
-    if headline_url is not None:
-        headline = (
-            f'<a href="{escape(headline_url, quote=True)}">{headline}</a>'
-        )
-    claims = "".join(_render_claim(claim) for claim in story.claims)
+def _render_entry_points() -> str:
     return (
-        "<article>"
-        f"<h2>{headline}</h2>"
-        f"{claims}</article>"
+        '<section aria-labelledby="continue-heading"><h2 id="continue-heading">继续探索</h2>'
+        '<div class="entry-grid"><article class="entry-card"><h3>Browse</h3>'
+        '<p>按发布者、主题和日期查找已发布 Story。</p><a href="/browse">浏览知识库</a></article>'
+        '<article class="entry-card"><h3>Research</h3><p>基于已接受、已发布的依据提出问题。</p>'
+        '<a href="/research">开始 Research</a></article></div></section>'
     )
 
 
@@ -224,24 +358,94 @@ def _relative_story_url(stable_key: str) -> str:
     return f"/stories/{quote(stable_key, safe='')}"
 
 
-def _render_linked_stories(
+def _render_story_cards(
     stories: tuple[PublicStory, ...], story_url: Callable[[str], str]
 ) -> str:
     return "".join(
-        _render_story(story, headline_url=story_url(story.stable_key))
+        _render_story_card(story, headline_url=story_url(story.stable_key))
         for story in stories
     )
 
 
-def _render_claim(claim: PublicClaim) -> str:
+def _render_story_card(story: PublicStory, *, headline_url: str) -> str:
+    published = (
+        story.original_published_at.date().isoformat()
+        if story.original_published_at is not None
+        else "时间未知"
+    )
+    topic = (
+        f'<p class="topic">{escape(story.primary_topic.value)}</p>'
+        if story.primary_topic is not None
+        else ""
+    )
+    summary = (
+        f"<p>{escape(story.summary)}</p>" if story.summary is not None else ""
+    )
+    return (
+        '<article class="story-card">'
+        f"{topic}"
+        f'<h2><a href="{escape(headline_url, quote=True)}">{escape(story.headline)}</a></h2>'
+        f'{summary}<p class="story-meta">'
+        f'<span>{escape(story.publisher)}</span><span>{published}</span></p></article>'
+    )
+
+
+def _render_story_detail(story: PublicStory) -> str:
+    published = (
+        story.original_published_at.isoformat()
+        if story.original_published_at is not None
+        else "时间未知"
+    )
+    source_url = _safe_source_url(story.canonical_url)
+    source_link = (
+        f'<a class="source-link" href="{escape(source_url, quote=True)}" '
+        f'rel="noopener noreferrer">阅读 {escape(story.publisher)} 原文</a>'
+        if source_url is not None
+        else ""
+    )
+    key_facts = "".join(
+        _render_claim(claim, position=position)
+        for position, claim in enumerate(story.claims, start=1)
+    ) or '<p class="empty-state">暂无可公开的关键事实。</p>'
+    topic = (
+        f'<p class="eyebrow">{escape(story.primary_topic.value)}</p>'
+        if story.primary_topic is not None
+        else ""
+    )
+    summary = (
+        f'<p class="story-summary">{escape(story.summary)}</p>'
+        if story.summary is not None
+        else ""
+    )
+    importance = (
+        '<section class="importance"><h2>为什么重要</h2>'
+        f'<p>{escape(story.why_it_matters)}</p></section>'
+        if story.why_it_matters is not None
+        else ""
+    )
+    return (
+        '<article class="story-detail"><header class="page-header">'
+        f'{topic}<h1>{escape(story.headline)}</h1>{summary}<p class="story-meta">'
+        f'<span>{escape(story.publisher)}</span><span>原始发布时间 {published}</span></p>{source_link}'
+        f'</header>{importance}'
+        '<section aria-labelledby="facts-heading"><h2 id="facts-heading">关键事实</h2>'
+        f"{key_facts}</section></article>"
+    )
+
+
+def _render_claim(claim: PublicClaim, *, position: int) -> str:
     evidence_state = claim.evidence_state
     evidence = "".join(_render_evidence(item) for item in claim.evidence)
+    details = (
+        '<details class="source-details"><summary>来源与依据</summary>'
+        f'<p class="source-meta">{EVIDENCE_STATE_LABELS[evidence_state]}</p>{evidence}</details>'
+        if evidence
+        else '<p class="source-meta">证据不足：尚无可公开的来源依据。</p>'
+    )
     return (
-        f'<section id="claim-{claim.id}">'
-        f"<p><strong>Claim：</strong>{escape(claim.text)}</p>"
-        f'<p data-evidence-state="{evidence_state.value}">'
-        f"<strong>证据状态：</strong>{EVIDENCE_STATE_LABELS[evidence_state]}</p>"
-        f"{evidence}</section>"
+        f'<section class="key-fact" id="claim-{claim.id}" '
+        f'data-evidence-state="{evidence_state.value}"><h3>事实 {position}</h3>'
+        f"<p>{escape(claim.text)}</p>{details}</section>"
     )
 
 
@@ -250,18 +454,47 @@ def _render_evidence(evidence: PublicEvidence) -> str:
     source_link = ""
     if source_url is not None:
         source_link = (
-            "<p><strong>原文链接：</strong>"
+            "<p>"
             f'<a href="{escape(source_url, quote=True)}" rel="noopener noreferrer">'
-            f"{escape(source_url)}</a></p>"
+            f"查看 {escape(evidence.publisher)} 原文</a></p>"
         )
     role = EVIDENCE_ROLE_LABELS[evidence.role]
     relation = EVIDENCE_RELATION_LABELS[evidence.relation]
     return (
+        '<div class="evidence-item">'
         f'<blockquote id="evidence-{evidence.id}">{escape(evidence.exact_text)}</blockquote>'
-        f"<p><strong>Evidence Role：</strong>{escape(role)}</p>"
-        f"<p><strong>Evidence Relation：</strong>{escape(relation)}</p>"
-        f"<p><strong>发布者：</strong>{escape(evidence.publisher)}</p>"
-        f"{source_link}"
+        f'<p class="source-meta">{escape(evidence.publisher)} · {escape(role)} · '
+        f"{escape(relation)}</p>{source_link}</div>"
+    )
+
+
+def _render_browse_form(
+    *,
+    q: str | None,
+    publisher: str | None,
+    topic: Topic | None,
+    publication_date: date | None,
+    sources: tuple[str, ...],
+    topics: tuple[Topic, ...],
+) -> str:
+    def options(values: tuple[str, ...], selected: str | None) -> str:
+        return "".join(
+            f'<option value="{escape(value, quote=True)}"'
+            f"{' selected' if value == selected else ''}>{escape(value)}</option>"
+            for value in values
+        )
+
+    return (
+        '<form class="browse-form" method="get" action="/browse">'
+        '<label>关键词<input name="q" type="search" value="'
+        f'{escape(q or "", quote=True)}" placeholder="模型、公司或事实"></label>'
+        '<label>发布者<select name="source"><option value="">全部来源</option>'
+        f"{options(sources, publisher)}</select></label>"
+        '<label>主题<select name="topic"><option value="">全部主题</option>'
+        f"{options(tuple(item.value for item in topics), topic.value if topic else None)}</select></label>"
+        '<label>原始发布日期<input name="date" type="date" value="'
+        f'{publication_date.isoformat() if publication_date else ""}"></label>'
+        '<button type="submit">筛选</button></form>'
     )
 
 
@@ -274,24 +507,71 @@ def _safe_source_url(value: str) -> str | None:
 
 def _render_research_page() -> str:
     return r"""
-<h1>Research</h1>
-<form id="research-form">
-  <label for="research-question">问题</label>
-  <textarea id="research-question" maxlength="500" rows="4" required></textarea>
-  <button type="submit">提问</button>
-</form>
-<p id="research-status" role="status"></p>
-<p id="research-answer"></p>
-<p id="research-refusal"></p>
-<ul id="research-citations"></ul>
+<header class="page-header">
+  <p class="eyebrow">Published knowledge, cited</p>
+  <h1>Research</h1>
+  <p class="lede">从本期已发布 Story 中查找答案，并沿引用返回具体事实与原始来源。</p>
+</header>
+<section aria-labelledby="research-capabilities">
+  <h2 id="research-capabilities">支持什么</h2>
+  <div class="capability-grid">
+    <article class="capability-card">
+      <h3>已发布知识</h3>
+      <p>仅检索已接受且已发布的知识，草稿和已拒绝内容不会进入答案。</p>
+    </article>
+    <article class="capability-card">
+      <h3>可追溯依据</h3>
+      <p>答案引用已发布 Story 中的关键事实，并链接到对应依据和原始来源。</p>
+    </article>
+    <article class="capability-card">
+      <h3>明确拒答</h3>
+      <p>证据不足时会明确拒答，不用缺失的材料补写结论。</p>
+    </article>
+  </div>
+</section>
+<aside class="boundary-note">
+  <h2>边界提示</h2>
+  <p>Research 不会联网搜索；它只回答当前公开知识库能够支持的问题。</p>
+</aside>
+<section aria-labelledby="research-examples-heading">
+  <h2 id="research-examples-heading">试试这些问题</h2>
+  <div class="research-examples">
+    <button class="research-example" type="button" data-question="Anthropic 的年化营收运行率是多少？">Anthropic 的年化营收运行率是多少？</button>
+    <button class="research-example" type="button" data-question="约束感知 GPU 分配器将利用率提升到多少？">约束感知 GPU 分配器将利用率提升到多少？</button>
+    <button class="research-example" type="button" data-question="OpenAI 在俄亥俄州规划了多大规模的数据中心？">OpenAI 在俄亥俄州规划了多大规模的数据中心？</button>
+  </div>
+</section>
+<section class="research-panel" aria-labelledby="research-question-heading">
+  <h2 id="research-question-heading">如何提问</h2>
+  <p>选择一个示例或输入一个具体问题；示例只会填入文本框，提交仍由你决定。</p>
+  <form id="research-form">
+    <label for="research-question">你的问题</label>
+    <textarea id="research-question" maxlength="500" rows="4" required></textarea>
+    <button type="submit">查找答案</button>
+  </form>
+  <div class="research-results" aria-live="polite">
+    <p id="research-status" role="status"></p>
+    <p id="research-answer"></p>
+    <p id="research-refusal"></p>
+    <ul id="research-citations"></ul>
+  </div>
+</section>
 <script>
 (() => {
   const form = document.getElementById("research-form");
   const question = document.getElementById("research-question");
+  const examples = document.querySelectorAll(".research-example");
   const status = document.getElementById("research-status");
   const answer = document.getElementById("research-answer");
   const refusal = document.getElementById("research-refusal");
   const citations = document.getElementById("research-citations");
+
+  for (const button of examples) {
+    button.addEventListener("click", () => {
+      question.value = button.dataset.question;
+      question.focus();
+    });
+  }
 
   function handleEvent(block) {
     let event = "";
@@ -356,6 +636,21 @@ def _render_research_page() -> str:
 """
 
 
+def _render_rss_page() -> str:
+    return (
+        '<header class="page-header"><p class="eyebrow">Follow every edition</p>'
+        '<h1>RSS 订阅</h1><p class="lede">RSS 是供阅读器订阅的机器可读更新流。'
+        "每次发布 Digest 后，你的阅读器都能收到新一期及其 Story。</p></header>"
+        '<section class="subscription-card" aria-labelledby="rss-address-heading">'
+        '<h2 id="rss-address-heading">订阅地址</h2>'
+        "<p>将下面的地址复制到你的 RSS 阅读器。直接打开时看到 XML 文本是正常的。</p>"
+        '<code class="rss-address">/rss.xml</code>'
+        '<a class="primary-action" href="/rss.xml">打开机器可读 RSS</a></section>'
+        '<nav class="rss-actions" aria-label="RSS 后续路径">'
+        '<a href="/">返回 Digest</a><a href="/browse">前往 Browse</a></nav>'
+    )
+
+
 def _encode_sse(event: str, data: dict[str, object]) -> str:
     payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     return f"event: {event}\ndata: {payload}\n\n"
@@ -382,7 +677,7 @@ def _render_rss(
         ElementTree.SubElement(item, "link").text = digest_url(digest.publication_date)
         ElementTree.SubElement(item, "guid", isPermaLink="false").text = digest.stable_key
         ElementTree.SubElement(item, "pubDate").text = format_datetime(digest.published_at)
-        ElementTree.SubElement(item, "description").text = _render_linked_stories(
+        ElementTree.SubElement(item, "description").text = _render_story_cards(
             digest.stories, story_url
         )
 
