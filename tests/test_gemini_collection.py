@@ -69,6 +69,102 @@ class StaticResolver:
         return self.addresses
 
 
+def test_deepseek_draft_constrains_live_output_to_three_short_evidence_claims() -> None:
+    body = (
+        "The system now supports deterministic source collection for public feeds. "
+        "Every stored document keeps an immutable canonical source URL for provenance. "
+        "Draft claims cite one unique exact evidence substring from the source body."
+    )
+    document = DocumentVersion(
+        id=uuid4(),
+        candidate_id=uuid4(),
+        source_url="https://example.com/live-output-contract",
+        title="Live output contract",
+        body=body,
+        content_hash=sha256(body.encode("utf-8")).hexdigest(),
+        observed_at=datetime(2026, 8, 18, tzinfo=UTC),
+        published_at=datetime(2026, 8, 18, tzinfo=UTC),
+        published_at_raw="2026-08-18",
+    )
+    output = {
+        "headline": "多来源采集草稿采用精确证据约束",
+        "claims": [
+            {
+                "text": "系统支持确定性的公开 Feed 采集。",
+                "evidence": (
+                    "The system now supports deterministic source collection for public feeds."
+                ),
+            },
+            {
+                "text": "每个文档保存不可变的规范来源链接。",
+                "evidence": (
+                    "Every stored document keeps an immutable canonical source URL for provenance."
+                ),
+            },
+            {
+                "text": "草稿 Claim 使用来源正文中的唯一精确证据片段。",
+                "evidence": (
+                    "Draft claims cite one unique exact evidence substring from the source body."
+                ),
+            },
+        ],
+    }
+
+    def live_output_contract(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        system_prompt = payload["messages"][0]["content"]
+        constrained = all(
+            requirement in system_prompt
+            for requirement in (
+                "Return exactly 3 claims.",
+                "between 20 and 120 characters",
+                "Keep the complete JSON concise.",
+            )
+        )
+        if not constrained:
+            return httpx.Response(
+                200,
+                request=request,
+                json={
+                    "model": "deepseek-v4-pro",
+                    "choices": [
+                        {
+                            "message": {"content": '{"headline":"truncated'},
+                            "finish_reason": "length",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 1024},
+                },
+            )
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "model": "deepseek-v4-pro",
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(output, ensure_ascii=False)
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 180},
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(live_output_contract)) as client:
+        prepared = DeepSeekGeminiDraftProvider(
+            client,
+            api_key="fixture-deepseek-key",
+            sleeper=lambda _: None,
+        ).prepare(document)
+
+    assert prepared.headline == output["headline"]
+    assert len(prepared.claims) == 3
+    assert load_gemini_draft_protocol().maximum_claims == 3
+
+
 @pytest.fixture
 def gemini_database_url():
     name = f"ai_intel_gemini_{uuid4().hex}"
@@ -254,7 +350,7 @@ def test_collect_gemini_cli_keeps_one_story_when_source_revision_changes(
     } == {"deepseek:v4-pro"}
     assert {
         trace.attributes["prompt_version"] for trace in traces
-    } == {"gemini-draft-prompt-2026-08-14.v1"}
+    } == {"gemini-draft-prompt-2026-08-18.v2"}
     assert {
         trace.attributes["routing_evaluation_version"] for trace in traces
     } == {"model-routing-evaluation-2026-08-12.v1"}
