@@ -1,29 +1,29 @@
-# Documentation map
+# Documentation Map
 
-Use this page after the product overview in the repository [README](../README.md).
+Start with the repository [English README](../README.md) or [简体中文 README](../README.zh-CN.md) for the product poster and roadmap, then choose the level of detail you need.
 
-## Operate the product
+## Learning Guide
 
-- [Local MVP runbook](mvp-local-runbook.md): locked setup, local Web and scheduler lifecycle,
-  operator flow, and safe shutdown.
-- [Production runbook](mvp-production-runbook.md): immutable release bundle, private database,
-  secret files, status, backup, isolated restore, and rollback.
-- [Domain model](../CONTEXT.md): the vocabulary for Source Definitions, Documents, Stories,
-  Claims, Evidence Spans, Digests, and Research.
+- [Learning Guide](guide/README.md): a Chinese-first path from the product loop to domain objects, repository seams, editorial boundaries, and retrieval.
+- [Product loop](guide/01-product-loop.md) · [Domain and data model](guide/02-domain-and-data-model.md) · [Repository tour](guide/03-repository-tour.md) · [Agent/human boundaries](guide/04-agent-human-boundaries.md) · [Retrieval and Research](guide/05-retrieval-and-research.md)
 
-## Understand the architecture and policy
+## Product Operations
 
-- [Architecture decisions](adr/) define the current collection, evidence, retrieval, Research,
-  production, and publication boundaries.
-- [Design decisions and Future Work](adr/README.md) records the approved pre-ticket choices
-  for the v2.1-v2.2 roadmap and the evidence that would reopen them.
+- [Local MVP runbook](mvp-local-runbook.md): locked setup, local Web and scheduler lifecycle, operator flow, and safe shutdown.
+- [Production runbook](mvp-production-runbook.md): immutable release bundle, private database, secret files, status, backup, isolated restore, rollback, and production acceptance.
 
-## Secondary evidence
+## Architecture and Policy
 
-- [Research and evaluation](research/README.md) explains the reproducible tools and routes to
-  their versioned protocols and reports.
-- [Historical evidence](archive/README.md) preserves earlier delivery and retired-profile
-  provenance without treating it as current product configuration.
+- [Domain model](../CONTEXT.md): the vocabulary for Source Definitions, Documents, Stories, Claims, Evidence Spans, Digests, and Research.
+- [Architecture decisions](adr/): current collection, evidence, retrieval, Research, production, and publication boundaries.
+- [Design decisions and Future Work](adr/README.md): approved pre-ticket choices for the v2.1-v2.2 roadmap and their revisit triggers.
 
-Repository governance notes for coding agents remain under `docs/agents/`; they are maintainer
-instructions, not product or operator documentation.
+## Research and Evaluation
+
+- [Research index](research/README.md): reproducible tools, fixed protocols, qualification reports, and their safety and cost boundaries.
+
+## Archive
+
+- [Historical evidence](archive/README.md): earlier delivery and retired-profile provenance, preserved without presenting it as current runtime configuration.
+
+Repository governance notes under `docs/agents/` are maintainer instructions, not product or operator documentation.
