@@ -1,5 +1,6 @@
 {
   "version": "mvp-v2-m2-source-profiles-2026-08-17.v1",
+  "active_set_version": "mvp-v2-1-m1-active-source-profiles-2026-08-19.v1",
   "profiles": [
     {
       "host": "the-decoder.com",
@@ -33,17 +34,6 @@
       "topic_scope": ["Models", "Research", "Products and Tools", "Community", "Policy and Safety"],
       "cursor_policy": "Latest feed publication or update timestamp plus canonical URL.",
       "health_policy": "Healthy after success or empty; blocked on explicit access controls; degraded on invalid format or temporary failure."
-    },
-    {
-      "host": "aibusiness.com",
-      "publisher": "AI Business",
-      "feed_url": "https://aibusiness.com/rss.xml",
-      "allowed_hosts": ["aibusiness.com"],
-      "allowed_path_prefixes": ["/"],
-      "language": "English",
-      "topic_scope": ["Business", "Applications", "Industry and Infrastructure", "Policy and Safety"],
-      "cursor_policy": "Latest feed publication or update timestamp plus canonical URL.",
-      "health_policy": "Healthy after a body-valid success or empty; blocked when article access is challenged or no valid body is available; degraded on invalid format or temporary failure."
     },
     {
       "host": "qbitai.com",

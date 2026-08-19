@@ -1,6 +1,6 @@
 # Local MVP runbook
 
-This runbook is the supported Windows-local path for the M1 service plus the M2 five-source
+This runbook is the supported Windows-local path for the M1 service plus the current four-profile
 collector. It does not replace the existing editorial, publication, Web, or Research behavior.
 
 ## Prerequisites and process-only configuration
@@ -75,7 +75,7 @@ answer and click its Story, Claim, and Evidence links. Then ask an unrelated uns
 and verify explicit insufficient-Evidence refusal with zero citations. Run `collect-sources` again
 with the same operation key and verify the summary reports a replay and the operator views show no
 duplicate Candidate, Document Version, Story, Claim, or Evidence. Then run with a new operation key
-and unchanged Feed cursors and verify all five source results are `empty`.
+and unchanged Feed cursors and verify all four source results are `empty`.
 
 `collect-sources` is a live backfill and Provider command. Do not run it merely to validate the
 release: it requires explicit M2 live-acceptance authorization, an isolated or approved target

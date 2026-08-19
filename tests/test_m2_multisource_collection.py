@@ -116,18 +116,17 @@ def m2_database_url():
         server.drop()
 
 
-def test_source_profiles_are_exactly_the_versioned_five_host_whitelist() -> None:
+def test_source_profiles_are_exactly_the_current_four_host_whitelist() -> None:
     profiles = load_source_profiles()
 
     assert {profile.host for profile in profiles} == {
         "the-decoder.com",
         "techcrunch.com",
         "huggingface.co",
-        "aibusiness.com",
         "qbitai.com",
     }
-    assert len(profiles) == 5
-    assert len({profile.id for profile in profiles}) == 5
+    assert len(profiles) == 4
+    assert len({profile.id for profile in profiles}) == 4
     assert {profile.profile_version for profile in profiles} == {
         "mvp-v2-m2-source-profiles-2026-08-17.v1"
     }
@@ -149,15 +148,24 @@ def test_source_profiles_are_exactly_the_versioned_five_host_whitelist() -> None
     (
         (
             datetime(2026, 8, 16, 22, 0, tzinfo=UTC),
-            "m2-incremental:2026-08-17T06:00+08:00:mvp-v2-m2-source-profiles-2026-08-17.v1",
+            (
+                "m2-incremental:2026-08-17T06:00+08:00:"
+                "mvp-v2-1-m1-active-source-profiles-2026-08-19.v1"
+            ),
         ),
         (
             datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
-            "m2-incremental:2026-08-17T18:00+08:00:mvp-v2-m2-source-profiles-2026-08-17.v1",
+            (
+                "m2-incremental:2026-08-17T18:00+08:00:"
+                "mvp-v2-1-m1-active-source-profiles-2026-08-19.v1"
+            ),
         ),
         (
             datetime(2026, 8, 17, 20, 0, tzinfo=UTC),
-            "m2-incremental:2026-08-17T18:00+08:00:mvp-v2-m2-source-profiles-2026-08-17.v1",
+            (
+                "m2-incremental:2026-08-17T18:00+08:00:"
+                "mvp-v2-1-m1-active-source-profiles-2026-08-19.v1"
+            ),
         ),
     ),
 )
@@ -251,14 +259,14 @@ def test_article_adapter_extracts_sanitized_body_and_validates_canonical_url() -
         (
             (
                 "<html><head><title>Short article</title>"
-                '<link rel="canonical" href="https://aibusiness.com/short">'
+                '<link rel="canonical" href="https://the-decoder.com/short">'
                 "</head><body><article><p>Too short.</p></article></body></html>"
             ),
-            ArticleAccessBlockedError,
+            ArticleBodyInvalidError,
         ),
         (
             "<html><head><title>Wrong canonical</title>"
-            '<link rel="canonical" href="https://aibusiness.com/different">'
+            '<link rel="canonical" href="https://the-decoder.com/different">'
             "</head><body><article><p>" + ("substantive article words " * 100) + "</p>"
             "</article></body></html>",
             ArticleBodyInvalidError,
@@ -271,11 +279,11 @@ def test_article_adapter_fails_closed_for_blocked_or_invalid_pages(
     error_type: type[Exception],
 ) -> None:
     profile = next(
-        profile for profile in load_source_profiles() if profile.host == "aibusiness.com"
+        profile for profile in load_source_profiles() if profile.host == "the-decoder.com"
     )
     entry = FeedEntry(
         title="Short article",
-        canonical_url="https://aibusiness.com/short",
+        canonical_url="https://the-decoder.com/short",
         summary="This summary is discovery metadata only.",
         published_at=None,
         published_at_raw=None,
@@ -566,7 +574,7 @@ def test_techcrunch_feed_adapter_rejects_redirect_to_a_general_feed() -> None:
 
 
 @pytest.mark.postgres
-def test_five_source_collection_is_idempotent_blocked_safe_and_exactly_traceable(
+def test_four_source_profile_collection_is_idempotent_blocked_safe_and_traceable(
     m2_database_url: str,
 ) -> None:
     profiles = load_source_profiles()
@@ -615,7 +623,7 @@ def test_five_source_collection_is_idempotent_blocked_safe_and_exactly_traceable
     class FakeArticleAdapter:
         def fetch(self, profile, entry):
             article_calls.append(profile.host)
-            if profile.host == "aibusiness.com":
+            if profile.host == "huggingface.co":
                 raise ArticleAccessBlockedError("fixture access block")
             evidence = f"Exact source evidence for {profile.host}."
             return ArticleDocument(
@@ -673,17 +681,16 @@ def test_five_source_collection_is_idempotent_blocked_safe_and_exactly_traceable
     assert first.source_results == {
         "the-decoder.com": "success",
         "techcrunch.com": "success",
-        "huggingface.co": "success",
-        "aibusiness.com": "access-blocked",
+        "huggingface.co": "access-blocked",
         "qbitai.com": "success",
     }
-    assert first.document_versions_created == 4
-    assert first.drafts_created == 4
+    assert first.document_versions_created == 3
+    assert first.drafts_created == 3
     assert replay.collection_run_id == first.collection_run_id
     assert replay.replayed is True
     assert feed_calls == [profile.host for profile in profiles]
     assert article_calls == [profile.host for profile in profiles]
-    assert len(provider_calls) == 4
+    assert len(provider_calls) == 3
 
     engine = create_database_engine(m2_database_url)
     try:
@@ -741,17 +748,17 @@ def test_five_source_collection_is_idempotent_blocked_safe_and_exactly_traceable
         engine.dispose()
 
     assert counts == {
-        "source_definitions": 5,
-        "source_profile_states": 5,
+        "source_definitions": 4,
+        "source_profile_states": 4,
         "collection_runs": 1,
-        "source_definition_collection_results": 5,
-        "source_candidate_results": 5,
-        "candidates": 5,
-        "document_versions": 4,
-        "stories": 4,
-        "claims": 4,
-        "evidence_spans": 4,
-        "structured_traces": 4,
+        "source_definition_collection_results": 4,
+        "source_candidate_results": 4,
+        "candidates": 4,
+        "document_versions": 3,
+        "stories": 3,
+        "claims": 3,
+        "evidence_spans": 3,
+        "structured_traces": 3,
     }
     assert all(
         summaries[definitions[state.source_definition_id].entry_point.split("/")[2]]
@@ -776,14 +783,14 @@ def test_five_source_collection_is_idempotent_blocked_safe_and_exactly_traceable
     assert {trace.operation_key for trace in traces} == {
         f"multisource-draft:{story.id}:claim:0" for story in stories
     }
-    aibusiness_state = next(
+    blocked_state = next(
         state
         for source_id, state in states.items()
-        if definitions[source_id].publisher == "AI Business"
+        if definitions[source_id].publisher == "Hugging Face"
     )
-    assert aibusiness_state.recent_result == "access-blocked"
-    assert aibusiness_state.health == "blocked"
-    assert aibusiness_state.cursor_value is not None
+    assert blocked_state.recent_result == "access-blocked"
+    assert blocked_state.health == "blocked"
+    assert blocked_state.cursor_value is not None
 
     status_result = runner.invoke(
         app,
@@ -792,11 +799,17 @@ def test_five_source_collection_is_idempotent_blocked_safe_and_exactly_traceable
     )
     assert status_result.exit_code == 0, status_result.output
     status_payload = json.loads(status_result.output)
-    assert len(status_payload["sources"]) == 5
+    assert len(status_payload["sources"]) == 4
     status_by_host = {item["host"]: item for item in status_payload["sources"]}
-    assert status_by_host["aibusiness.com"]["recent_result"] == "access-blocked"
-    assert status_by_host["aibusiness.com"]["health"] == "blocked"
-    assert status_by_host["aibusiness.com"]["pending_drafts"] == 0
+    assert set(status_by_host) == {
+        "the-decoder.com",
+        "techcrunch.com",
+        "huggingface.co",
+        "qbitai.com",
+    }
+    assert status_by_host["huggingface.co"]["recent_result"] == "access-blocked"
+    assert status_by_host["huggingface.co"]["health"] == "blocked"
+    assert status_by_host["huggingface.co"]["pending_drafts"] == 0
     assert status_by_host["techcrunch.com"]["pending_drafts"] == 0
     assert status_by_host["techcrunch.com"]["cursor"] is not None
 
@@ -813,22 +826,21 @@ def test_five_source_collection_is_idempotent_blocked_safe_and_exactly_traceable
         "status": "partial",
         "started_at": "2026-08-17T02:00:00+00:00",
         "completed_at": "2026-08-17T02:00:00+00:00",
-        "candidates_processed": 5,
+        "candidates_processed": 4,
     }
-    assert operational["pending_reviews"] == 4
+    assert operational["pending_reviews"] == 3
     assert {
         source["host"]: source["health"] for source in operational["sources"]
     } == {
         "the-decoder.com": "healthy",
         "techcrunch.com": "healthy",
-        "huggingface.co": "healthy",
-        "aibusiness.com": "blocked",
+        "huggingface.co": "blocked",
         "qbitai.com": "healthy",
     }
 
 
 @pytest.mark.postgres
-def test_one_source_failure_yields_a_partial_run_without_losing_other_sources(
+def test_one_source_profile_failure_preserves_other_source_profile_results(
     m2_database_url: str,
 ) -> None:
     profiles = load_source_profiles()
@@ -857,8 +869,6 @@ def test_one_source_failure_yields_a_partial_run_without_losing_other_sources(
 
     class BodyAdapter:
         def fetch(self, profile, entry):
-            if profile.host == "aibusiness.com":
-                raise ArticleAccessBlockedError("fixture access block")
             evidence = f"Exact source evidence for {profile.host}."
             return ArticleDocument(
                 title=entry.title,
@@ -899,15 +909,19 @@ def test_one_source_failure_yields_a_partial_run_without_losing_other_sources(
     )
 
     assert summary.status.value == "partial"
-    assert summary.source_results["the-decoder.com"] == "temporary-failure"
-    assert summary.source_results["aibusiness.com"] == "access-blocked"
+    assert summary.source_results == {
+        "the-decoder.com": "temporary-failure",
+        "techcrunch.com": "success",
+        "huggingface.co": "success",
+        "qbitai.com": "success",
+    }
     assert summary.document_versions_created == 3
     assert summary.drafts_created == 3
 
     engine = create_database_engine(m2_database_url)
     try:
         with Session(engine) as session:
-            assert session.scalar(select(func.count()).select_from(CandidateRecord)) == 4
+            assert session.scalar(select(func.count()).select_from(CandidateRecord)) == 3
             assert (
                 session.scalar(select(func.count()).select_from(DocumentVersionRecord))
                 == 3
@@ -928,8 +942,12 @@ def test_one_source_failure_yields_a_partial_run_without_losing_other_sources(
 
     assert states["the-decoder.com"].health == "degraded"
     assert states["the-decoder.com"].cursor_value is None
-    assert states["aibusiness.com"].health == "blocked"
-    assert states["aibusiness.com"].cursor_value is not None
+    assert set(states) == {
+        "the-decoder.com",
+        "techcrunch.com",
+        "huggingface.co",
+        "qbitai.com",
+    }
     assert states["techcrunch.com"].health == "healthy"
 
 
@@ -964,8 +982,6 @@ def test_persisted_cursor_makes_a_new_incremental_operation_logically_idempotent
     class CountingArticleAdapter:
         def fetch(self, profile, entry):
             article_calls.append(profile.host)
-            if profile.host == "aibusiness.com":
-                raise ArticleAccessBlockedError("fixture access block")
             evidence = f"Exact source evidence for {profile.host}."
             return ArticleDocument(
                 title=entry.title,
@@ -1037,27 +1053,21 @@ def test_persisted_cursor_makes_a_new_incremental_operation_logically_idempotent
                         SourceDefinitionCollectionResultRecord
                     )
                 )
-                == 10
+                == 8
             )
-            assert session.scalar(select(func.count()).select_from(CandidateRecord)) == 5
+            assert session.scalar(select(func.count()).select_from(CandidateRecord)) == 4
             assert (
                 session.scalar(select(func.count()).select_from(DocumentVersionRecord))
                 == 4
             )
             assert session.scalar(select(func.count()).select_from(StoryRecord)) == 4
-            ai_business_health = session.scalar(
-                select(SourceProfileStateRecord.health)
-                .join(
-                    SourceDefinitionRecord,
-                    SourceDefinitionRecord.id
-                    == SourceProfileStateRecord.source_definition_id,
-                )
-                .where(SourceDefinitionRecord.name == "aibusiness.com")
+            active_state_count = session.scalar(
+                select(func.count()).select_from(SourceProfileStateRecord)
             )
     finally:
         engine.dispose()
 
-    assert ai_business_health == "healthy"
+    assert active_state_count == 4
 
 
 @pytest.mark.postgres
