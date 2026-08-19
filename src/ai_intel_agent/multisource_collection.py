@@ -51,13 +51,13 @@ from ai_intel_agent.persistence import (
 )
 
 SOURCE_PROFILE_VERSION = "mvp-v2-m2-source-profiles-2026-08-17.v1"
+SOURCE_PROFILE_SET_VERSION = "mvp-v2-1-m1-active-source-profiles-2026-08-19.v1"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 APPROVED_SOURCE_HOSTS = frozenset(
     {
         "the-decoder.com",
         "techcrunch.com",
         "huggingface.co",
-        "aibusiness.com",
         "qbitai.com",
     }
 )
@@ -65,7 +65,6 @@ APPROVED_FEED_URLS = {
     "the-decoder.com": "https://the-decoder.com/feed/",
     "techcrunch.com": "https://techcrunch.com/category/artificial-intelligence/feed/",
     "huggingface.co": "https://huggingface.co/blog/feed.xml",
-    "aibusiness.com": "https://aibusiness.com/rss.xml",
     "qbitai.com": "https://www.qbitai.com/feed/",
 }
 ALLOWED_ARTICLE_MIME_TYPES = frozenset({"text/html", "application/xhtml+xml"})
@@ -207,7 +206,10 @@ def scheduled_operation_key(instant: datetime) -> str:
             second=0,
             microsecond=0,
         )
-    return f"m2-incremental:{slot.isoformat(timespec='minutes')}:{SOURCE_PROFILE_VERSION}"
+    return (
+        f"m2-incremental:{slot.isoformat(timespec='minutes')}:"
+        f"{SOURCE_PROFILE_SET_VERSION}"
+    )
 
 
 class _ArticleMetadataParser(HTMLParser):
@@ -258,11 +260,20 @@ def load_source_profiles() -> tuple[SourceProfile, ...]:
         payload: Any = json.loads(resource.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise SourceProfileConfigurationError("Source Profile manifest is unreadable") from error
-    if not isinstance(payload, dict) or set(payload) != {"version", "profiles"}:
+    if not isinstance(payload, dict) or set(payload) != {
+        "version",
+        "active_set_version",
+        "profiles",
+    }:
         raise SourceProfileConfigurationError("Source Profile manifest keys do not match v1")
     version = payload["version"]
+    active_set_version = payload["active_set_version"]
     raw_profiles = payload["profiles"]
-    if version != SOURCE_PROFILE_VERSION or not isinstance(raw_profiles, list):
+    if (
+        version != SOURCE_PROFILE_VERSION
+        or active_set_version != SOURCE_PROFILE_SET_VERSION
+        or not isinstance(raw_profiles, list)
+    ):
         raise SourceProfileConfigurationError("Source Profile manifest version is invalid")
 
     required_keys = {
@@ -324,13 +335,14 @@ def load_source_profiles() -> tuple[SourceProfile, ...]:
         raise
     except (TypeError, ValueError) as error:
         raise SourceProfileConfigurationError("Source Profile manifest values are invalid") from error
+    approved_profile_count = len(APPROVED_SOURCE_HOSTS)
     if (
-        len(profiles) != 5
+        len(profiles) != approved_profile_count
         or {profile.host for profile in profiles} != APPROVED_SOURCE_HOSTS
-        or len({profile.id for profile in profiles}) != 5
+        or len({profile.id for profile in profiles}) != len(profiles)
     ):
         raise SourceProfileConfigurationError(
-            "Source Profile manifest must contain exactly the approved five hosts"
+            "Source Profile manifest must contain exactly the current four hosts"
         )
     return tuple(profiles)
 
@@ -511,10 +523,6 @@ class HttpArticleAdapter:
         ):
             raise ArticleAccessBlockedError("Article page is an access-control response")
         if not body_passes_quality_gate:
-            if profile.host == "aibusiness.com":
-                raise ArticleAccessBlockedError(
-                    "AI Business article body access is blocked"
-                )
             raise ArticleBodyInvalidError("Article body did not pass the quality gate")
         return ArticleDocument(
             title=parser.title or entry.title,
@@ -687,11 +695,11 @@ def collect_source_profiles(
     operation_key: str,
     backfill_limit: int = 5,
 ) -> MultiSourceCollectionSummary:
-    """Collect exactly the approved five profiles while isolating each source."""
+    """Collect exactly the active four profiles while isolating each source."""
     approved_profiles = load_source_profiles()
     if profiles != approved_profiles:
         raise SourceProfileConfigurationError(
-            "Collection requires the exact ordered five Source Profiles"
+            "Collection requires the exact ordered four Source Profiles"
         )
     if not operation_key.strip() or len(operation_key) > 255:
         raise ValueError("Collection operation key must be 1-255 characters")

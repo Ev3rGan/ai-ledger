@@ -314,7 +314,7 @@ def operator_source_status(
         typer.Option("--production", help="Load the M1 Docker-secret contract."),
     ] = False,
 ) -> None:
-    """Report current five-profile result, cursor, health, and pending drafts."""
+    """Report current four-profile result, cursor, health, and pending drafts."""
     try:
         database_url = _operator_database_url(production)
         profiles = load_source_profiles()
@@ -546,7 +546,7 @@ def schedule_sources(
         ),
     ] = False,
 ) -> None:
-    """Collect the five approved Source Profiles twice daily until interrupted."""
+    """Collect the four active Source Profiles twice daily until interrupted."""
     if production:
         try:
             _require_recorded_production_backfill_limit(backfill_limit)
@@ -592,7 +592,7 @@ def schedule_sources(
         return
 
     configuration = _local_mvp_configuration()
-    console.print("Five-source scheduler active at 06:00 and 18:00 Asia/Shanghai.")
+    console.print("Four-profile scheduler active at 06:00 and 18:00 Asia/Shanghai.")
     with SchedulerStopController() as stopped:
         GeminiScheduler(
             collect=lambda: _run_multisource_collection(
@@ -1092,7 +1092,7 @@ def collect_sources(
         ),
     ] = None,
 ) -> None:
-    """Collect the five approved sources and prepare budgeted DeepSeek drafts."""
+    """Collect the four active Source Profiles and prepare budgeted DeepSeek drafts."""
     requested_key = operation_key or f"m2-manual:{uuid4()}"
     try:
         if os.getenv("DEEPSEEK_API_KEY_FILE"):

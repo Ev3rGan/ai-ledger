@@ -1,6 +1,6 @@
 # Public multi-source v2 production runbook
 
-This is the supported Issue #57 M4 procedure integrating the M1 service, M2 five-source
+This is the supported Issue #57 M4 procedure integrating the M1 service, current four-profile
 collector, and M3 editorial/publication loop. It keeps the public Web behind Caddy automatic
 HTTPS and PostgreSQL reachable only on an internal Compose network. M4 does not change the
 public security boundary, allowance ledger, backup/restore, rollback, secret handling, or add an
@@ -185,27 +185,25 @@ Infrastructure ownership remains with the user. After purchasing or selecting th
 Any missing real domain/certificate, public browser path, Provider counter proof, restart
 persistence, isolated restore, rollback, or secret audit makes live M1 acceptance incomplete.
 
-## M2 live-source acceptance gate
+## Current live-source acceptance gate
 
-The bounded implementation probe on 2026-08-17 used only these public discovery URLs:
+The active Source Profile set uses only these public discovery URLs:
 
 - `https://the-decoder.com/feed/`
 - `https://techcrunch.com/category/artificial-intelligence/feed/`
 - `https://huggingface.co/blog/feed.xml`
-- `https://aibusiness.com/rss.xml`
 - `https://www.qbitai.com/feed/`
 
-All five behaved as XML/RSS Feed endpoints; representative public article reads on each approved
-host exposed substantive HTML body content through ordinary access. No login, challenge bypass,
-credentials, raw-body persistence, live database, or Provider call was used. This implementation
-probe is evidence for the common adapter shape, not live acceptance.
+The earlier implementation probe is historical evidence and included a Source Profile that is now
+retired. Its immutable baseline remains linked from the
+[historical evidence index](archive/README.md); it is not current activation policy. Ordinary
+repository validation makes no live request to the four URLs above.
 
 Do not run `collect-sources`, start a live backfill, or let the M2 Scheduler reach a collection
-slot until the supervisor explicitly authorizes `M2_LIVE_ACCEPTANCE_READY`. After authorization,
-use only the five versioned Source Profiles and record URLs, response status/behavior, counters,
-and identifiers—not raw fetched bodies or credentials. Verify TechCrunch discovery uses only its
-AI category Feed; AI Business either creates a body-valid Document Version or records
-`access-blocked`; one forced source failure leaves useful results from the other sources; and a
+slot until the supervisor explicitly authorizes the applicable live-acceptance gate. After authorization,
+use only the four active versioned Source Profiles and record URLs, response status/behavior,
+counters, and identifiers—not raw fetched bodies or credentials. Verify TechCrunch discovery uses
+only its AI category Feed; one forced source failure leaves useful results from the other sources; and a
 same-key replay plus a new-key unchanged-cursor run creates no duplicates. Run
 `operator source-status --production` before and after collection and preserve the M1 acceptance
 record above. A missing real Feed/article observation, real budgeted Provider draft, idempotency
@@ -262,7 +260,7 @@ bash deploy/m1/operate.sh operator story list --state unreviewed
 ```
 
 The combined status reports the deployed commit, database readiness, Scheduler state and next
-execution, latest multi-source Collection Run, all five source health snapshots, pending review
+execution, latest multi-source Collection Run, all four source health snapshots, pending review
 count, and latest published Digest. It never reports the database URL, credentials, source body,
 Evidence text, or Provider response.
 
@@ -297,7 +295,7 @@ public projection, not CLI prose copied into an acceptance report, are the sourc
 
 ## Bounded backfill to incremental schedule
 
-Initial backfill and subsequent scheduled collection use the same five versioned Source Profiles,
+Initial backfill and subsequent scheduled collection use the same four active Source Profiles,
 body gate, cursor, canonical identity, operation-key idempotency, and Provider budget. A backfill
 requires an explicit supervisor-approved unique operation key and a limit no greater than the
 recorded scheduled limit:
@@ -326,7 +324,8 @@ A source-level `invalid-format`, `access-blocked`, or `temporary-failure` is not
 Use combined status and logs to verify the other Source Profiles completed, public historical
 Digest/Story URLs remain available, and Research still reads only accepted published knowledge.
 Never replace a blocked article body with Feed summary text, bypass an access control, edit a
-cursor, or add a sixth source. A temporary source may retry at the next scheduled window; a
+cursor, or add any Source Profile outside the active versioned set. A temporary source may retry
+at the next scheduled window; a
 supervisor-approved manual retry must use a new recorded operation key and the bounded limit.
 
 ### Provider failure or budget refusal
@@ -388,7 +387,7 @@ values, source bodies, Evidence text, model responses, or anonymous-client ident
 M4 is incomplete until one frozen candidate proves all of the following in the same deployed
 state:
 
-- all five Feeds and the body gate, with AI Business body-valid or explicitly blocked;
+- all four active Feeds and the body gate, with no retired profile in scheduler or status output;
 - real DeepSeek draft preparation and the operator review/order/publish loop;
 - one public Digest with 8-12 real Stories from at least three Publishers;
 - anonymous HTTPS Home → Digest → Story/source, Browse, RSS, and Research;

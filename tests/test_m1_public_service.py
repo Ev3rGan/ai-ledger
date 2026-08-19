@@ -376,7 +376,7 @@ def test_private_operator_status_reports_complete_operational_snapshot(
     assert payload["scheduler"]["state"] == "waiting"
     assert payload["scheduler"]["next_run_at"] == "2026-08-18T06:00:00+00:00"
     assert payload["recent_collection"] is None
-    assert len(payload["sources"]) == 5
+    assert len(payload["sources"]) == 4
     assert all(source["health"] == "unknown" for source in payload["sources"])
     assert isinstance(payload["pending_reviews"], int)
     if payload["latest_digest"] is not None:

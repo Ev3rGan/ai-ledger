@@ -1,196 +1,188 @@
-# AI Intelligence Agent
+# AI Ledger
 
-The deterministic sample workflow persists three traceable Stories in PostgreSQL/pgvector. A
-Fake administrator accepts one Story, rejects one, leaves one unreviewed, and publishes one
-stably identified Digest containing only the accepted Story with a complete audit trail.
+AI Ledger is a public, evidence-grounded AI daily. It collects from a bounded source portfolio,
+turns body-valid documents into traceable draft Stories, keeps publication under operator
+control, and serves accepted knowledge as daily Digests, individual Stories, Browse, RSS, and
+bounded Research.
 
-## Quick start
+The repository is organized product-first. Start here for the running product and supported
+operations, then use the [documentation map](docs/README.md) for architecture and runbooks. The
+[research and evaluation](docs/research/README.md) and
+[historical evidence](docs/archive/README.md) areas are retained as secondary, indexed material.
 
-Use Python 3.12 and the repository-local locked environment:
+## What the product does
+
+The operating loop is deliberately small and auditable:
+
+1. A scheduler collects eligible entries at 06:00 and 18:00 Asia/Shanghai from versioned Source
+   Profiles. Canonical URLs, content hashes, cursors, and operation keys make retries safe.
+2. Feed text is discovery metadata only. A Story draft is prepared only after the article body
+   passes access, canonical-location, and body-quality gates.
+3. The DeepSeek draft route produces traceable Story, Claim, and exact Evidence Span candidates. It
+   cannot accept or publish them.
+4. An operator inspects each draft, accepts or rejects it, previews the dated Digest, and
+   publishes explicitly.
+5. Public pages and RSS expose only published knowledge. Research retrieves only accepted
+   knowledge, cites Story, Claim, and Evidence Span records, and refuses unsupported questions.
+
+One failed source remains isolated from the rest of a Collection Run. The system never bypasses
+login, paywall, CAPTCHA, robots, consent, or anti-bot controls, and it does not use live Web
+retrieval to answer public Research questions.
+
+## What readers see
+
+The public service exposes these stable surfaces:
+
+| Surface | Route | Reader result |
+| --- | --- | --- |
+| Home | `/` | The current published Digest, source coverage, highlights, and recent Digests |
+| Digest | `/digests/<date>` | One reviewed daily composition of accepted Stories |
+| Story | `/stories/<stable-key>` | A published Story with Claims, exact Evidence Spans, and original-source links |
+| Browse | `/browse` | Published Stories filtered by keyword, publisher, Topic, or date |
+| RSS | `/rss` and `/rss.xml` | A human-readable subscription page and machine-readable feed |
+| Research | `/research` | SSE answers grounded only in accepted knowledge, with clickable citations |
+
+The public Home page describes reader-facing intelligence. Internal Agent mechanics and operator
+controls remain in repository documentation and the private CLI.
+
+## Run it locally
+
+Use Python 3.12, Docker Desktop, PostgreSQL/pgvector through the supplied Compose boundary, and
+the repository-local locked environment:
 
 ```powershell
 uv sync --locked --python 3.12 --extra ch3
-copy .env.example .env
-```
-
-Create the PostgreSQL database named in `.env`, then apply the baseline migration:
-
-```powershell
-uv run alembic upgrade head
-uv run ai-intel-agent run --sample
-```
-
-For the complete local MVP, have the supervising PowerShell process inject only
-`AI_INTEL_DATABASE_URL` and `DEEPSEEK_API_KEY`, then run:
-
-```powershell
 uv run ai-intel-agent start-local
 ```
 
-This one foreground command starts loopback PostgreSQL/pgvector through Docker Compose, applies
-all migrations, and owns the formal Web server plus Gemini collection scheduler at 06:00 and
-18:00 Asia/Shanghai. Press `Ctrl+C` for safe shutdown; the database volume is retained. See the
-[`Local MVP runbook`](docs/mvp-local-runbook.md) for process-only configuration, operator CLI
-steps, public URLs, and the required live acceptance record. The local-start path does not load
-credentials from `.env`.
+Before `start-local`, inject `AI_INTEL_DATABASE_URL` and `DEEPSEEK_API_KEY` into the supervising
+process. Do not place credentials in tracked files or command arguments. The command starts the
+loopback database, migrates to the sole Alembic head, then owns the local Web and twice-daily
+source scheduler until `Ctrl+C`. See the [local runbook](docs/mvp-local-runbook.md) for the exact
+process boundary, URLs, shutdown behavior, and acceptance procedure.
 
-For the versioned one-Linux-host production boundary, use the
-[`MVP M1 production runbook`](docs/mvp-production-runbook.md). It records an immutable application
-image digest, Caddy automatic HTTPS, private PostgreSQL, Docker-secret files, independent Web and
-singleton Scheduler services, rotated logs, scheduled backup/isolated restore, persistent
-anonymous Research allowance, and fixed-version rollback. Live host, DNS, domain, firewall, and
-Provider acceptance remain explicit user-controlled actions.
-
-The sample uses a fixed Asia/Shanghai clock, fixed source data, and deterministic identifiers.
-Running it again leaves one corresponding set of records, one Digest, four audit events, and the
-same report.
-
-Audit the versioned first-wave Source Definitions without network access or production
-credentials:
+For a provider-free deterministic smoke run against a configured PostgreSQL database:
 
 ```powershell
-uv run ai-intel-agent audit-sources --output reports\source-activation-audit.md
+uv run alembic upgrade head
+uv run ai-intel-agent run --sample --output reports\daily.md
 ```
 
-The audit records each official entry point, language and Topic scope, robots and terms
-findings, private-storage and public-excerpt policy, pause conditions, and a conservative
-activation conclusion. Refresh the underlying evidence before activating a Source Definition
-whose conclusion is `needs-verification`.
+Generated `reports/*.md` files are local artifacts and are ignored by Git.
 
-Add `FIRECRAWL_API_KEY` and `TAVILY_API_KEY` to the untracked `.env`, install Chromium once,
-then run the live versioned Document extraction benchmark over the fixed 60-URL corpus:
+## Operator workflow
+
+Keep the service running and use the same commit and database for collection, review, and
+publication:
 
 ```powershell
-uv run playwright install chromium
-uv run ai-intel-agent benchmark-extraction --output reports\document-extraction-benchmark.md
+uv run ai-intel-agent operator status
+uv run ai-intel-agent operator source-status
+uv run ai-intel-agent collect-sources --operation-key <recorded-key>
+uv run ai-intel-agent story list
+uv run ai-intel-agent story show <stable-key>
+uv run ai-intel-agent story accept <stable-key> `
+  --summary <reviewed-summary> --why-it-matters <reviewed-significance> `
+  --topic <Topic> --actor <operator>
+uv run ai-intel-agent story reject <stable-key> --actor <operator>
+uv run ai-intel-agent digest preview --date <Asia-Shanghai-date> `
+  --story <first-key> --story <second-key>
+uv run ai-intel-agent digest publish --date <Asia-Shanghai-date> `
+  --introduction <reviewed-introduction> `
+  --story <first-key> --story <second-key> --actor <operator>
 ```
 
-The benchmark compares HTTP plus Trafilatura, Playwright plus Trafilatura, Firecrawl, and
-Tavily across body extraction, body completeness, metadata, noise, provenance anchoring,
-repeatability, reliability, latency, and cost. Each URL/path pair runs twice by default.
-Provider calls use credits; raw extracted bodies stay in memory and are not written to the
-report. The command recommends at most one managed fallback and keeps rewritten extractor
-output ineligible for Evidence. It does not activate production Source Definitions or
-Collection Runs.
+`collect-sources` is a live source and Provider operation. Run it only against an authorized
+database with an approved Provider budget. The [production runbook](docs/mvp-production-runbook.md)
+defines the secret-file contract, immutable release bundle, backup, rollback, and production
+operator commands.
 
-Add `DEEPSEEK_API_KEY` and a Kimi China-platform `KIMI_API_KEY` to `.env`, then run the
-standalone model-routing evaluation over the frozen, human-approved corpus:
+### Current source boundary
 
-```powershell
-uv run ai-intel-agent evaluate-model-routes --output reports\model-routing-evaluation.md
+The twice-daily multi-source scheduler currently activates four Source Profiles: THE DECODER,
+TechCrunch AI, Hugging Face Blog, and QbitAI. Gemini API Release Notes remain supported through
+the dedicated Gemini collection path. AI Business is retired from active profiles, scheduling,
+status output, and site-specific handling; 36kr is not active.
+
+The approved v2.1-v2.2 target portfolio is eight active Source Definitions: Gemini API Release
+Notes, THE DECODER, TechCrunch AI, Hugging Face Blog, QbitAI, OpenAI News through its official
+News/RSS boundary, GitHub Trending as a Community Signal, and Hugging Face Daily Papers through
+the official Hub interface. Machine Heart is a ninth conditional definition and stays disabled
+until a formally authorized entry point exists. Later milestones must activate that target
+incrementally; this milestone adds no source.
+
+Whitelisting permits only a bounded acquisition attempt at the approved entry point. It never
+permits authentication, challenge bypass, arbitrary crawling, or treating Community Signals as
+factual support.
+
+### Agent responsibilities
+
+- The collection path applies deterministic source, access, body-quality, idempotency, and
+  provenance rules; the DeepSeek route prepares drafts but cannot accept or publish them.
+- The human operator owns Story acceptance/rejection, Digest ordering, and publication.
+- The public Research path uses one bounded Provider route over accepted knowledge only and must
+  cite or refuse.
+- A later Editorial Agent will prepare one complete versioned Digest Plan. It will not publish;
+  one administrator approval of the exact plan remains required.
+
+## Architecture and decisions
+
+```text
+approved sources -> Scheduler -> PostgreSQL/pgvector <- Operator CLI
+                                |                       |
+                                v                       v
+                    draft Story/Claim/Evidence Span -> accepted Digest
+                                |                       |
+                                +---- Web + RSS --------+
+                                         |
+                                  accepted-only Research
 ```
 
-The command compares the versioned DeepSeek V4 Flash, DeepSeek V4 Pro, and Kimi K2.6
-candidates on classification, Chinese summarization, Claim verification, simple questions,
-and complex reasoning. Every case applies strict structure, factual, citation, and abstention
-gates before comparing quality, latency, and token-based cost. A failed critical gate makes a
-candidate ineligible regardless of aggregate score. Model IDs, endpoints, thinking routes,
-prices, the CNY-to-USD evaluation conversion, human-approval provenance, prompt, output schema,
-retry policy, route ranking, per-task token limits, per-run cost budget, and gold criteria are
-versioned inputs. Eligible candidates rank by quality, then cost, then latency, preserving
-DeepSeek as the economical default when quality is tied. The command checks the worst-case
-request budget before making any provider call; provider invoices remain authoritative. This
-evaluation does not connect any model to the production application.
+Production runs on one versioned Linux-host bundle: Caddy owns public HTTPS; separate Web and
+singleton Scheduler services share private PostgreSQL/pgvector; backup and isolated restore stay
+off the public network; Docker secret files hold credentials; rollback activates the previous
+immutable application bundle without rewriting publication history.
 
-The frozen v1 corpus is an initial route smoke evaluation: classification, Chinese
-summarization, Claim verification, and complex reasoning each have one case, while simple
-questions have two. A single failed case therefore makes its whole task route ineligible. The
-complex-reasoning case measures application of the approved routing policy; it does not measure
-general complex-reasoning ability. Treat recommendations as project-specific starting routes,
-not broad model-capability conclusions.
+Use the [domain model](CONTEXT.md), existing [architecture decisions](docs/adr/),
+[local runbook](docs/mvp-local-runbook.md), and
+[production runbook](docs/mvp-production-runbook.md) for implementation and operations.
 
-Benchmark the three Hong Kong runtime candidates with the same representative container and
-fixed mainland observer. Build and run the workload using
-`docker/runtime-benchmark.Dockerfile`, then capture one versioned JSON artifact per candidate:
+### Design decisions and Future Work
 
-```powershell
-uv run ai-intel-agent benchmark-runtime probe --help
-uv run ai-intel-agent benchmark-runtime compare --help
-```
+The [decision index](docs/adr/README.md) contains concise, approved pre-ticket records for:
 
-The probe covers public HTTPS and SSE, node-side source, model API, and OAuth egress, a bounded
-CPU/memory/disk and PostgreSQL dump/restore workload, and dated cost evidence. It sends no model credentials or
-billed model requests. The comparator requires all three configured candidates to use the same
-protocol, workload and database image SHA-256 values, and observer before it emits a report or recommendation. See
-[`docs/research/hong-kong-runtime-benchmark-protocol-2026-08-13.md`](docs/research/hong-kong-runtime-benchmark-protocol-2026-08-13.md)
-for the complete reproducible procedure.
-Run the standalone CPU calibration over the fixed synthetic bilingual retrieval corpus and
-export a loadable, versioned Retrieval Profile:
+- [Editorial planning and one explicit approval](docs/adr/0007-editorial-approval-boundary.md)
+- [The focused source portfolio and retired entries](docs/adr/0008-source-portfolio-boundary.md)
+- [Deferring event-level semantic deduplication](docs/adr/0009-event-level-semantic-deduplication.md)
+- [MiniLM Hybrid retrieval and the sole mMARCO reranker](docs/adr/0010-minilm-mmarco-retrieval.md)
 
-```powershell
-uv run --extra retrieval ai-intel-agent calibrate-retrieval `
-  --output reports\retrieval-calibration.md `
-  --profile-output src\ai_intel_agent\data\retrieval_profile.v1.json
-```
+Near-term delivery follows Parent #69: M2 completes the focused source portfolio, M3 adds the
+complete Digest Plan and one-approval flow, M4 adds MiniLM Hybrid retrieval plus mMARCO with an
+explicit fallback, and M5 adds comparison, timeline, and bounded multi-hop Research. Each
+milestone requires deterministic local validation before exact-merge-SHA production acceptance.
 
-The first run downloads the versioned FastEmbed 0.8 ONNX candidates. The calibration compares
-two multilingual Embeddings, a Chinese/English BGE Reranker plus a no-Reranker control, two
-type-aware Chunk profiles, and two weighted reciprocal-rank fusion profiles. It reports
-cross-language Recall@5, exact technical-Entity Recall@5, exact anchored Evidence Span
-Recall@5, offline index-preparation throughput, concurrent three-channel query latency, model
-load time, logical CPU count, configured threads, and calibration-process RSS. Every recall
-threshold must pass before quality, latency, or resource measurements can select a candidate;
-process RSS is run-level diagnostic data and is not used as a candidate-comparable score.
+## Research, evaluation, and historical evidence
 
-The packaged v1 corpus is a small-scale, project-specific smoke-calibration set approved by the
-administrator over its exact fixtures SHA-256. The command fails before loading models when the
-approval metadata is absent or does not match the current Documents, Evidence Spans, and query
-gold labels.
-
-The packaged v1 Profile is a replaceable calibration result, not a permanent architecture
-decision. It does not change Browse or Research behavior, touch the application database, or
-add a vector database. Chunks remain rebuildable retrieval artifacts and never become Evidence.
+Research tools, fixed corpora, benchmark protocols, and their safety/cost boundaries are indexed
+under [docs/research/README.md](docs/research/README.md). Earlier source audits, extraction and
+model-route studies, runtime qualification, calibration evidence, and retired-profile provenance
+remain discoverable through [docs/archive/README.md](docs/archive/README.md). They support current
+decisions but are not the product landing page or current runtime configuration.
 
 ## Verification
 
-The dev environment bundles an isolated PostgreSQL/pgvector test server. The acceptance test
-starts it, applies the migration, invokes the CLI twice, and removes its data afterward. Set
-`TEST_DATABASE_URL` only when you want the same test to use an existing disposable database.
+From the repository root:
 
 ```powershell
 uv run --extra dev pytest
 uv run --extra dev ruff check .
+uv lock --check
+uv run alembic heads
 uv run ai-intel-agent run --sample --output reports\daily.md
-uv run ai-intel-agent audit-sources --output reports\source-activation-audit.md
 ```
 
-Run `benchmark-extraction` separately when a live, credit-consuming benchmark refresh is
-intended. Run `evaluate-model-routes` separately when a live, token-billed model evaluation
-refresh is intended. Run `calibrate-retrieval` separately when a CPU/model-cache-specific
-Retrieval Profile refresh is intended.
-
-The sample slice intentionally does not include Web pages, RSS, real GitHub OAuth, real sources,
-post-publication revisions, production model-provider integration, or placeholder tables for
-later work.
-
-## Repository layout
-
-```text
-src/ai_intel_agent/
-  domain.py       # persistence-independent domain records
-  editorial.py    # deterministic Story review and Digest publication workflow
-  sample.py       # fixed clock, fake source adapter, and sample data
-  persistence.py  # SQLAlchemy mappings and idempotent repository
-  pipeline.py     # application operation
-  source_audit.py # versioned first-wave Source Definition activation audit
-  extraction_corpus.py # fixed 60-URL benchmark corpus
-  extraction_benchmark.py # fixed-corpus Document extraction benchmark
-  model_routing_evaluation.py # frozen-corpus DeepSeek/Kimi route evaluation
-  runtime_benchmark.py # fixed Hong Kong node probes and comparison
-  runtime_workload.py # token-protected representative container workload
-  data/model_routing_evaluation.v1.json # human-approved gold cases and gates
-  data/model_routing_candidates.v1.json # versioned models, endpoints, and prices
-  data/model_routing_protocol.v1.json # versioned prompt, schema, retries, and budgets
-  data/retrieval_calibration_corpus.v1.json # fixed bilingual retrieval corpus
-  data/retrieval_candidates.v1.json # versioned CPU candidate matrix and thresholds
-  data/retrieval_profile.v1.json # selected loadable Retrieval Profile
-  retrieval_calibration.py # fixed-corpus Retrieval Profile calibration
-  cli.py          # supported CLI transport
-alembic/          # clean PostgreSQL/pgvector baseline migration
-tests/            # CLI-to-database acceptance test
-docker/runtime-benchmark.Dockerfile # benchmark-only workload image
-docker/runtime-benchmark.compose.yml # representative workload plus PostgreSQL
-```
+Live source collection, real Provider calls, public Browser checks, and production deployment are
+separate authorized acceptance actions, not ordinary repository verification.
 
 ## License
 
