@@ -63,7 +63,7 @@ Create a dedicated host group with numeric GID 10001, then set the directory and
 services which need a mounted secret; each service receives only its own required secret files.
 Do not print their contents during setup or acceptance.
 
-Set `AI_INTEL_PROVIDER_MONTHLY_BUDGET_CENTS` no higher than `10000`. Set
+Set `AI_INTEL_PROVIDER_MONTHLY_BUDGET_CENTS` no higher than `11500`. Set
 `AI_INTEL_PROVIDER_REQUEST_RESERVATION_CENTS` to a conservative upper bound for one request using
 the current Provider price and configured maximum tokens. Web and Scheduler atomically reserve
 that amount in the same PostgreSQL monthly ledger before every request attempt. The ledger never
