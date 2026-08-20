@@ -3,12 +3,11 @@ from __future__ import annotations
 import json
 import posixpath
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from html.parser import HTMLParser
-from importlib.resources import files
-from typing import Any, Protocol
+from typing import Protocol
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo
@@ -23,12 +22,9 @@ from ai_intel_agent.domain import (
     CollectionRun,
     CollectionRunStatus,
     DocumentVersion,
-    SourceCandidateCollectionResult,
     SourceDefinitionCollectionResult,
     SourceDefinitionCollectionStatus,
     SourceProfileHealth,
-    SourceProfileState,
-    Topic,
 )
 from ai_intel_agent.feed_acquisition import (
     BoundedPublicHttpsError,
@@ -48,6 +44,19 @@ from ai_intel_agent.persistence import (
     GeminiDraftRepository,
     MultiSourceCollectionRepository,
     create_database_engine,
+)
+from ai_intel_agent.source_portfolio import (
+    CORE_PROFILE_KEYS,
+    SourcePortfolioDefinition,
+    SourceProfile,
+    load_legacy_article_profiles,
+    load_source_universe,
+)
+from ai_intel_agent.source_portfolio_acquisition import (
+    SourceAcquisition,
+    SourcePortfolioAcquisitionError,
+    SourcePortfolioItemResult,
+    SourceSpecificRecord,
 )
 
 SOURCE_PROFILE_VERSION = "mvp-v2-m2-source-profiles-2026-08-17.v1"
@@ -102,25 +111,37 @@ TRACKING_QUERY_KEYS = frozenset({"fbclid", "gclid", "ref", "source"})
 
 
 @dataclass(frozen=True)
-class SourceProfile:
-    id: UUID
-    profile_version: str
-    host: str
-    publisher: str
-    feed_url: str
-    allowed_hosts: tuple[str, ...]
-    allowed_path_prefixes: tuple[str, ...]
-    language: str
-    topic_scope: tuple[Topic, ...]
-    cursor_policy: str
-    health_policy: str
-
-
-@dataclass(frozen=True)
 class ArticleDocument:
     title: str
     canonical_url: str
     body: str
+
+
+@dataclass(frozen=True)
+class PersistableArticleResult:
+    source_definition_id: UUID
+    candidate: Candidate
+    status: ArticleCollectionStatus
+    evidence_eligible: bool
+    eligibility_kind: str
+    document_version: DocumentVersion | None = None
+    source_record: SourceSpecificRecord | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+
+    def __post_init__(self) -> None:
+        body_valid = self.status is ArticleCollectionStatus.BODY_VALID
+        errors_absent = self.error_code is None and self.error_message is None
+        errors_present = self.error_code is not None and self.error_message is not None
+        if (
+            self.evidence_eligible != body_valid
+            or (self.document_version is not None) != body_valid
+            or self.eligibility_kind
+            != ("body-valid" if body_valid else "ineligible")
+            or (body_valid and not errors_absent)
+            or (not body_valid and not errors_present)
+        ):
+            raise ValueError("Article result Evidence policy is invalid")
 
 
 @dataclass(frozen=True)
@@ -132,6 +153,21 @@ class MultiSourceCollectionSummary:
     document_versions_created: int
     drafts_created: int
     replayed: bool
+    core_results_persisted: int = 0
+    core_eligible_contributors: int = 0
+    core_acceptance_met: bool = False
+
+
+@dataclass(frozen=True)
+class PortfolioSourceState:
+    source_definition_id: UUID
+    recent_result: SourceDefinitionCollectionStatus
+    cursor_value: str | None
+    health: SourceProfileHealth
+    consecutive_failures: int
+    last_collection_run_id: UUID
+    updated_at: datetime
+    pause_state: str
 
 
 class Clock(Protocol):
@@ -148,6 +184,19 @@ class ArticleAdapter(Protocol):
 
 class DraftProvider(Protocol):
     def prepare(self, document: DocumentVersion) -> PreparedDraft: ...
+
+
+class SourcePortfolioAdapter(Protocol):
+    def acquire(
+        self,
+        profile: SourceProfile,
+        *,
+        observed_at: datetime,
+        backfill_limit: int,
+        cursor_value: str | None,
+        known_paper_identities: frozenset[tuple[str, str]],
+        known_signal_targets: frozenset[str],
+    ) -> SourceAcquisition: ...
 
 
 class SourceProfileConfigurationError(ValueError):
@@ -255,96 +304,28 @@ class _ArticleMetadataParser(HTMLParser):
 
 
 def load_source_profiles() -> tuple[SourceProfile, ...]:
-    resource = files("ai_intel_agent").joinpath("data/source_profiles.v1.json")
-    try:
-        payload: Any = json.loads(resource.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise SourceProfileConfigurationError("Source Profile manifest is unreadable") from error
-    if not isinstance(payload, dict) or set(payload) != {
-        "version",
-        "active_set_version",
-        "profiles",
-    }:
-        raise SourceProfileConfigurationError("Source Profile manifest keys do not match v1")
-    version = payload["version"]
-    active_set_version = payload["active_set_version"]
-    raw_profiles = payload["profiles"]
+    profiles = tuple(
+        replace(
+            profile,
+            id=uuid5(
+                NAMESPACE_URL,
+                f"ai-intel-agent:source-profile:{SOURCE_PROFILE_VERSION}:{profile.host}",
+            ),
+            profile_version=SOURCE_PROFILE_VERSION,
+        )
+        for profile in load_legacy_article_profiles()
+    )
     if (
-        version != SOURCE_PROFILE_VERSION
-        or active_set_version != SOURCE_PROFILE_SET_VERSION
-        or not isinstance(raw_profiles, list)
-    ):
-        raise SourceProfileConfigurationError("Source Profile manifest version is invalid")
-
-    required_keys = {
-        "host",
-        "publisher",
-        "feed_url",
-        "allowed_hosts",
-        "allowed_path_prefixes",
-        "language",
-        "topic_scope",
-        "cursor_policy",
-        "health_policy",
-    }
-    profiles: list[SourceProfile] = []
-    try:
-        for raw_profile in raw_profiles:
-            if not isinstance(raw_profile, dict) or set(raw_profile) != required_keys:
-                raise SourceProfileConfigurationError(
-                    "Source Profile manifest profile keys do not match v1"
-                )
-            if (
-                not isinstance(raw_profile["allowed_hosts"], list)
-                or not all(
-                    isinstance(item, str) for item in raw_profile["allowed_hosts"]
-                )
-                or not isinstance(raw_profile["allowed_path_prefixes"], list)
-                or not all(
-                    isinstance(item, str)
-                    for item in raw_profile["allowed_path_prefixes"]
-                )
-                or not isinstance(raw_profile["topic_scope"], list)
-                or not all(isinstance(item, str) for item in raw_profile["topic_scope"])
-            ):
-                raise SourceProfileConfigurationError(
-                    "Source Profile manifest lists are invalid"
-                )
-            host = str(raw_profile["host"]).casefold()
-            profile = SourceProfile(
-                id=uuid5(
-                    NAMESPACE_URL,
-                    f"ai-intel-agent:source-profile:{version}:{host}",
-                ),
-                profile_version=version,
-                host=host,
-                publisher=str(raw_profile["publisher"]),
-                feed_url=str(raw_profile["feed_url"]),
-                allowed_hosts=tuple(
-                    str(item).casefold() for item in raw_profile["allowed_hosts"]
-                ),
-                allowed_path_prefixes=tuple(raw_profile["allowed_path_prefixes"]),
-                language=str(raw_profile["language"]),
-                topic_scope=tuple(Topic(item) for item in raw_profile["topic_scope"]),
-                cursor_policy=str(raw_profile["cursor_policy"]),
-                health_policy=str(raw_profile["health_policy"]),
-            )
-            _validate_profile(profile)
-            profiles.append(profile)
-    except SourceProfileConfigurationError:
-        raise
-    except (TypeError, ValueError) as error:
-        raise SourceProfileConfigurationError("Source Profile manifest values are invalid") from error
-    approved_profile_count = len(APPROVED_SOURCE_HOSTS)
-    if (
-        len(profiles) != approved_profile_count
+        len(profiles) != len(APPROVED_SOURCE_HOSTS)
         or {profile.host for profile in profiles} != APPROVED_SOURCE_HOSTS
         or len({profile.id for profile in profiles}) != len(profiles)
     ):
         raise SourceProfileConfigurationError(
             "Source Profile manifest must contain exactly the current four hosts"
         )
-    return tuple(profiles)
+    for profile in profiles:
+        _validate_profile(profile)
+    return profiles
 
 
 def _validate_profile(profile: SourceProfile) -> None:
@@ -690,16 +671,23 @@ def collect_source_profiles(
     profiles: tuple[SourceProfile, ...],
     feed_adapter: FeedDiscoveryAdapter,
     article_adapter: ArticleAdapter,
+    portfolio_adapter: SourcePortfolioAdapter | None = None,
     provider: DraftProvider,
     clock: Clock,
     operation_key: str,
     backfill_limit: int = 5,
 ) -> MultiSourceCollectionSummary:
-    """Collect exactly the active four profiles while isolating each source."""
-    approved_profiles = load_source_profiles()
-    if profiles != approved_profiles:
+    """Collect the approved source universe while isolating every profile."""
+    legacy_profiles = load_source_profiles()
+    universe_profiles = load_source_universe()
+    is_source_universe = profiles == universe_profiles
+    if profiles != legacy_profiles and not is_source_universe:
         raise SourceProfileConfigurationError(
-            "Collection requires the exact ordered four Source Profiles"
+            "Collection requires an exact approved ordered Source Profile set"
+        )
+    if is_source_universe and portfolio_adapter is None:
+        raise SourceProfileConfigurationError(
+            "The source universe requires the approved portfolio adapters"
         )
     if not operation_key.strip() or len(operation_key) > 255:
         raise ValueError("Collection operation key must be 1-255 characters")
@@ -711,6 +699,9 @@ def collect_source_profiles(
         repository = MultiSourceCollectionRepository(engine)
         existing = repository.operation(operation_key)
         if existing is not None:
+            core_results, core_contributors = repository.acceptance_counts(
+                existing.collection_run_id
+            )
             return MultiSourceCollectionSummary(
                 collection_run_id=existing.collection_run_id,
                 status=CollectionRunStatus(existing.status),
@@ -719,6 +710,11 @@ def collect_source_profiles(
                 document_versions_created=0,
                 drafts_created=0,
                 replayed=True,
+                core_results_persisted=core_results,
+                core_eligible_contributors=core_contributors,
+                core_acceptance_met=(
+                    core_results == len(CORE_PROFILE_KEYS) and core_contributors >= 6
+                ),
             )
 
         source_definitions = tuple(_source_definition(profile) for profile in profiles)
@@ -732,13 +728,100 @@ def collect_source_profiles(
             raise ValueError("Collection clock must be timezone-aware")
         run_id = uuid4()
         source_results: list[SourceDefinitionCollectionResult] = []
-        candidate_results: list[SourceCandidateCollectionResult] = []
-        states: list[SourceProfileState] = []
+        candidate_results: list[
+            PersistableArticleResult | SourcePortfolioItemResult
+        ] = []
+        states: list[PortfolioSourceState] = []
         valid_documents: list[tuple[Candidate, DocumentVersion]] = []
+        known_paper_identities = set(repository.known_paper_identities())
+        known_signal_targets = set(repository.known_signal_targets())
 
         for profile in profiles:
             previous_cursor = cursor_values.get(profile.id)
             previous_state = previous_states.get(profile.id)
+            previous_failures = (
+                previous_state.consecutive_failures
+                if previous_state is not None
+                else 0
+            )
+            if not profile.enabled:
+                status = SourceDefinitionCollectionStatus.EMPTY
+                source_results.append(_source_result(profile, status, candidate_count=0))
+                states.append(
+                    _source_state(
+                        profile,
+                        run_id=run_id,
+                        status=status,
+                        cursor_value=previous_cursor,
+                        updated_at=clock.now(),
+                        previous_failures=previous_failures,
+                    )
+                )
+                continue
+            if profile.adapter != "shared-feed-html":
+                assert portfolio_adapter is not None
+                try:
+                    acquisition = portfolio_adapter.acquire(
+                        profile,
+                        observed_at=observed_at,
+                        backfill_limit=backfill_limit,
+                        cursor_value=previous_cursor,
+                        known_paper_identities=frozenset(known_paper_identities),
+                        known_signal_targets=frozenset(known_signal_targets),
+                    )
+                except SourcePortfolioAcquisitionError as error:
+                    status = SourceDefinitionCollectionStatus(error.code)
+                    source_results.append(
+                        _source_result(profile, status, candidate_count=0)
+                    )
+                    states.append(
+                        _source_state(
+                            profile,
+                            run_id=run_id,
+                            status=status,
+                            cursor_value=previous_cursor,
+                            updated_at=clock.now(),
+                            previous_failures=previous_failures,
+                        )
+                    )
+                    continue
+                candidate_results.extend(acquisition.items)
+                status = (
+                    SourceDefinitionCollectionStatus.SUCCESS
+                    if acquisition.items
+                    else SourceDefinitionCollectionStatus.EMPTY
+                )
+                source_results.append(
+                    _source_result(
+                        profile,
+                        status,
+                        candidate_count=len(acquisition.items),
+                    )
+                )
+                for item in acquisition.items:
+                    if item.evidence_eligible and item.document_version is not None:
+                        valid_documents.append((item.candidate, item.document_version))
+                    record = item.source_record
+                    if record.record_kind == "paper":
+                        known_paper_identities.add(
+                            (record.external_id, record.external_version)
+                        )
+                    if record.record_kind in {
+                        "community-signal",
+                        "github-trending",
+                    }:
+                        known_signal_targets.add(record.canonical_url)
+                states.append(
+                    _source_state(
+                        profile,
+                        run_id=run_id,
+                        status=status,
+                        cursor_value=acquisition.cursor_value or previous_cursor,
+                        updated_at=clock.now(),
+                        previous_failures=previous_failures,
+                    )
+                )
+                continue
             try:
                 entries = feed_adapter.discover(profile)
                 for entry in entries:
@@ -761,11 +844,7 @@ def collect_source_profiles(
                         status=status,
                         cursor_value=previous_cursor,
                         updated_at=clock.now(),
-                        previous_failures=(
-                            previous_state.consecutive_failures
-                            if previous_state is not None
-                            else 0
-                        ),
+                        previous_failures=previous_failures,
                     )
                 )
                 continue
@@ -781,16 +860,12 @@ def collect_source_profiles(
                         status=status,
                         cursor_value=previous_cursor,
                         updated_at=clock.now(),
-                        previous_failures=(
-                            previous_state.consecutive_failures
-                            if previous_state is not None
-                            else 0
-                        ),
+                        previous_failures=previous_failures,
                     )
                 )
                 continue
 
-            profile_candidate_results: list[SourceCandidateCollectionResult] = []
+            profile_candidate_results: list[PersistableArticleResult] = []
             invalid_metadata_count = 0
             for entry in selected_entries:
                 try:
@@ -823,19 +898,23 @@ def collect_source_profiles(
                         article,
                         observed_at=observed_at,
                     )
-                    result = SourceCandidateCollectionResult(
+                    result = PersistableArticleResult(
                         source_definition_id=profile.id,
                         candidate=candidate,
                         status=ArticleCollectionStatus.BODY_VALID,
+                        evidence_eligible=True,
+                        eligibility_kind="body-valid",
                         document_version=document,
                     )
                     valid_documents.append((candidate, document))
                 except ArticleAcquisitionError as error:
                     article_status = ArticleCollectionStatus(error.code)
-                    result = SourceCandidateCollectionResult(
+                    result = PersistableArticleResult(
                         source_definition_id=profile.id,
                         candidate=candidate,
                         status=article_status,
+                        evidence_eligible=False,
+                        eligibility_kind="ineligible",
                         error_code=article_status.value,
                         error_message=_article_error_message(article_status),
                     )
@@ -873,11 +952,7 @@ def collect_source_profiles(
                     status=status,
                     cursor_value=next_cursor,
                     updated_at=clock.now(),
-                    previous_failures=(
-                        previous_state.consecutive_failures
-                        if previous_state is not None
-                        else 0
-                    ),
+                    previous_failures=previous_failures,
                 )
             )
 
@@ -904,6 +979,9 @@ def collect_source_profiles(
             existing = repository.operation(operation_key)
             if existing is None:
                 raise RuntimeError("Concurrent Collection Run could not be loaded")
+            core_results, core_contributors = repository.acceptance_counts(
+                existing.collection_run_id
+            )
             return MultiSourceCollectionSummary(
                 collection_run_id=existing.collection_run_id,
                 status=CollectionRunStatus(existing.status),
@@ -912,6 +990,11 @@ def collect_source_profiles(
                 document_versions_created=0,
                 drafts_created=0,
                 replayed=True,
+                core_results_persisted=core_results,
+                core_eligible_contributors=core_contributors,
+                core_acceptance_met=(
+                    core_results == len(CORE_PROFILE_KEYS) and core_contributors >= 6
+                ),
             )
 
         drafts_created = 0
@@ -938,56 +1021,83 @@ def collect_source_profiles(
             if draft_repository.persist(story, claims, evidence_spans, traces):
                 drafts_created += 1
 
+        core_results = sum(
+            profile.acceptance_group == "core" for profile in profiles
+        )
+        core_contributors = len(
+            {
+                item.source_definition_id
+                for item in candidate_results
+                if item.evidence_eligible
+                and next(
+                    profile.acceptance_group
+                    for profile in profiles
+                    if profile.id == item.source_definition_id
+                )
+                == "core"
+            }
+        )
         return MultiSourceCollectionSummary(
             collection_run_id=run.id,
             status=run.status,
             source_results={
-                profile.host: result.status.value
+                (profile.key if is_source_universe else profile.host): result.status.value
                 for profile, result in zip(profiles, source_results, strict=True)
             },
             candidates_processed=len(candidate_results),
             document_versions_created=len(document_ids - known_before),
             drafts_created=drafts_created,
             replayed=False,
+            core_results_persisted=core_results,
+            core_eligible_contributors=core_contributors,
+            core_acceptance_met=(
+                core_results == len(CORE_PROFILE_KEYS) and core_contributors >= 6
+            ),
         )
     finally:
         engine.dispose()
 
 
 def _source_definition(profile: SourceProfile) -> ApprovedFeedSourceDefinition:
-    return ApprovedFeedSourceDefinition(
+    is_legacy = profile.profile_version == SOURCE_PROFILE_VERSION
+    return SourcePortfolioDefinition(
         id=profile.id,
-        name=profile.host,
+        name=profile.host if is_legacy else profile.key,
         publisher=profile.publisher,
-        entry_point=profile.feed_url,
+        entry_point=profile.entry_point,
         audit_version=profile.profile_version,
-        collection_schedule="06:00 and 18:00 Asia/Shanghai",
-        discovery_method="Shared Feed Discovery Adapter over the profile's fixed public Feed",
+        collection_schedule=profile.cadence,
+        discovery_method=profile.discovery_method,
         language=profile.language,
         topic_scope=profile.topic_scope,
         access_constraints=(
-            "HTTPS only inside the Source Profile host and path scope",
+            profile.access_scope,
             "No login, paywall, CAPTCHA, consent, or challenge bypass",
         ),
-        extraction_adapter="Shared bounded HTML Article Adapter v1",
+        extraction_adapter=profile.adapter,
         health_policy=profile.health_policy,
         cursor=profile.cursor_policy,
-        storage_policy=(
-            "Feed metadata creates a Candidate only; a body-valid article creates an "
-            "immutable Document Version"
+        storage_policy=profile.body_eligibility,
+        public_excerpt_policy=(
+            "Only policy-eligible immutable Documents may support Claim Evidence"
         ),
-        public_excerpt_policy="Only exact Claim Evidence from a body-valid Document Version",
-        public_excerpt_max_characters=1000,
-        pause_conditions=(
-            "access challenge or block",
-            "Feed or article format drift",
-            "repeated temporary failure",
+        public_excerpt_max_characters=(
+            0 if profile.evidence_eligibility == "never" else 1000
         ),
+        pause_conditions=(profile.pause_policy,),
         canonical_url_prefixes=tuple(
             f"https://{host}{path}"
             for host in profile.allowed_hosts
             for path in profile.allowed_path_prefixes
         ),
+        activation_conclusion="approved" if profile.enabled else "disabled",
+        acceptance_group=profile.acceptance_group,
+        contribution_role=profile.contribution_role,
+        evidence_eligibility=profile.evidence_eligibility,
+        body_eligibility=profile.body_eligibility,
+        pause_state=profile.pause_state,
+        expected_contribution=profile.expected_contribution,
+        overlap_rationale=profile.overlap_rationale,
     )
 
 
@@ -1091,7 +1201,7 @@ def _document_version(
 
 
 def _profile_result_status(
-    candidate_results: list[SourceCandidateCollectionResult],
+    candidate_results: list[PersistableArticleResult],
     *,
     invalid_metadata_count: int = 0,
 ) -> SourceDefinitionCollectionStatus:
@@ -1141,7 +1251,7 @@ def _source_state(
     cursor_value: str | None,
     updated_at: datetime,
     previous_failures: int,
-) -> SourceProfileState:
+) -> PortfolioSourceState:
     if status in {
         SourceDefinitionCollectionStatus.SUCCESS,
         SourceDefinitionCollectionStatus.EMPTY,
@@ -1154,7 +1264,7 @@ def _source_state(
     else:
         health = SourceProfileHealth.DEGRADED
         consecutive_failures = previous_failures + 1
-    return SourceProfileState(
+    return PortfolioSourceState(
         source_definition_id=profile.id,
         recent_result=status,
         cursor_value=cursor_value,
@@ -1162,6 +1272,7 @@ def _source_state(
         consecutive_failures=consecutive_failures,
         last_collection_run_id=run_id,
         updated_at=updated_at,
+        pause_state=profile.pause_state,
     )
 
 

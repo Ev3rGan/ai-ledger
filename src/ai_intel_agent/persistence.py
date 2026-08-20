@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 from uuid import UUID
 
 from alembic.config import Config
 from dotenv import load_dotenv
 from sqlalchemy import (
     JSON,
+    Boolean,
     CheckConstraint,
     Date,
     DateTime,
@@ -35,6 +36,7 @@ from ai_intel_agent.domain import (
     AuditAction,
     AuditEvent,
     AuditSubjectType,
+    Candidate,
     Claim,
     CollectionDiscovery,
     CollectionRun,
@@ -46,8 +48,8 @@ from ai_intel_agent.domain import (
     EvidenceSpan,
     SampleDigestPublication,
     SampleStory,
-    SourceCandidateCollectionResult,
-    SourceProfileState,
+    SourceDefinitionCollectionStatus,
+    SourceProfileHealth,
     Story,
     StoryReviewState,
     StructuredTrace,
@@ -64,11 +66,56 @@ from ai_intel_agent.editorial import (
     publish_digest,
     review_story,
 )
+from ai_intel_agent.source_portfolio import SourcePortfolioDefinition
 from alembic import command
 
 
 class Base(DeclarativeBase):
     pass
+
+
+class PersistableStatus(Protocol):
+    value: str
+
+
+class PersistableSourceRecord(Protocol):
+    id: UUID
+    source_definition_id: UUID
+    candidate_id: UUID
+    document_version_id: UUID | None
+    record_kind: str
+    external_id: str
+    external_version: str
+    canonical_url: str
+    record_hash: str
+    provenance: Mapping[str, Any]
+    policy_metadata: Mapping[str, Any]
+    structured_metadata: Mapping[str, Any]
+    evidence_eligible: bool
+    observed_at: datetime
+
+
+class PersistableCandidateResult(Protocol):
+    source_definition_id: UUID
+    candidate: Candidate
+    status: PersistableStatus
+    evidence_eligible: bool
+    eligibility_kind: str
+    document_version: DocumentVersion | None
+    source_record: PersistableSourceRecord | None
+    error_code: str | None
+    error_message: str | None
+
+
+class PersistableSourceState(Protocol):
+    source_definition_id: UUID
+    recent_result: SourceDefinitionCollectionStatus
+    cursor_value: str | None
+    health: SourceProfileHealth
+    consecutive_failures: int
+    last_collection_run_id: UUID
+    updated_at: datetime
+    pause_state: str
 
 
 class CandidateRecord(Base):
@@ -245,8 +292,17 @@ class SourceDefinitionRecord(Base):
     __tablename__ = "source_definitions"
     __table_args__ = (
         CheckConstraint(
-            "activation_conclusion = 'approved'",
-            name="ck_source_definitions_approved",
+            "activation_conclusion IN ('approved', 'disabled')",
+            name="ck_source_definitions_activation",
+        ),
+        CheckConstraint(
+            "evidence_eligibility IN "
+            "('body-valid', 'policy-valid-structured', 'never')",
+            name="ck_source_definitions_evidence_eligibility",
+        ),
+        CheckConstraint(
+            "pause_state IN ('active', 'authorization-required')",
+            name="ck_source_definitions_pause_state",
         ),
         CheckConstraint(
             "public_excerpt_max_characters BETWEEN 0 AND 1000",
@@ -274,6 +330,13 @@ class SourceDefinitionRecord(Base):
     public_excerpt_max_characters: Mapped[int] = mapped_column(Integer)
     pause_conditions: Mapped[list[str]] = mapped_column(JSON)
     canonical_url_prefixes: Mapped[list[str]] = mapped_column(JSON)
+    acceptance_group: Mapped[str] = mapped_column(String(32))
+    contribution_role: Mapped[str] = mapped_column(String(64))
+    evidence_eligibility: Mapped[str] = mapped_column(String(32))
+    body_eligibility: Mapped[str] = mapped_column(Text)
+    pause_state: Mapped[str] = mapped_column(String(32))
+    expected_contribution: Mapped[str] = mapped_column(Text)
+    overlap_rationale: Mapped[str] = mapped_column(Text)
 
 
 class CollectionRunRecord(Base):
@@ -350,6 +413,10 @@ class SourceProfileStateRecord(Base):
             "consecutive_failures >= 0",
             name="ck_source_profile_states_consecutive_failures",
         ),
+        CheckConstraint(
+            "pause_state IN ('active', 'authorization-required')",
+            name="ck_source_profile_states_pause_state",
+        ),
     )
 
     source_definition_id: Mapped[UUID] = mapped_column(
@@ -363,21 +430,31 @@ class SourceProfileStateRecord(Base):
         ForeignKey("collection_runs.id")
     )
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    pause_state: Mapped[str] = mapped_column(String(32))
 
 
 class SourceCandidateResultRecord(Base):
     __tablename__ = "source_candidate_results"
     __table_args__ = (
         CheckConstraint(
-            "article_status IN ('body-valid', 'invalid-format', 'access-blocked', "
+            "article_status IN ('body-valid', 'policy-valid-structured', "
+            "'metadata-only', 'signal-only', 'invalid-format', 'access-blocked', "
             "'temporary-failure')",
             name="ck_source_candidate_results_status",
         ),
         CheckConstraint(
-            "(article_status = 'body-valid' AND document_version_id IS NOT NULL "
-            "AND error_code IS NULL AND error_message IS NULL) OR "
-            "(article_status <> 'body-valid' AND document_version_id IS NULL "
-            "AND error_code IS NOT NULL AND error_message IS NOT NULL)",
+            "(article_status IN ('body-valid', 'policy-valid-structured') "
+            "AND document_version_id IS NOT NULL AND error_code IS NULL "
+            "AND error_message IS NULL AND evidence_eligible = true "
+            "AND eligibility_kind = article_status) OR "
+            "(article_status IN ('metadata-only', 'signal-only') "
+            "AND document_version_id IS NULL AND error_code IS NULL "
+            "AND error_message IS NULL AND evidence_eligible = false "
+            "AND eligibility_kind = 'ineligible') OR "
+            "(article_status IN ('invalid-format', 'access-blocked', "
+            "'temporary-failure') AND document_version_id IS NULL "
+            "AND error_code IS NOT NULL AND error_message IS NOT NULL "
+            "AND evidence_eligible = false AND eligibility_kind = 'ineligible')",
             name="ck_source_candidate_results_shape",
         ),
     )
@@ -397,6 +474,46 @@ class SourceCandidateResultRecord(Base):
     article_status: Mapped[str] = mapped_column(String(32))
     error_code: Mapped[str | None] = mapped_column(String(64))
     error_message: Mapped[str | None] = mapped_column(Text)
+    evidence_eligible: Mapped[bool] = mapped_column(Boolean)
+    eligibility_kind: Mapped[str] = mapped_column(String(32))
+
+
+class SourceSpecificRecordRecord(Base):
+    __tablename__ = "source_specific_records"
+    __table_args__ = (
+        CheckConstraint(
+            "(evidence_eligible = true AND document_version_id IS NOT NULL) OR "
+            "(evidence_eligible = false AND document_version_id IS NULL)",
+            name="ck_source_specific_records_evidence_document",
+        ),
+        UniqueConstraint(
+            "source_definition_id",
+            "record_kind",
+            "external_id",
+            "external_version",
+            "record_hash",
+            name="uq_source_specific_record_identity",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    source_definition_id: Mapped[UUID] = mapped_column(
+        ForeignKey("source_definitions.id")
+    )
+    candidate_id: Mapped[UUID] = mapped_column(ForeignKey("candidates.id"))
+    document_version_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("document_versions.id")
+    )
+    record_kind: Mapped[str] = mapped_column(String(64))
+    external_id: Mapped[str] = mapped_column(String(512))
+    external_version: Mapped[str] = mapped_column(String(255))
+    canonical_url: Mapped[str] = mapped_column(String(2048))
+    record_hash: Mapped[str] = mapped_column(String(64))
+    provenance: Mapped[dict[str, Any]] = mapped_column(JSON)
+    policy_metadata: Mapped[dict[str, Any]] = mapped_column(JSON)
+    structured_metadata: Mapped[dict[str, Any]] = mapped_column(JSON)
+    evidence_eligible: Mapped[bool] = mapped_column(Boolean)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class CollectionDiscoveryRecord(Base):
@@ -1243,6 +1360,11 @@ class SourceStatusSnapshot:
     last_collection_run_id: UUID
     updated_at: datetime
     pending_drafts: int
+    acceptance_group: str
+    contribution_role: str
+    evidence_eligibility: str
+    body_eligibility: str
+    pause_state: str
 
 
 class MultiSourceCollectionRepository:
@@ -1349,12 +1471,77 @@ class MultiSourceCollectionRepository:
                 if cursor_value is not None
             }
 
+    def known_paper_identities(self) -> frozenset[tuple[str, str]]:
+        with Session(self._engine) as session:
+            return frozenset(
+                session.execute(
+                    select(
+                        SourceSpecificRecordRecord.external_id,
+                        SourceSpecificRecordRecord.external_version,
+                    ).where(SourceSpecificRecordRecord.record_kind == "paper")
+                ).all()
+            )
+
+    def known_signal_targets(self) -> frozenset[str]:
+        with Session(self._engine) as session:
+            return frozenset(
+                session.scalars(
+                    select(SourceSpecificRecordRecord.canonical_url).where(
+                        SourceSpecificRecordRecord.record_kind.in_(
+                            ("community-signal", "github-trending")
+                        )
+                    )
+                ).all()
+            )
+
+    def acceptance_counts(self, collection_run_id: UUID) -> tuple[int, int]:
+        with Session(self._engine) as session:
+            core_results = session.scalar(
+                select(
+                    func.count(
+                        func.distinct(
+                            SourceDefinitionCollectionResultRecord.source_definition_id
+                        )
+                    )
+                )
+                .select_from(SourceDefinitionCollectionResultRecord)
+                .join(
+                    SourceDefinitionRecord,
+                    SourceDefinitionRecord.id
+                    == SourceDefinitionCollectionResultRecord.source_definition_id,
+                )
+                .where(
+                    SourceDefinitionCollectionResultRecord.collection_run_id
+                    == collection_run_id,
+                    SourceDefinitionRecord.acceptance_group == "core",
+                )
+            )
+            eligible_contributors = session.scalar(
+                select(
+                    func.count(
+                        func.distinct(SourceCandidateResultRecord.source_definition_id)
+                    )
+                )
+                .select_from(SourceCandidateResultRecord)
+                .join(
+                    SourceDefinitionRecord,
+                    SourceDefinitionRecord.id
+                    == SourceCandidateResultRecord.source_definition_id,
+                )
+                .where(
+                    SourceCandidateResultRecord.collection_run_id == collection_run_id,
+                    SourceCandidateResultRecord.evidence_eligible.is_(True),
+                    SourceDefinitionRecord.acceptance_group == "core",
+                )
+            )
+            return int(core_results or 0), int(eligible_contributors or 0)
+
     def persist(
         self,
         run: CollectionRun,
         source_definitions: tuple[ApprovedFeedSourceDefinition, ...],
-        candidate_results: tuple[SourceCandidateCollectionResult, ...],
-        states: tuple[SourceProfileState, ...],
+        candidate_results: tuple[PersistableCandidateResult, ...],
+        states: tuple[PersistableSourceState, ...],
     ) -> bool:
         definitions_by_id = {
             source_definition.id: source_definition
@@ -1409,6 +1596,7 @@ class MultiSourceCollectionRepository:
                     "consecutive_failures": state.consecutive_failures,
                     "last_collection_run_id": state.last_collection_run_id,
                     "updated_at": state.updated_at,
+                    "pause_state": state.pause_state,
                 }
                 existing = session.get(SourceProfileStateRecord, state.source_definition_id)
                 if existing is None:
@@ -1430,7 +1618,7 @@ class MultiSourceCollectionRepository:
     def _persist_candidate_result(
         session: Session,
         collection_run_id: UUID,
-        result: SourceCandidateCollectionResult,
+        result: PersistableCandidateResult,
     ) -> None:
         candidate = result.candidate
         document = result.document_version
@@ -1468,8 +1656,53 @@ class MultiSourceCollectionRepository:
                 article_status=result.status.value,
                 error_code=result.error_code,
                 error_message=result.error_message,
+                evidence_eligible=result.evidence_eligible,
+                eligibility_kind=result.eligibility_kind,
             )
         )
+        source_record = result.source_record
+        if source_record is not None:
+            record_values = {
+                "id": source_record.id,
+                "source_definition_id": source_record.source_definition_id,
+                "candidate_id": source_record.candidate_id,
+                "document_version_id": source_record.document_version_id,
+                "record_kind": source_record.record_kind,
+                "external_id": source_record.external_id,
+                "external_version": source_record.external_version,
+                "canonical_url": source_record.canonical_url,
+                "record_hash": source_record.record_hash,
+                "provenance": dict(source_record.provenance),
+                "policy_metadata": dict(source_record.policy_metadata),
+                "structured_metadata": dict(source_record.structured_metadata),
+                "evidence_eligible": source_record.evidence_eligible,
+                "observed_at": source_record.observed_at,
+            }
+            persisted_record_id = session.scalar(
+                insert(SourceSpecificRecordRecord)
+                .values(**record_values)
+                .on_conflict_do_nothing(
+                    constraint="uq_source_specific_record_identity"
+                )
+                .returning(SourceSpecificRecordRecord.id)
+            )
+            if persisted_record_id is None:
+                persisted_record_id = session.scalar(
+                    select(SourceSpecificRecordRecord.id).where(
+                        SourceSpecificRecordRecord.source_definition_id
+                        == source_record.source_definition_id,
+                        SourceSpecificRecordRecord.record_kind
+                        == source_record.record_kind,
+                        SourceSpecificRecordRecord.external_id
+                        == source_record.external_id,
+                        SourceSpecificRecordRecord.external_version
+                        == source_record.external_version,
+                        SourceSpecificRecordRecord.record_hash
+                        == source_record.record_hash,
+                    )
+                )
+            if persisted_record_id != source_record.id:
+                raise ValueError("Source-specific record identity differs from its policy")
 
     def source_statuses(
         self,
@@ -1511,7 +1744,7 @@ class MultiSourceCollectionRepository:
                     .where(
                         SourceCandidateResultRecord.source_definition_id
                         == definition.id,
-                        SourceCandidateResultRecord.article_status == "body-valid",
+                        SourceCandidateResultRecord.evidence_eligible.is_(True),
                         SourceCandidateResultRecord.document_version_id.is_not(None),
                         StoryRecord.id.is_(None),
                     )
@@ -1528,6 +1761,11 @@ class MultiSourceCollectionRepository:
                         last_collection_run_id=state.last_collection_run_id,
                         updated_at=state.updated_at,
                         pending_drafts=int(pending_drafts or 0),
+                        acceptance_group=definition.acceptance_group,
+                        contribution_role=definition.contribution_role,
+                        evidence_eligibility=definition.evidence_eligibility,
+                        body_eligibility=definition.body_eligibility,
+                        pause_state=state.pause_state,
                     )
                 )
             return tuple(snapshots)
@@ -1549,7 +1787,7 @@ class MultiSourceCollectionRepository:
                 SourceCandidateResultRecord.source_definition_id.in_(
                     source_definition_ids
                 ),
-                SourceCandidateResultRecord.article_status == "body-valid",
+                SourceCandidateResultRecord.evidence_eligible.is_(True),
                 SourceCandidateResultRecord.document_version_id.is_not(None),
                 StoryRecord.id.is_(None),
             )
@@ -1696,13 +1934,31 @@ def _persist_source_definition(
     session: Session,
     source_definition: ApprovedFeedSourceDefinition,
 ) -> None:
+    if isinstance(source_definition, SourcePortfolioDefinition):
+        activation_conclusion = source_definition.activation_conclusion
+        acceptance_group = source_definition.acceptance_group
+        contribution_role = source_definition.contribution_role
+        evidence_eligibility = source_definition.evidence_eligibility
+        body_eligibility = source_definition.body_eligibility
+        pause_state = source_definition.pause_state
+        expected_contribution = source_definition.expected_contribution
+        overlap_rationale = source_definition.overlap_rationale
+    else:
+        activation_conclusion = "approved"
+        acceptance_group = "legacy"
+        contribution_role = "Legacy"
+        evidence_eligibility = "body-valid"
+        body_eligibility = "Legacy body-valid policy"
+        pause_state = "active"
+        expected_contribution = "Legacy source contribution"
+        overlap_rationale = "Legacy source overlap policy"
     values = {
         "id": source_definition.id,
         "name": source_definition.name,
         "publisher": source_definition.publisher,
         "entry_point": source_definition.entry_point,
         "audit_version": source_definition.audit_version,
-        "activation_conclusion": "approved",
+        "activation_conclusion": activation_conclusion,
         "collection_schedule": source_definition.collection_schedule,
         "discovery_method": source_definition.discovery_method,
         "language": source_definition.language,
@@ -1718,6 +1974,13 @@ def _persist_source_definition(
         ),
         "pause_conditions": list(source_definition.pause_conditions),
         "canonical_url_prefixes": list(source_definition.canonical_url_prefixes),
+        "acceptance_group": acceptance_group,
+        "contribution_role": contribution_role,
+        "evidence_eligibility": evidence_eligibility,
+        "body_eligibility": body_eligibility,
+        "pause_state": pause_state,
+        "expected_contribution": expected_contribution,
+        "overlap_rationale": overlap_rationale,
     }
     existing = session.get(SourceDefinitionRecord, source_definition.id)
     if existing is None:
