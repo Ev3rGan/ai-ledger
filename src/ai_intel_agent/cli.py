@@ -51,7 +51,6 @@ from ai_intel_agent.model_routing_evaluation import (
 from ai_intel_agent.multisource_collection import (
     HttpArticleAdapter,
     HttpFeedDiscoveryAdapter,
-    SourceProfile,
     collect_source_profiles,
     load_source_profiles,
     scheduled_operation_key,
@@ -103,6 +102,8 @@ from ai_intel_agent.runtime_benchmark import (
 )
 from ai_intel_agent.sample import FixedClock
 from ai_intel_agent.source_audit import run_source_definition_activation_audit
+from ai_intel_agent.source_portfolio import SourceProfile, load_source_universe
+from ai_intel_agent.source_portfolio_acquisition import HttpSourcePortfolioAdapter
 
 app = typer.Typer(help="Run the deterministic AI intelligence workflow.")
 story_app = typer.Typer(help="Inspect and review persisted Stories.")
@@ -175,8 +176,35 @@ def _source_status_payload(
         snapshot = snapshots_by_id.get(profile.id)
         sources.append(
             {
+                "key": profile.key,
                 "host": profile.host,
                 "publisher": profile.publisher,
+                "enabled": profile.enabled,
+                "acceptance_group": (
+                    snapshot.acceptance_group
+                    if snapshot is not None
+                    else profile.acceptance_group
+                ),
+                "contribution_role": (
+                    snapshot.contribution_role
+                    if snapshot is not None
+                    else profile.contribution_role
+                ),
+                "evidence_eligibility": (
+                    snapshot.evidence_eligibility
+                    if snapshot is not None
+                    else profile.evidence_eligibility
+                ),
+                "body_eligibility": (
+                    snapshot.body_eligibility
+                    if snapshot is not None
+                    else profile.body_eligibility
+                ),
+                "pause_state": (
+                    snapshot.pause_state
+                    if snapshot is not None
+                    else profile.pause_state
+                ),
                 "recent_result": (
                     snapshot.recent_result if snapshot is not None else None
                 ),
@@ -199,6 +227,16 @@ def _source_status_payload(
             }
         )
     return sources
+
+
+def _operator_source_profiles(
+    repository: MultiSourceCollectionRepository,
+) -> tuple[SourceProfile, ...]:
+    universe = load_source_universe()
+    universe_ids = {profile.id for profile in universe}
+    if repository.latest_operation(universe_ids) is not None:
+        return universe
+    return load_source_profiles()
 
 
 @operator_app.command("migrate")
@@ -227,14 +265,14 @@ def operator_status(
     """Report the deployed release and one complete operational snapshot."""
     try:
         database_url = _operator_database_url(production)
-        profiles = load_source_profiles()
-        profile_ids = {profile.id for profile in profiles}
         engine = create_database_engine(database_url)
         try:
             with engine.connect() as connection:
                 connection.exec_driver_sql("SELECT 1")
             snapshot = SchedulerStatusRepository(engine).snapshot()
             collection_repository = MultiSourceCollectionRepository(engine)
+            profiles = _operator_source_profiles(collection_repository)
+            profile_ids = {profile.id for profile in profiles}
             recent_collection = collection_repository.latest_operation(profile_ids)
             sources = _source_status_payload(
                 profiles,
@@ -314,14 +352,19 @@ def operator_source_status(
         typer.Option("--production", help="Load the M1 Docker-secret contract."),
     ] = False,
 ) -> None:
-    """Report current four-profile result, cursor, health, and pending drafts."""
+    """Report the versioned source universe policy, health, and pending drafts."""
     try:
         database_url = _operator_database_url(production)
-        profiles = load_source_profiles()
         engine = create_database_engine(database_url)
         try:
-            snapshots = MultiSourceCollectionRepository(engine).source_statuses(
+            repository = MultiSourceCollectionRepository(engine)
+            profiles = _operator_source_profiles(repository)
+            snapshots = repository.source_statuses(
                 {profile.id for profile in profiles}
+            )
+            universe_profiles = load_source_universe()
+            universe_snapshots = repository.source_statuses(
+                {profile.id for profile in universe_profiles}
             )
         finally:
             engine.dispose()
@@ -329,11 +372,11 @@ def operator_source_status(
         raise typer.BadParameter(str(error)) from error
 
     sources = _source_status_payload(profiles, snapshots)
-    console.print_json(
-        data={
-            "sources": sources
-        }
+    source_universe = _source_status_payload(
+        universe_profiles,
+        universe_snapshots,
     )
+    console.print_json(data={"sources": sources, "source_universe": source_universe})
 
 
 @operator_app.command("scheduler-health")
@@ -546,7 +589,7 @@ def schedule_sources(
         ),
     ] = False,
 ) -> None:
-    """Collect the four active Source Profiles twice daily until interrupted."""
+    """Collect the approved source universe twice daily until interrupted."""
     if production:
         try:
             _require_recorded_production_backfill_limit(backfill_limit)
@@ -592,7 +635,7 @@ def schedule_sources(
         return
 
     configuration = _local_mvp_configuration()
-    console.print("Four-profile scheduler active at 06:00 and 18:00 Asia/Shanghai.")
+    console.print("Source-universe scheduler active at 06:00 and 18:00 Asia/Shanghai.")
     with SchedulerStopController() as stopped:
         GeminiScheduler(
             collect=lambda: _run_multisource_collection(
@@ -1092,7 +1135,7 @@ def collect_sources(
         ),
     ] = None,
 ) -> None:
-    """Collect the four active Source Profiles and prepare budgeted DeepSeek drafts."""
+    """Collect the approved source universe and prepare eligible drafts."""
     requested_key = operation_key or f"m2-manual:{uuid4()}"
     try:
         if os.getenv("DEEPSEEK_API_KEY_FILE"):
@@ -1135,7 +1178,7 @@ def _run_multisource_collection(
     provider_budget: PersistentMeteredProviderBudget | None = None,
     structured_output: bool,
 ) -> None:
-    profiles = load_source_profiles()
+    profiles = load_source_universe()
     lease_engine = create_database_engine(database_url)
     try:
         with (
@@ -1149,6 +1192,7 @@ def _run_multisource_collection(
                 profiles=profiles,
                 feed_adapter=HttpFeedDiscoveryAdapter(source_client),
                 article_adapter=HttpArticleAdapter(source_client),
+                portfolio_adapter=HttpSourcePortfolioAdapter(source_client),
                 provider=DeepSeekGeminiDraftProvider(
                     provider_client,
                     api_key=api_key,
@@ -1169,6 +1213,9 @@ def _run_multisource_collection(
         "document_versions_created": summary.document_versions_created,
         "drafts_created": summary.drafts_created,
         "replayed": summary.replayed,
+        "core_results_persisted": summary.core_results_persisted,
+        "core_eligible_contributors": summary.core_eligible_contributors,
+        "core_acceptance_met": summary.core_acceptance_met,
     }
     if structured_output:
         console.print_json(data=payload)
