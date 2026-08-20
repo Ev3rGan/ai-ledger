@@ -150,7 +150,7 @@ class M1ProviderConfiguration:
             environment,
             "AI_INTEL_PROVIDER_MONTHLY_BUDGET_CENTS",
             minimum=1,
-            maximum=10_000,
+            maximum=11_500,
         )
         request_reservation_cents = bounded_integer_from_environment(
             environment,

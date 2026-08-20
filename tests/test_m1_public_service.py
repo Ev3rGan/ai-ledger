@@ -41,6 +41,7 @@ from ai_intel_agent.research import (
 )
 from ai_intel_agent.runtime import (
     GeminiScheduler,
+    M1ProviderConfiguration,
     M1WebConfiguration,
     PostgresSchedulerLease,
     ServiceJsonFormatter,
@@ -67,6 +68,30 @@ def test_database_migration_accepts_percent_encoded_password(
     upgrade_database(database_url)
 
     assert observed == {"database_url": database_url, "revision": "head"}
+
+
+def test_provider_budget_configuration_accepts_11500_and_rejects_more() -> None:
+    provider_key_path = Path(__file__).resolve().parents[1] / "alembic.ini"
+    environment = {
+        "DEEPSEEK_API_KEY_FILE": str(provider_key_path),
+        "AI_INTEL_PROVIDER_MONTHLY_BUDGET_CENTS": "11500",
+        "AI_INTEL_PROVIDER_REQUEST_RESERVATION_CENTS": "100",
+    }
+
+    configuration = M1ProviderConfiguration.from_environment(environment)
+
+    assert configuration.monthly_budget_cents == 11_500
+    assert configuration.request_reservation_cents == 100
+    with pytest.raises(
+        ValueError,
+        match="AI_INTEL_PROVIDER_MONTHLY_BUDGET_CENTS must be between 1 and 11500",
+    ):
+        M1ProviderConfiguration.from_environment(
+            {
+                **environment,
+                "AI_INTEL_PROVIDER_MONTHLY_BUDGET_CENTS": "11501",
+            }
+        )
 
 
 @pytest.fixture(scope="module")
@@ -107,7 +132,7 @@ def production_environment(
         "DEEPSEEK_API_KEY_FILE": secret_paths["provider-key"],
         "AI_INTEL_ANONYMOUS_ID_SALT_FILE": secret_paths["identity-salt"],
         "AI_INTEL_ANONYMOUS_RESEARCH_DAILY_LIMIT": "1",
-        "AI_INTEL_PROVIDER_MONTHLY_BUDGET_CENTS": "10000",
+        "AI_INTEL_PROVIDER_MONTHLY_BUDGET_CENTS": "11500",
         "AI_INTEL_PROVIDER_REQUEST_RESERVATION_CENTS": "100",
         "AI_INTEL_SCHEDULE_BACKFILL_LIMIT": "5",
     }
@@ -341,7 +366,7 @@ def test_production_configuration_reads_secrets_from_files_and_redacts_repr(
     assert parsed_database.host == production_environment["AI_INTEL_DATABASE_HOST"]
     assert parsed_database.database == production_environment["AI_INTEL_DATABASE_NAME"]
     assert configuration.anonymous_research_daily_limit == 1
-    assert configuration.provider.monthly_budget_cents == 10_000
+    assert configuration.provider.monthly_budget_cents == 11_500
     assert parsed_database.password not in repr(configuration)
     assert "fixture-provider-key" not in repr(configuration)
     assert "fixture-production-salt" not in repr(configuration)
@@ -483,7 +508,7 @@ def test_production_caddy_proxy_emits_https_absolute_rss_links(
         ),
         provider=SimpleNamespace(
             api_key="fixture-provider-key",
-            monthly_budget_cents=10_000,
+            monthly_budget_cents=11_500,
             request_reservation_cents=100,
         ),
         anonymous_research_daily_limit=1,
