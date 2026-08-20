@@ -146,11 +146,24 @@ def upgrade() -> None:
         ),
     )
     op.execute(
+        "DROP TRIGGER protect_source_candidate_collection_result "
+        "ON source_candidate_results"
+    )
+    op.execute(
         """
         UPDATE source_candidate_results
         SET evidence_eligible = true,
             eligibility_kind = 'body-valid'
         WHERE article_status = 'body-valid'
+        """
+    )
+    op.execute(
+        """
+        CREATE TRIGGER protect_source_candidate_collection_result
+        BEFORE INSERT OR UPDATE OR DELETE ON source_candidate_results
+        FOR EACH ROW EXECUTE FUNCTION ai_intel_protect_collection_run_child(
+            'Source candidate collection result is immutable'
+        )
         """
     )
     op.create_check_constraint(

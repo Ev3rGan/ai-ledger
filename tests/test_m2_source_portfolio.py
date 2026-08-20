@@ -10,7 +10,10 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import httpx
 import pytest
+from alembic.config import Config
 from pg0 import Pg0
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
 from ai_intel_agent.cli import _source_status_payload
 from ai_intel_agent.domain import Candidate, DocumentVersion
@@ -19,6 +22,7 @@ from ai_intel_agent.multisource_collection import collect_source_profiles
 from ai_intel_agent.persistence import (
     MultiSourceCollectionRepository,
     create_database_engine,
+    database_url_for_alembic_config,
     upgrade_database,
 )
 from ai_intel_agent.source_portfolio import load_source_universe
@@ -31,6 +35,7 @@ from ai_intel_agent.source_portfolio_acquisition import (
     SourcePortfolioItemResult,
     SourceSpecificRecord,
 )
+from alembic import command
 
 PUBLIC_ADDRESS = IPv4Address("93.184.216.34")
 
@@ -90,6 +95,242 @@ def m2_portfolio_database_url():
     try:
         upgrade_database(server.uri)
         yield server.uri
+    finally:
+        server.drop()
+
+
+@pytest.mark.postgres
+def test_0007_terminal_candidate_results_upgrade_to_0008_with_protections() -> None:
+    server = Pg0(name=f"ai_intel_m2_0007_upgrade_{uuid4().hex}")
+    server.start()
+    try:
+        project_root = Path(__file__).resolve().parents[1]
+        config = Config(str(project_root / "alembic.ini"))
+        config.set_main_option(
+            "sqlalchemy.url",
+            database_url_for_alembic_config(server.uri),
+        )
+        command.upgrade(config, "0007")
+
+        source_definition_id = uuid4()
+        collection_run_id = uuid4()
+        body_candidate_id = uuid4()
+        invalid_candidate_id = uuid4()
+        late_candidate_id = uuid4()
+        document_version_id = uuid4()
+        started_at = datetime(2026, 8, 19, 0, 0, tzinfo=UTC)
+        completed_at = datetime(2026, 8, 19, 0, 1, tzinfo=UTC)
+        engine = create_database_engine(server.uri)
+        try:
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO source_definitions (
+                            id, name, publisher, entry_point, audit_version,
+                            activation_conclusion, collection_schedule,
+                            discovery_method, language, topic_scope,
+                            access_constraints, extraction_adapter, health_policy,
+                            cursor, storage_policy, public_excerpt_policy,
+                            public_excerpt_max_characters, pause_conditions,
+                            canonical_url_prefixes
+                        ) VALUES (
+                            :id, 'Legacy source', 'Legacy publisher',
+                            'https://example.com/feed', 'legacy-audit.v1',
+                            'approved', 'daily', 'legacy feed', 'en', '[]'::json,
+                            '[]'::json, 'legacy adapter', 'legacy health',
+                            'legacy cursor', 'legacy storage', 'legacy excerpt',
+                            280, '[]'::json, '["https://example.com/"]'::json
+                        )
+                        """
+                    ),
+                    {"id": source_definition_id},
+                )
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO collection_runs (
+                            id, retry_of_run_id, status, started_at, completed_at,
+                            operation_key
+                        ) VALUES (
+                            :id, NULL, 'running', :started_at, NULL,
+                            'm2-0007-upgrade-regression'
+                        )
+                        """
+                    ),
+                    {"id": collection_run_id, "started_at": started_at},
+                )
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO candidates (
+                            id, title, canonical_url, publisher, discovered_at
+                        ) VALUES
+                            (:body_id, 'Body result', 'https://example.com/body',
+                             'Legacy publisher', :started_at),
+                            (:invalid_id, 'Invalid result', 'https://example.com/invalid',
+                             'Legacy publisher', :started_at)
+                        """
+                    ),
+                    {
+                        "body_id": body_candidate_id,
+                        "invalid_id": invalid_candidate_id,
+                        "started_at": started_at,
+                    },
+                )
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO document_versions (
+                            id, candidate_id, source_url, title, body, content_hash,
+                            observed_at, published_at, published_at_raw,
+                            updated_at, updated_at_raw
+                        ) VALUES (
+                            :id, :candidate_id, 'https://example.com/body',
+                            'Body result', 'Legacy body', :content_hash,
+                            :started_at, NULL, NULL, NULL, NULL
+                        )
+                        """
+                    ),
+                    {
+                        "id": document_version_id,
+                        "candidate_id": body_candidate_id,
+                        "content_hash": sha256(b"Legacy body").hexdigest(),
+                        "started_at": started_at,
+                    },
+                )
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO source_candidate_results (
+                            collection_run_id, source_definition_id, candidate_id,
+                            document_version_id, article_status, error_code,
+                            error_message
+                        ) VALUES
+                            (:run_id, :source_id, :body_id, :document_id,
+                             'body-valid', NULL, NULL),
+                            (:run_id, :source_id, :invalid_id, NULL,
+                             'invalid-format', 'invalid-format', 'Legacy invalid result')
+                        """
+                    ),
+                    {
+                        "run_id": collection_run_id,
+                        "source_id": source_definition_id,
+                        "body_id": body_candidate_id,
+                        "document_id": document_version_id,
+                        "invalid_id": invalid_candidate_id,
+                    },
+                )
+                connection.execute(
+                    text(
+                        """
+                        UPDATE collection_runs
+                        SET status = 'complete', completed_at = :completed_at
+                        WHERE id = :id
+                        """
+                    ),
+                    {"id": collection_run_id, "completed_at": completed_at},
+                )
+        finally:
+            engine.dispose()
+
+        command.upgrade(config, "0008")
+
+        engine = create_database_engine(server.uri)
+        try:
+            with engine.connect() as connection:
+                migrated_rows = {
+                    candidate_id: (evidence_eligible, eligibility_kind)
+                    for candidate_id, evidence_eligible, eligibility_kind in (
+                        connection.execute(
+                            text(
+                                """
+                                SELECT candidate_id,
+                                       evidence_eligible,
+                                       eligibility_kind
+                                FROM source_candidate_results
+                                """
+                            )
+                        ).all()
+                    )
+                }
+                migration_head = connection.scalar(text("SELECT version_num FROM alembic_version"))
+
+            assert migrated_rows == {
+                body_candidate_id: (True, "body-valid"),
+                invalid_candidate_id: (False, "ineligible"),
+            }
+            assert migration_head == "0008"
+
+            for statement in (
+                text(
+                    """
+                    UPDATE source_candidate_results
+                    SET eligibility_kind = eligibility_kind
+                    WHERE candidate_id = :candidate_id
+                    """
+                ),
+                text(
+                    """
+                    DELETE FROM source_candidate_results
+                    WHERE candidate_id = :candidate_id
+                    """
+                ),
+            ):
+                with (
+                    pytest.raises(
+                        DBAPIError,
+                        match="Source candidate collection result is immutable",
+                    ),
+                    engine.begin() as connection,
+                ):
+                    connection.execute(
+                        statement,
+                        {"candidate_id": body_candidate_id},
+                    )
+
+            with (
+                pytest.raises(
+                    DBAPIError,
+                    match="Source candidate collection result is immutable",
+                ),
+                engine.begin() as connection,
+            ):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO candidates (
+                            id, title, canonical_url, publisher, discovered_at
+                        ) VALUES (
+                            :id, 'Late result', 'https://example.com/late',
+                            'Legacy publisher', :started_at
+                        )
+                        """
+                    ),
+                    {"id": late_candidate_id, "started_at": started_at},
+                )
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO source_candidate_results (
+                            collection_run_id, source_definition_id, candidate_id,
+                            document_version_id, article_status, error_code,
+                            error_message, evidence_eligible, eligibility_kind
+                        ) VALUES (
+                            :run_id, :source_id, :candidate_id, NULL,
+                            'invalid-format', 'invalid-format', 'Late result',
+                            false, 'ineligible'
+                        )
+                        """
+                    ),
+                    {
+                        "run_id": collection_run_id,
+                        "source_id": source_definition_id,
+                        "candidate_id": late_candidate_id,
+                    },
+                )
+        finally:
+            engine.dispose()
     finally:
         server.drop()
 
