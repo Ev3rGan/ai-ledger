@@ -24,6 +24,7 @@ dependencies = [
     "uvicorn>=0.35,<1",
     "trafilatura>=2.2.0",
     "playwright>=1.62.0",
+    "pgvector>=0.4,<1",
 ]
 
 [project.optional-dependencies]
@@ -36,7 +37,7 @@ ch3 = [
     "rapidfuzz>=3.9",
 ]
 retrieval = [
-    "fastembed>=0.8,<0.9",
+    "fastembed==0.8.0",
     "psutil>=7,<8",
 ]
 dev = [

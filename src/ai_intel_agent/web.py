@@ -13,37 +13,33 @@ from xml.etree import ElementTree
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func, select
-from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session
 
+from ai_intel_agent.accepted_knowledge import (
+    AcceptedKnowledgeOperation,
+    AcceptedKnowledgeRetrieval,
+    EmbeddingBackend,
+    RerankerBackend,
+    RetrievalFilters,
+    RetrievalQuery,
+)
 from ai_intel_agent.domain import (
     EvidenceRelation,
     EvidenceRole,
     EvidenceState,
-    StoryReviewState,
     Topic,
 )
-from ai_intel_agent.persistence import (
-    ClaimRecord,
-    EvidenceSpanRecord,
-    StoryRecord,
-    create_database_engine,
-)
+from ai_intel_agent.persistence import create_database_engine
 from ai_intel_agent.publication import (
     PublicClaim,
     PublicDigest,
     PublicEvidence,
     PublicPublicationRepository,
     PublicStory,
-    bounded_public_evidence_excerpt,
 )
 from ai_intel_agent.research import (
     PersistentAnonymousResearchAllowance,
-    ResearchEvidence,
-    ResearchEvidenceSet,
     ResearchProvider,
-    _fts_query_text,
+    ResearchRepository,
     stream_research_events,
 )
 
@@ -65,70 +61,6 @@ EVIDENCE_RELATION_LABELS: dict[EvidenceRelation, str] = {
 }
 
 
-class _PublicResearchRepository:
-    """Apply the public visibility projection before Research sees Evidence."""
-
-    def __init__(
-        self,
-        engine: Engine,
-    ) -> None:
-        self._engine = engine
-
-    def retrieve(self, question: str, *, limit: int = 5) -> ResearchEvidenceSet:
-        query_text = _fts_query_text(question)
-        if not query_text:
-            return ResearchEvidenceSet(question=question, evidence=())
-        searchable_text = func.concat_ws(
-            " ",
-            StoryRecord.headline,
-            ClaimRecord.text,
-            EvidenceSpanRecord.exact_text,
-        )
-        search_vector = func.to_tsvector("simple", searchable_text)
-        query = func.websearch_to_tsquery("simple", query_text)
-        statement = (
-            select(
-                StoryRecord.id.label("story_id"),
-                StoryRecord.stable_key,
-                StoryRecord.headline,
-                ClaimRecord.id.label("claim_id"),
-                ClaimRecord.text.label("claim_text"),
-                EvidenceSpanRecord.id.label("evidence_span_id"),
-                EvidenceSpanRecord.exact_text,
-            )
-            .join(ClaimRecord, ClaimRecord.story_id == StoryRecord.id)
-            .join(EvidenceSpanRecord, EvidenceSpanRecord.claim_id == ClaimRecord.id)
-            .where(
-                StoryRecord.review_state == StoryReviewState.ACCEPTED.value,
-                EvidenceSpanRecord.relation == EvidenceRelation.SUPPORTS.value,
-                EvidenceSpanRecord.role != EvidenceRole.COMMUNITY.value,
-                PublicPublicationRepository.public_story_exists(StoryRecord.id),
-                search_vector.op("@@")(query),
-            )
-            .order_by(
-                func.ts_rank_cd(search_vector, query).desc(),
-                StoryRecord.occurred_at.desc(),
-                ClaimRecord.position,
-                EvidenceSpanRecord.start_offset,
-            )
-            .limit(limit)
-        )
-        with Session(self._engine) as session:
-            evidence = tuple(
-                ResearchEvidence(
-                    story_id=row.story_id,
-                    story_stable_key=row.stable_key,
-                    story_headline=row.headline,
-                    claim_id=row.claim_id,
-                    claim_text=row.claim_text,
-                    evidence_span_id=row.evidence_span_id,
-                    exact_text=bounded_public_evidence_excerpt(row.exact_text),
-                )
-                for row in session.execute(statement)
-            )
-        return ResearchEvidenceSet(question=question, evidence=evidence)
-
-
 class ResearchQuestion(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -141,12 +73,20 @@ def create_app(
     research_provider: ResearchProvider | None = None,
     anonymous_research_daily_limit: int | None = None,
     anonymous_identity_salt: bytes | None = None,
+    accepted_knowledge_retrieval: AcceptedKnowledgeOperation | None = None,
+    retrieval_embedding: EmbeddingBackend | None = None,
+    retrieval_reranker: RerankerBackend | None = None,
 ) -> FastAPI:
     if (anonymous_research_daily_limit is None) != (anonymous_identity_salt is None):
         raise ValueError("Anonymous Research limit and identity salt must be configured together")
     engine = create_database_engine(database_url)
     repository = PublicPublicationRepository(engine)
-    research_repository = _PublicResearchRepository(engine)
+    retrieval = accepted_knowledge_retrieval or AcceptedKnowledgeRetrieval(
+        engine,
+        embedding=retrieval_embedding,
+        reranker=retrieval_reranker,
+    )
+    research_repository = ResearchRepository(retrieval=retrieval)
     research_allowance = (
         PersistentAnonymousResearchAllowance(
             engine,
@@ -279,13 +219,23 @@ def create_app(
         topic: Annotated[Topic | None, Query(alias="topic")] = None,
         publication_date: Annotated[date | None, Query(alias="date")] = None,
     ) -> HTMLResponse:
-        stories = repository.browse_published_stories(
-            keyword=q,
-            publisher=publisher,
-            topic=topic,
-            publication_date=publication_date,
+        result = retrieval.retrieve(
+            RetrievalQuery(
+                text=q or "",
+                filters=RetrievalFilters(
+                    publisher=publisher,
+                    topic=topic,
+                    publication_date=publication_date,
+                ),
+            )
         )
         all_stories = repository.browse_published_stories()
+        stories_by_id = {story.id: story for story in all_stories}
+        stories = tuple(
+            stories_by_id[story_id]
+            for story_id in result.matching_story_ids
+            if story_id in stories_by_id
+        )
         form = _render_browse_form(
             q=q,
             publisher=publisher,

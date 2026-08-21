@@ -17,6 +17,19 @@ from dotenv import load_dotenv
 from rich.console import Console
 from sqlalchemy.engine import Engine
 
+from ai_intel_agent.accepted_knowledge import (
+    AcceptedKnowledgeIndexer,
+    AcceptedKnowledgeRetrieval,
+    ApprovedRetrievalBackends,
+    RetrievalBackendFault,
+    RetrievalFilters,
+    RetrievalModelConfiguration,
+    RetrievalQuery,
+    load_approved_fastembed_backends,
+    record_retrieval_backend_startup_state,
+    retrieval_health_snapshot,
+    validate_approved_model_artifacts,
+)
 from ai_intel_agent.collection import (
     SystemClock,
     collect_feed_source_definitions,
@@ -117,11 +130,13 @@ digest_app = typer.Typer(help="Preview and publish persisted Digests.")
 digest_plan_app = typer.Typer(help="Prepare, inspect, and approve immutable Digest Plans.")
 runtime_benchmark_app = typer.Typer(help="Capture and compare fixed Hong Kong runtime probes.")
 operator_app = typer.Typer(help="Private production operator commands.")
+operator_retrieval_app = typer.Typer(help="Manage accepted-knowledge Retrieval indexes.")
 app.add_typer(story_app, name="story")
 app.add_typer(digest_app, name="digest")
 digest_app.add_typer(digest_plan_app, name="plan")
 app.add_typer(runtime_benchmark_app, name="benchmark-runtime")
 app.add_typer(operator_app, name="operator")
+operator_app.add_typer(operator_retrieval_app, name="retrieval")
 console = Console()
 DEFAULT_OUTPUT = Path("reports/daily.md")
 DEFAULT_SOURCE_AUDIT_OUTPUT = Path("reports/source-activation-audit.md")
@@ -150,6 +165,21 @@ def _persistent_provider_budget(
         monthly_limit_cents=configuration.monthly_budget_cents,
         request_reservation_cents=configuration.request_reservation_cents,
     )
+
+
+def _retrieval_backends_from_environment() -> ApprovedRetrievalBackends:
+    try:
+        configuration = RetrievalModelConfiguration.from_environment(os.environ)
+    except ValueError:
+        return ApprovedRetrievalBackends(
+            embedding=None,
+            reranker=None,
+            faults=(
+                RetrievalBackendFault("embedding", "embedding-unavailable"),
+                RetrievalBackendFault("reranker", "reranker-unavailable"),
+            ),
+        )
+    return load_approved_fastembed_backends(configuration)
 
 
 def _require_recorded_production_backfill_limit(backfill_limit: int) -> None:
@@ -238,6 +268,226 @@ def operator_migrate(
     except ValueError as error:
         raise typer.BadParameter(str(error)) from error
     console.print_json(data={"database": "migrated"})
+
+
+@operator_retrieval_app.command("artifacts")
+def operator_retrieval_artifacts() -> None:
+    """Verify the exact local FastEmbed artifacts and AVX2 requirement."""
+    try:
+        configuration = RetrievalModelConfiguration.from_environment(os.environ)
+        check = validate_approved_model_artifacts(configuration)
+    except (OSError, ValueError) as error:
+        raise typer.BadParameter(str(error)) from error
+    console.print_json(
+        data={
+            "ready": check.ready,
+            "runtime_version": check.runtime_version,
+            "threads": configuration.threads,
+            "embedding": {
+                "model_id": check.embedding.model_id,
+                "revision": check.embedding.revision,
+                "artifact_sha256": check.embedding.artifact_sha256,
+            },
+            "reranker": {
+                "model_id": check.reranker.model_id,
+                "revision": check.reranker.revision,
+                "artifact_sha256": check.reranker.artifact_sha256,
+                "required_cpu_feature": check.reranker.cpu_feature,
+            },
+        }
+    )
+
+
+@operator_retrieval_app.command("index")
+def operator_retrieval_index(
+    complete: Annotated[
+        bool,
+        typer.Option("--complete", help="Build and atomically activate a new generation."),
+    ] = False,
+    production: Annotated[
+        bool,
+        typer.Option("--production", help="Load the M1 Docker-secret contract."),
+    ] = False,
+) -> None:
+    """Incrementally index accepted knowledge or build a complete generation."""
+    try:
+        database_url = _operator_database_url(production)
+        backends = _retrieval_backends_from_environment()
+        engine = create_database_engine(database_url)
+        try:
+            indexer = AcceptedKnowledgeIndexer(
+                engine,
+                embedding=backends.embedding,
+                require_embeddings=production,
+            )
+            result = indexer.rebuild() if complete else indexer.incremental()
+        finally:
+            engine.dispose()
+    except (OSError, ValueError) as error:
+        raise typer.BadParameter(str(error)) from error
+    console.print_json(
+        data={
+            "index_id": str(result.index_id),
+            "profile_id": result.profile_id,
+            "mode": "complete" if complete else "incremental",
+            "documents_indexed": result.documents_indexed,
+            "chunks_created": result.chunks_created,
+            "embeddings_created": result.embeddings_created,
+            "fault_code": result.fault_code,
+            "runtime_faults": [
+                {"stage": fault.stage, "code": fault.code} for fault in backends.faults
+            ],
+        }
+    )
+
+
+@operator_retrieval_app.command("status")
+def operator_retrieval_status(
+    require_hybrid: Annotated[
+        bool,
+        typer.Option(
+            "--require-hybrid",
+            help="Fail unless the active MiniLM and mMARCO runtime is ready.",
+        ),
+    ] = False,
+    production: Annotated[
+        bool,
+        typer.Option("--production", help="Load the M1 Docker-secret contract."),
+    ] = False,
+) -> None:
+    """Report active generation identity, capacity, and model fault states."""
+    try:
+        database_url = _operator_database_url(production)
+        engine = create_database_engine(database_url)
+        try:
+            snapshot = retrieval_health_snapshot(engine)
+        finally:
+            engine.dispose()
+    except (OSError, ValueError) as error:
+        raise typer.BadParameter(str(error)) from error
+    if require_hybrid and not snapshot.hybrid_ready:
+        raise typer.BadParameter("Accepted-knowledge Hybrid Retrieval is not ready")
+    console.print_json(
+        data={
+            "hybrid_ready": snapshot.hybrid_ready,
+            "active_index_id": (
+                str(snapshot.active_index_id) if snapshot.active_index_id is not None else None
+            ),
+            "profile_id": snapshot.profile_id,
+            "profile_sha256": snapshot.profile_sha256,
+            "documents_indexed": snapshot.documents_indexed,
+            "chunks_indexed": snapshot.chunks_indexed,
+            "embeddings_indexed": snapshot.embeddings_indexed,
+            "index_fault_code": snapshot.index_fault_code,
+            "stages": [
+                {
+                    "stage": stage.stage,
+                    "index_id": str(stage.index_id) if stage.index_id is not None else None,
+                    "state": stage.state,
+                    "model_id": stage.model_id,
+                    "revision": stage.revision,
+                    "artifact_sha256": stage.artifact_sha256,
+                    "fault_code": stage.fault_code,
+                    "updated_at": stage.updated_at.isoformat(),
+                }
+                for stage in snapshot.stages
+            ],
+        }
+    )
+
+
+@operator_retrieval_app.command("query")
+def operator_retrieval_query(
+    text: Annotated[str, typer.Argument(help="Accepted-knowledge query text.")],
+    publisher: Annotated[
+        str | None,
+        typer.Option("--source", help="Require this exact primary publisher."),
+    ] = None,
+    topic: Annotated[
+        Topic | None,
+        typer.Option("--topic", help="Require this primary Topic."),
+    ] = None,
+    publication_date: Annotated[
+        str | None,
+        typer.Option("--date", help="Require this original publication date."),
+    ] = None,
+    occurred_from: Annotated[
+        datetime | None,
+        typer.Option("--occurred-from", help="Inclusive Story occurrence lower bound."),
+    ] = None,
+    occurred_to: Annotated[
+        datetime | None,
+        typer.Option("--occurred-to", help="Exclusive Story occurrence upper bound."),
+    ] = None,
+    production: Annotated[
+        bool,
+        typer.Option("--production", help="Load the M1 Docker-secret contract."),
+    ] = False,
+) -> None:
+    """Run the shared Retrieval operation and emit every deterministic ranking stage."""
+    try:
+        parsed_publication_date = (
+            date.fromisoformat(publication_date) if publication_date is not None else None
+        )
+        database_url = _operator_database_url(production)
+        backends = _retrieval_backends_from_environment()
+        engine = create_database_engine(database_url)
+        try:
+            result = AcceptedKnowledgeRetrieval(
+                engine,
+                embedding=backends.embedding,
+                reranker=backends.reranker,
+            ).retrieve(
+                RetrievalQuery(
+                    text=text,
+                    filters=RetrievalFilters(
+                        publisher=publisher,
+                        topic=topic,
+                        publication_date=parsed_publication_date,
+                        occurred_from=occurred_from,
+                        occurred_to=occurred_to,
+                    ),
+                )
+            )
+        finally:
+            engine.dispose()
+    except (OSError, ValueError) as error:
+        raise typer.BadParameter(str(error)) from error
+
+    def stage_payload(candidates: tuple[object, ...]) -> list[dict[str, object]]:
+        return [
+            {
+                "evidence_span_id": str(candidate.evidence_span_id),
+                "rank": candidate.rank,
+                "score": candidate.score,
+                "chunk_id": str(candidate.chunk_id) if candidate.chunk_id is not None else None,
+            }
+            for candidate in candidates
+        ]
+
+    console.print_json(
+        data={
+            "hits": [
+                {
+                    "story_id": str(hit.story_id),
+                    "claim_id": str(hit.claim_id),
+                    "evidence_span_id": str(hit.evidence_span_id),
+                    "chunk_id": str(hit.chunk_id) if hit.chunk_id is not None else None,
+                }
+                for hit in result.hits
+            ],
+            "trace": {
+                "lexical": stage_payload(result.trace.lexical),
+                "semantic": stage_payload(result.trace.semantic),
+                "entity": stage_payload(result.trace.entity),
+                "fusion": stage_payload(result.trace.fusion),
+                "final": stage_payload(result.trace.final),
+                "faults": [
+                    {"stage": fault.stage, "code": fault.code} for fault in result.trace.faults
+                ],
+            },
+        }
+    )
 
 
 @operator_app.command("status")
@@ -433,8 +683,25 @@ def serve(
 
     from ai_intel_agent.web import create_app
 
+    retrieval_backends = _retrieval_backends_from_environment()
+    retrieval_state_engine = create_database_engine(database_url)
+    try:
+        record_retrieval_backend_startup_state(
+            retrieval_state_engine,
+            retrieval_backends,
+        )
+    finally:
+        retrieval_state_engine.dispose()
     if not api_key:
-        uvicorn.run(create_app(database_url), host=host, port=port)
+        uvicorn.run(
+            create_app(
+                database_url,
+                retrieval_embedding=retrieval_backends.embedding,
+                retrieval_reranker=retrieval_backends.reranker,
+            ),
+            host=host,
+            port=port,
+        )
         return
 
     budget_engine = create_database_engine(database_url) if production else None
@@ -470,6 +737,8 @@ def serve(
                 if service_configuration is not None
                 else None
             ),
+            retrieval_embedding=retrieval_backends.embedding,
+            retrieval_reranker=retrieval_backends.reranker,
         )
         try:
             if production:

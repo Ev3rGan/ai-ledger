@@ -11,10 +11,12 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from alembic.config import Config
 from dotenv import load_dotenv
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     JSON,
     Boolean,
     CheckConstraint,
+    Computed,
     Date,
     DateTime,
     ForeignKey,
@@ -27,7 +29,7 @@ from sqlalchemy import (
     select,
     update,
 )
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.dialects.postgresql import TSVECTOR, insert
 from sqlalchemy.engine import Engine, create_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
@@ -642,6 +644,106 @@ class SchedulerStatusRecord(Base):
     last_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_result: Mapped[str | None] = mapped_column(String(32))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class RetrievalIndexRecord(Base):
+    __tablename__ = "retrieval_indexes"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('building', 'active', 'retired', 'failed')",
+            name="ck_retrieval_indexes_state",
+        ),
+        CheckConstraint(
+            "documents_indexed >= 0 AND chunks_indexed >= 0 AND embeddings_indexed >= 0",
+            name="ck_retrieval_indexes_counts_nonnegative",
+        ),
+        CheckConstraint(
+            "length(profile_sha256) = 64",
+            name="ck_retrieval_indexes_profile_hash_length",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    profile_id: Mapped[str] = mapped_column(String(255))
+    profile_sha256: Mapped[str] = mapped_column(String(64))
+    profile_definition: Mapped[dict[str, Any]] = mapped_column(JSON)
+    state: Mapped[str] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    documents_indexed: Mapped[int] = mapped_column(Integer, default=0)
+    chunks_indexed: Mapped[int] = mapped_column(Integer, default=0)
+    embeddings_indexed: Mapped[int] = mapped_column(Integer, default=0)
+    fault_code: Mapped[str | None] = mapped_column(String(64))
+
+
+class RetrievalChunkRecord(Base):
+    __tablename__ = "retrieval_chunks"
+    __table_args__ = (
+        CheckConstraint(
+            "start_offset >= 0 AND end_offset > start_offset",
+            name="ck_retrieval_chunks_offsets",
+        ),
+        CheckConstraint("token_count >= 1", name="ck_retrieval_chunks_token_count"),
+        CheckConstraint("length(text_hash) = 64", name="ck_retrieval_chunks_text_hash_length"),
+        UniqueConstraint(
+            "index_id",
+            "document_version_id",
+            "ordinal",
+            name="uq_retrieval_chunks_index_document_ordinal",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    index_id: Mapped[UUID] = mapped_column(ForeignKey("retrieval_indexes.id", ondelete="CASCADE"))
+    document_version_id: Mapped[UUID] = mapped_column(ForeignKey("document_versions.id"))
+    document_type: Mapped[str] = mapped_column(String(32))
+    language: Mapped[str] = mapped_column(String(32))
+    ordinal: Mapped[int] = mapped_column(Integer)
+    start_offset: Mapped[int] = mapped_column(Integer)
+    end_offset: Mapped[int] = mapped_column(Integer)
+    token_count: Mapped[int] = mapped_column(Integer)
+    text: Mapped[str] = mapped_column(Text)
+    text_hash: Mapped[str] = mapped_column(String(64))
+    search_vector: Mapped[Any] = mapped_column(
+        TSVECTOR,
+        Computed("to_tsvector('simple', text)", persisted=True),
+    )
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(384))
+
+
+class RetrievalChunkEntityRecord(Base):
+    __tablename__ = "retrieval_chunk_entities"
+
+    chunk_id: Mapped[UUID] = mapped_column(
+        ForeignKey("retrieval_chunks.id", ondelete="CASCADE"), primary_key=True
+    )
+    normalized_name: Mapped[str] = mapped_column(String(512), primary_key=True)
+    display_name: Mapped[str] = mapped_column(String(512))
+    entity_type: Mapped[str] = mapped_column(String(64))
+
+
+class RetrievalRuntimeStateRecord(Base):
+    __tablename__ = "retrieval_runtime_states"
+    __table_args__ = (
+        CheckConstraint(
+            "stage IN ('index', 'embedding', 'reranker')",
+            name="ck_retrieval_runtime_states_stage",
+        ),
+        CheckConstraint(
+            "state IN ('ready', 'degraded', 'unavailable')",
+            name="ck_retrieval_runtime_states_state",
+        ),
+    )
+
+    stage: Mapped[str] = mapped_column(String(32), primary_key=True)
+    index_id: Mapped[UUID | None] = mapped_column(ForeignKey("retrieval_indexes.id"))
+    state: Mapped[str] = mapped_column(String(32))
+    model_id: Mapped[str | None] = mapped_column(String(255))
+    revision: Mapped[str | None] = mapped_column(String(64))
+    artifact_sha256: Mapped[str | None] = mapped_column(String(64))
+    fault_code: Mapped[str | None] = mapped_column(String(64))
+    fault_detail: Mapped[str | None] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 

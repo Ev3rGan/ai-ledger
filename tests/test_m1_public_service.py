@@ -18,7 +18,9 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 from pg0 import Pg0
+from sqlalchemy import select
 from sqlalchemy.engine import make_url
+from sqlalchemy.orm import Session
 from typer.testing import CliRunner
 from uvicorn import Config
 
@@ -28,6 +30,7 @@ import ai_intel_agent.web as web_module
 from ai_intel_agent.cli import app
 from ai_intel_agent.persistence import (
     PersistentMeteredProviderBudget,
+    RetrievalRuntimeStateRecord,
     SchedulerStatusRepository,
     create_database_engine,
     upgrade_database,
@@ -61,9 +64,7 @@ def test_database_migration_accepts_percent_encoded_password(
         observed["revision"] = revision
 
     monkeypatch.setattr(persistence_module.command, "upgrade", record_upgrade)
-    database_url = (
-        "postgresql+psycopg://ai_ledger:contains%2Fslash@postgres:5432/ai_ledger"
-    )
+    database_url = "postgresql+psycopg://ai_ledger:contains%2Fslash@postgres:5432/ai_ledger"
 
     upgrade_database(database_url)
 
@@ -230,8 +231,10 @@ def test_aggregate_provider_budget_persists_and_fails_before_http(
 ) -> None:
     publish_sample_digest(m1_database_url)
     engine = create_database_engine(m1_database_url)
+
     def fixed_day() -> date:
         return datetime(2026, 8, 17, tzinfo=UTC).date()
+
     first_process_budget = PersistentMeteredProviderBudget(
         engine,
         monthly_limit_cents=100,
@@ -252,9 +255,7 @@ def test_aggregate_provider_budget_persists_and_fails_before_http(
 
     try:
         assert first_process_budget.reserve() is True
-        evidence = ResearchRepository(engine).retrieve(
-            "示例发布者的 AI Agent 会记录任务轨迹"
-        )
+        evidence = ResearchRepository(engine).retrieve("示例发布者的 AI Agent 会记录任务轨迹")
         with (
             httpx.Client(transport=httpx.MockTransport(unexpected_request)) as client,
             pytest.raises(ResearchError, match="monthly Provider budget"),
@@ -270,6 +271,7 @@ def test_aggregate_provider_budget_persists_and_fails_before_http(
         engine.dispose()
 
     assert requests == []
+
 
 def test_internal_health_endpoints_expose_only_liveness_and_database_readiness(
     m1_database_url: str,
@@ -300,9 +302,11 @@ def test_scheduler_has_one_effective_lease_and_persists_recent_status(
     )
 
     try:
-        with PostgresSchedulerLease(engine), pytest.raises(
-            RuntimeError, match="already active"
-        ), PostgresSchedulerLease(engine):
+        with (
+            PostgresSchedulerLease(engine),
+            pytest.raises(RuntimeError, match="already active"),
+            PostgresSchedulerLease(engine),
+        ):
             pass
         with PostgresSchedulerLease(engine):
             scheduler.run()
@@ -344,9 +348,12 @@ def test_scheduler_lease_monitor_guards_collection_io(
         raise RuntimeError("Production Scheduler lease was lost")
 
     try:
-        with lease, lease.monitor(
-            lease_lost.set,
-            check_interval_seconds=0.01,
+        with (
+            lease,
+            lease.monitor(
+                lease_lost.set,
+                check_interval_seconds=0.01,
+            ),
         ):
             assert lease_lost.wait(timeout=0.05) is False
 
@@ -449,6 +456,16 @@ def test_production_serve_wires_secret_files_and_persistent_allowance(
     )
 
     assert result.exit_code == 0
+    engine = create_database_engine(m1_database_url)
+    try:
+        with Session(engine) as session:
+            retrieval_states = {
+                state.stage: state for state in session.scalars(select(RetrievalRuntimeStateRecord))
+            }
+    finally:
+        engine.dispose()
+    assert retrieval_states["embedding"].fault_code == "embedding-unavailable"
+    assert retrieval_states["reranker"].fault_code == "reranker-unavailable"
     with TestClient(captured["app"]) as client:
         headers = {"X-AI-Anonymous-Client": "198.51.100.23"}
         first = client.post(
@@ -491,9 +508,7 @@ def test_production_caddy_proxy_emits_https_absolute_rss_links(
         flags=re.MULTILINE,
     )
     caddy_address = (
-        configured_caddy.group("address")
-        if configured_caddy is not None
-        else "172.31.255.2"
+        configured_caddy.group("address") if configured_caddy is not None else "172.31.255.2"
     )
     environment: dict[str, str] = {}
     monkeypatch.delenv("FORWARDED_ALLOW_IPS", raising=False)
@@ -503,9 +518,7 @@ def test_production_caddy_proxy_emits_https_absolute_rss_links(
     captured: dict[str, object] = {}
     engine = SimpleNamespace(dispose=lambda: None)
     service_configuration = SimpleNamespace(
-        database=SimpleNamespace(
-            database_url="postgresql+psycopg://fixture@postgres/ai_ledger"
-        ),
+        database=SimpleNamespace(database_url="postgresql+psycopg://fixture@postgres/ai_ledger"),
         provider=SimpleNamespace(
             api_key="fixture-provider-key",
             monthly_budget_cents=11_500,
@@ -547,6 +560,11 @@ def test_production_caddy_proxy_emits_https_absolute_rss_links(
     )
     monkeypatch.setattr(cli_module, "configure_structured_logging", lambda: None)
     monkeypatch.setattr(cli_module, "create_database_engine", lambda _: engine)
+    monkeypatch.setattr(
+        cli_module,
+        "record_retrieval_backend_startup_state",
+        lambda *_: None,
+    )
     monkeypatch.setattr(web_module, "create_database_engine", lambda _: engine)
     monkeypatch.setattr(web_module, "PublicPublicationRepository", lambda _: repository)
     monkeypatch.setattr(sys.modules["uvicorn"], "run", run_server)
@@ -722,19 +740,20 @@ def test_versioned_linux_bundle_keeps_only_https_boundary_public() -> None:
     compose = (project_root / "deploy" / "m1" / "production.compose.yml").read_text(
         encoding="utf-8"
     )
-    caddy = (project_root / "deploy" / "m1" / "Caddyfile").read_text(
-        encoding="utf-8"
-    )
+    caddy = (project_root / "deploy" / "m1" / "Caddyfile").read_text(encoding="utf-8")
     dockerfile = (project_root / "deploy" / "m1" / "production.Dockerfile").read_text(
         encoding="utf-8"
     )
     dockerignore = (project_root / ".dockerignore").read_text(encoding="utf-8")
-    release_example = (
-        project_root / "deploy" / "m1" / "release.env.example"
-    ).read_text(encoding="utf-8")
+    release_example = (project_root / "deploy" / "m1" / "release.env.example").read_text(
+        encoding="utf-8"
+    )
 
     assert "AI_INTEL_IMAGE:?" in compose
-    assert all(f"  {service}:" in compose for service in ("caddy", "web", "scheduler", "postgres", "backup"))
+    assert all(
+        f"  {service}:" in compose
+        for service in ("caddy", "web", "scheduler", "postgres", "backup")
+    )
     assert 'command: ["serve", "--production"' in compose
     assert 'command: ["schedule-sources", "--production"' in compose
     assert "AI_INTEL_SCHEDULE_BACKFILL_LIMIT" in compose
@@ -743,25 +762,20 @@ def test_versioned_linux_bundle_keeps_only_https_boundary_public() -> None:
     assert "80:80" in compose and "443:443" in compose
     postgres_block = compose.split("\n  postgres:\n", 1)[1].split("\n  web:\n", 1)[0]
     assert "ports:" not in postgres_block
-    scheduler_block = compose.split("\n  scheduler:\n", 1)[1].split(
-        "\n  backup:\n", 1
-    )[0]
+    scheduler_block = compose.split("\n  scheduler:\n", 1)[1].split("\n  backup:\n", 1)[0]
     assert (
-        "AI_INTEL_SCHEDULE_BACKFILL_LIMIT: "
-        "${AI_INTEL_SCHEDULE_BACKFILL_LIMIT:?required}"
+        "AI_INTEL_SCHEDULE_BACKFILL_LIMIT: ${AI_INTEL_SCHEDULE_BACKFILL_LIMIT:?required}"
     ) in scheduler_block
     assert "      - edge\n      - database" in scheduler_block
     assert "ports:" not in scheduler_block
     assert "internal: true" in compose
     assert "restart: unless-stopped" in compose
-    assert "max-size: \"10m\"" in compose
-    assert "max-file: \"5\"" in compose
+    assert 'max-size: "10m"' in compose
+    assert 'max-file: "5"' in compose
     assert "AI_INTEL_DATABASE_PASSWORD_FILE" in compose
     assert "DEEPSEEK_API_KEY_FILE" in compose
     assert "AI_INTEL_ANONYMOUS_ID_SALT_FILE" in compose
-    migrate_block = compose.split("\n  migrate:\n", 1)[1].split(
-        "\n  restore-postgres:\n", 1
-    )[0]
+    migrate_block = compose.split("\n  migrate:\n", 1)[1].split("\n  restore-postgres:\n", 1)[0]
     assert "deepseek-api-key" not in migrate_block
     assert "anonymous-id-salt" not in migrate_block
     assert "AI_INTEL_OFFSITE_BACKUP_DIR" in compose
@@ -774,20 +788,16 @@ def test_versioned_linux_bundle_keeps_only_https_boundary_public() -> None:
     assert "org.opencontainers.image.revision" in dockerfile
     assert "uv sync --locked --no-dev --no-editable" in dockerfile
     assert "python:3.12.10-slim-bookworm@sha256:" in dockerfile
-    assert all(pattern in dockerignore for pattern in (".env", ".git", "secrets", "backups", "reports"))
+    assert all(
+        pattern in dockerignore for pattern in (".env", ".git", "secrets", "backups", "reports")
+    )
 
 
 def test_operator_script_supports_lifecycle_backup_restore_and_rollback() -> None:
     project_root = Path(__file__).parents[1]
-    operator = (project_root / "deploy" / "m1" / "operate.sh").read_text(
-        encoding="utf-8"
-    )
-    backup = (project_root / "deploy" / "m1" / "backup.sh").read_text(
-        encoding="utf-8"
-    )
-    restore = (project_root / "deploy" / "m1" / "restore.sh").read_text(
-        encoding="utf-8"
-    )
+    operator = (project_root / "deploy" / "m1" / "operate.sh").read_text(encoding="utf-8")
+    backup = (project_root / "deploy" / "m1" / "backup.sh").read_text(encoding="utf-8")
+    restore = (project_root / "deploy" / "m1" / "restore.sh").read_text(encoding="utf-8")
 
     assert all(
         f'"{operation}")' in operator
@@ -831,19 +841,14 @@ def test_operator_script_supports_lifecycle_backup_restore_and_rollback() -> Non
         "AI_INTEL_BACKUP_INTERVAL_SECONDS",
         "AI_INTEL_BACKUP_RETENTION_DAYS",
     ):
-        assert (
-            f'"{release_key}=$(release_value "$release_file" {release_key})"'
-            in compose_block
-        )
+        assert f'"{release_key}=$(release_value "$release_file" {release_key})"' in compose_block
     assert "docker image inspect" in operator
     assert "org.opencontainers.image.revision" in operator
-    image_revision_block = operator.split("validate_image_revision() {", 1)[1].split(
+    image_revision_block = operator.split("validate_image_revision() {", 1)[1].split("\n}\n", 1)[0]
+    assert "AI_INTEL_SCHEDULE_BACKFILL_LIMIT" not in image_revision_block
+    candidate_contract_block = operator.split("validate_candidate_contract() {", 1)[1].split(
         "\n}\n", 1
     )[0]
-    assert "AI_INTEL_SCHEDULE_BACKFILL_LIMIT" not in image_revision_block
-    candidate_contract_block = operator.split(
-        "validate_candidate_contract() {", 1
-    )[1].split("\n}\n", 1)[0]
     assert "AI_INTEL_SCHEDULE_BACKFILL_LIMIT=[1-5]" in candidate_contract_block
     assert "operator migrate" in operator
     activate_block = operator.split("activate_release() {", 1)[1].split(
@@ -855,14 +860,12 @@ def test_operator_script_supports_lifecycle_backup_restore_and_rollback() -> Non
     assert activate_block.index('compose "$release_file" pull') < activate_block.index(
         'validate_image_revision "$release_file"'
     )
-    assert activate_block.index(
-        'validate_image_revision "$release_file"'
-    ) < activate_block.index("up --detach --wait postgres")
+    assert activate_block.index('validate_image_revision "$release_file"') < activate_block.index(
+        "up --detach --wait postgres"
+    )
     assert "restart caddy web scheduler backup postgres" in operator
     assert 'activate_release "$previous_release" 0' in operator
-    start_release_block = operator.split("start_release() {", 1)[1].split(
-        "\n}\n", 1
-    )[0]
+    start_release_block = operator.split("start_release() {", 1)[1].split("\n}\n", 1)[0]
     assert 'validate_candidate_contract "$release_file"' in start_release_block
     assert "validate_candidate_contract" not in activate_block
     upgrade_block = operator.split('  "upgrade")', 1)[1].split('  "rollback")', 1)[0]

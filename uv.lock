@@ -14,6 +14,7 @@ dependencies = [
     { name = "alembic" },
     { name = "fastapi" },
     { name = "httpx" },
+    { name = "pgvector" },
     { name = "playwright" },
     { name = "psycopg", extra = ["binary"] },
     { name = "pydantic" },
@@ -48,11 +49,12 @@ requires-dist = [
     { name = "alembic", specifier = ">=1.14" },
     { name = "beautifulsoup4", marker = "extra == 'ch3'", specifier = ">=4.12" },
     { name = "fastapi", specifier = ">=0.116,<1" },
-    { name = "fastembed", marker = "extra == 'retrieval'", specifier = ">=0.8,<0.9" },
+    { name = "fastembed", marker = "extra == 'retrieval'", specifier = "==0.8.0" },
     { name = "feedparser", marker = "extra == 'ch3'", specifier = ">=6.0" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "httpx2", marker = "extra == 'dev'", specifier = ">=2,<3" },
     { name = "pg0-embedded", marker = "extra == 'dev'", specifier = "==0.15.1" },
+    { name = "pgvector", specifier = ">=0.4,<1" },
     { name = "playwright", specifier = ">=1.62.0" },
     { name = "psutil", marker = "extra == 'retrieval'", specifier = ">=7,<8" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
@@ -769,6 +771,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/66/d6/2e86e879cfd9b1ddc1bf7ad807c0e09329cf2b1c1c488d668eb9fd8ab2d9/pg0_embedded-0.15.1-py3-none-manylinux_2_35_aarch64.whl", hash = "sha256:96e1b0867421e3553e34b39c7492b2301aff34f85eeef7a553d45601fd2f4d77", size = 29817061, upload-time = "2026-07-31T19:52:25.048Z" },
     { url = "https://files.pythonhosted.org/packages/ef/93/97e02722ca40c3e9907c641866f8f29479f406e7087d09fe3fbf3de61bbb/pg0_embedded-0.15.1-py3-none-manylinux_2_35_x86_64.whl", hash = "sha256:24336e666bd3c954cb70fac2f93db1f928116aa92cbd0aba9320f789acfbb263", size = 30408224, upload-time = "2026-07-31T19:52:28.31Z" },
     { url = "https://files.pythonhosted.org/packages/0d/3c/fa8526ce1f7ddc0283370629593f2f7303288cb74d1c67eacbabbc4ecf57/pg0_embedded-0.15.1-py3-none-win_amd64.whl", hash = "sha256:35a245d29452915a314ecb655f33a35d8d881583d6c00373ef616a47a84c639f", size = 55104180, upload-time = "2026-07-31T19:52:32.286Z" },
+]
+
+[[package]]
+name = "pgvector"
+version = "0.5.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/a7/ec/6eb80aebc728200f95229219882994c1b0585b956ca47da5edb9d062627a/pgvector-0.5.0.tar.gz", hash = "sha256:07a9dcf735696879406983afc6eba9a787cef7c0cf6c367ca1a5779f036dee74", size = 35170, upload-time = "2026-07-06T18:27:27.767Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5c/e4/a5573f2c579ca9ad133293bfb624148ba0893674ca4a6eeec85ced9a6a09/pgvector-0.5.0-py3-none-any.whl", hash = "sha256:fedc9800894e6da2be51358d7b7c574bf34f247ca741a5a09513622135f5964f", size = 30958, upload-time = "2026-07-06T18:27:26.797Z" },
 ]
 
 [[package]]
