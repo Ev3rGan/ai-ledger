@@ -1808,6 +1808,96 @@ def test_operator_cli_rebuilds_model_free_and_exposes_degraded_health(
 
 
 @pytest.mark.postgres
+def test_operator_cli_accepts_timezone_aware_combined_retrieval_filters(
+    m4_database_url: str,
+) -> None:
+    _, story_id, _, evidence_id = _persist_knowledge_story(
+        m4_database_url,
+        identity="operator-time-filters",
+        body="CUDA-12.8 powers the accepted timezone filter fixture.",
+        publisher="NVIDIA Technical Blog",
+        published_at=datetime(2026, 8, 19, 8, tzinfo=UTC),
+        occurred_at=datetime(2026, 8, 19, 9, tzinfo=UTC),
+        primary_topic=Topic.INDUSTRY_AND_INFRASTRUCTURE,
+    )
+    environment = {"AI_INTEL_DATABASE_URL": m4_database_url}
+
+    rebuilt = runner.invoke(
+        app,
+        ["operator", "retrieval", "index", "--complete"],
+        env=environment,
+    )
+    queried = runner.invoke(
+        app,
+        [
+            "operator",
+            "retrieval",
+            "query",
+            "CUDA-12.8",
+            "--source",
+            "NVIDIA Technical Blog",
+            "--date",
+            "2026-08-19",
+            "--topic",
+            Topic.INDUSTRY_AND_INFRASTRUCTURE.value,
+            "--occurred-from",
+            "2026-08-19T08:00:00Z",
+            "--occurred-to",
+            "2026-08-20T08:00:00+08:00",
+        ],
+        env=environment,
+    )
+
+    assert rebuilt.exit_code == 0, rebuilt.output
+    assert queried.exit_code == 0, queried.output
+    payload = json.loads(queried.output)
+    assert tuple(hit["story_id"] for hit in payload["hits"]) == (str(story_id),)
+    assert tuple(hit["evidence_span_id"] for hit in payload["hits"]) == (str(evidence_id),)
+    assert payload["trace"]["entity"]
+
+
+@pytest.mark.postgres
+def test_operator_cli_rejects_invalid_retrieval_time_boundaries(
+    m4_database_url: str,
+) -> None:
+    environment = {"AI_INTEL_DATABASE_URL": m4_database_url}
+    cases = (
+        (
+            ["--occurred-from", "2026-08-19T08:00:00"],
+            "occurred_from must use timezone-aware ISO-8601 form",
+        ),
+        (
+            ["--occurred-from", "not-a-timestamp"],
+            "occurred_from must use timezone-aware ISO-8601 form",
+        ),
+        (
+            [
+                "--occurred-from",
+                "2026-08-20T00:00:00Z",
+                "--occurred-to",
+                "2026-08-19T08:00:00+00:00",
+            ],
+            "occurred_from must be earlier than occurred_to",
+        ),
+    )
+
+    results = tuple(
+        (
+            runner.invoke(
+                app,
+                ["operator", "retrieval", "query", "CUDA-12.8", *arguments],
+                env=environment,
+            ),
+            message,
+        )
+        for arguments, message in cases
+    )
+
+    assert all(result.exit_code != 0 for result, _ in results)
+    assert all(message in result.output for result, message in results)
+
+
+@pytest.mark.postgres
 def test_0010_to_0011_rehearsal_preserves_predecessor_state_and_builds_fallback_index() -> None:
     name = f"ai_intel_m4_rehearsal_{_id(os.urandom(8).hex).hex}"
     data_root = os.getenv("PG0_TEST_DATA_ROOT")
