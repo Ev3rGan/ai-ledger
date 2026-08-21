@@ -7,7 +7,7 @@ from datetime import UTC, date, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Protocol
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from alembic.config import Config
 from dotenv import load_dotenv
@@ -57,14 +57,25 @@ from ai_intel_agent.domain import (
 )
 from ai_intel_agent.editorial import (
     ClaimInspection,
+    DigestPlan,
+    DigestPlanInclusion,
     DigestPreview,
     DigestPublicationContract,
+    EditorialContext,
+    EditorialPlanProvider,
     EditorialStateError,
     EvidenceSpanInspection,
+    SchedulerHealthInspection,
+    SourceHealthInspection,
     StoryInspection,
     compose_digest,
+    editorial_window_for,
     publish_digest,
+    restore_digest_plan,
     review_story,
+)
+from ai_intel_agent.editorial import (
+    prepare_digest_plan as build_digest_plan,
 )
 from ai_intel_agent.source_portfolio import SourcePortfolioDefinition
 from alembic import command
@@ -155,9 +166,7 @@ class StoryRecord(Base):
     )
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
-    primary_document_version_id: Mapped[UUID] = mapped_column(
-        ForeignKey("document_versions.id")
-    )
+    primary_document_version_id: Mapped[UUID] = mapped_column(ForeignKey("document_versions.id"))
     stable_key: Mapped[str] = mapped_column(String(255), unique=True)
     headline: Mapped[str] = mapped_column(String(500))
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -183,12 +192,11 @@ class StoryPresentationRecord(Base):
         ),
     )
 
-    story_id: Mapped[UUID] = mapped_column(
-        ForeignKey("stories.id"), primary_key=True
-    )
+    story_id: Mapped[UUID] = mapped_column(ForeignKey("stories.id"), primary_key=True)
     summary: Mapped[str] = mapped_column(Text)
     why_it_matters: Mapped[str] = mapped_column(Text)
     primary_topic: Mapped[str] = mapped_column(String(64))
+    secondary_topics: Mapped[list[str]] = mapped_column(JSON, default=list)
 
 
 class ClaimRecord(Base):
@@ -248,8 +256,15 @@ class DigestRecord(Base):
             name="ck_digests_state",
         ),
         CheckConstraint(
-            "publication_contract IN ('legacy-fixture', 'm3-multisource')",
+            "publication_contract IN ('legacy-fixture', 'm3-multisource', 'm3-editorial-plan')",
             name="ck_digests_publication_contract",
+        ),
+        CheckConstraint(
+            "(publication_contract = 'm3-editorial-plan' "
+            "AND digest_plan_id IS NOT NULL) OR "
+            "(publication_contract <> 'm3-editorial-plan' "
+            "AND digest_plan_id IS NULL)",
+            name="ck_digests_editorial_plan_contract",
         ),
     )
 
@@ -263,6 +278,7 @@ class DigestRecord(Base):
         String(32),
         server_default=DigestPublicationContract.M3_MULTISOURCE.value,
     )
+    digest_plan_id: Mapped[UUID | None] = mapped_column(ForeignKey("digest_plans.id"), unique=True)
 
 
 class DigestStoryRecord(Base):
@@ -288,6 +304,66 @@ class AuditEventRecord(Base):
     attributes: Mapped[dict[str, Any]] = mapped_column(JSON)
 
 
+class DigestPlanRecord(Base):
+    __tablename__ = "digest_plans"
+    __table_args__ = (
+        CheckConstraint("version >= 1", name="ck_digest_plans_version_positive"),
+        CheckConstraint("window_end > window_start", name="ck_digest_plans_window_order"),
+        CheckConstraint(
+            "length(content_hash) = 64 AND length(current_state_hash) = 64",
+            name="ck_digest_plans_hash_lengths",
+        ),
+        UniqueConstraint(
+            "publication_date",
+            "version",
+            name="uq_digest_plans_publication_version",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    publication_date: Mapped[date] = mapped_column(Date)
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    window_end: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer)
+    prepared_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    content: Mapped[dict[str, Any]] = mapped_column(JSON)
+    content_hash: Mapped[str] = mapped_column(String(64))
+    current_state_hash: Mapped[str] = mapped_column(String(64))
+    provider_identifier: Mapped[str] = mapped_column(String(255))
+    protocol_version: Mapped[str] = mapped_column(String(255))
+
+
+class DigestPlanApprovalRecord(Base):
+    __tablename__ = "digest_plan_approvals"
+    __table_args__ = (
+        CheckConstraint(
+            "length(content_hash) = 64",
+            name="ck_digest_plan_approvals_hash_length",
+        ),
+    )
+
+    plan_id: Mapped[UUID] = mapped_column(ForeignKey("digest_plans.id"), primary_key=True)
+    digest_id: Mapped[UUID] = mapped_column(ForeignKey("digests.id"), unique=True)
+    content_hash: Mapped[str] = mapped_column(String(64))
+    actor_identifier: Mapped[str] = mapped_column(String(255))
+    approved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class DigestWithdrawalRecord(Base):
+    __tablename__ = "digest_withdrawals"
+    __table_args__ = (
+        CheckConstraint(
+            "length(btrim(reason)) BETWEEN 20 AND 1000",
+            name="ck_digest_withdrawals_reason_length",
+        ),
+    )
+
+    digest_id: Mapped[UUID] = mapped_column(ForeignKey("digests.id"), primary_key=True)
+    actor_identifier: Mapped[str] = mapped_column(String(255))
+    reason: Mapped[str] = mapped_column(Text)
+    withdrawn_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class SourceDefinitionRecord(Base):
     __tablename__ = "source_definitions"
     __table_args__ = (
@@ -296,8 +372,7 @@ class SourceDefinitionRecord(Base):
             name="ck_source_definitions_activation",
         ),
         CheckConstraint(
-            "evidence_eligibility IN "
-            "('body-valid', 'policy-valid-structured', 'never')",
+            "evidence_eligibility IN ('body-valid', 'policy-valid-structured', 'never')",
             name="ck_source_definitions_evidence_eligibility",
         ),
         CheckConstraint(
@@ -355,9 +430,7 @@ class CollectionRunRecord(Base):
     )
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
-    retry_of_run_id: Mapped[UUID | None] = mapped_column(
-        ForeignKey("collection_runs.id")
-    )
+    retry_of_run_id: Mapped[UUID | None] = mapped_column(ForeignKey("collection_runs.id"))
     status: Mapped[str] = mapped_column(String(32))
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -426,9 +499,7 @@ class SourceProfileStateRecord(Base):
     cursor_value: Mapped[str | None] = mapped_column(Text)
     health: Mapped[str] = mapped_column(String(32))
     consecutive_failures: Mapped[int] = mapped_column(Integer)
-    last_collection_run_id: Mapped[UUID] = mapped_column(
-        ForeignKey("collection_runs.id")
-    )
+    last_collection_run_id: Mapped[UUID] = mapped_column(ForeignKey("collection_runs.id"))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     pause_state: Mapped[str] = mapped_column(String(32))
 
@@ -465,12 +536,8 @@ class SourceCandidateResultRecord(Base):
     source_definition_id: Mapped[UUID] = mapped_column(
         ForeignKey("source_definitions.id"), primary_key=True
     )
-    candidate_id: Mapped[UUID] = mapped_column(
-        ForeignKey("candidates.id"), primary_key=True
-    )
-    document_version_id: Mapped[UUID | None] = mapped_column(
-        ForeignKey("document_versions.id")
-    )
+    candidate_id: Mapped[UUID] = mapped_column(ForeignKey("candidates.id"), primary_key=True)
+    document_version_id: Mapped[UUID | None] = mapped_column(ForeignKey("document_versions.id"))
     article_status: Mapped[str] = mapped_column(String(32))
     error_code: Mapped[str | None] = mapped_column(String(64))
     error_message: Mapped[str | None] = mapped_column(Text)
@@ -497,13 +564,9 @@ class SourceSpecificRecordRecord(Base):
     )
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
-    source_definition_id: Mapped[UUID] = mapped_column(
-        ForeignKey("source_definitions.id")
-    )
+    source_definition_id: Mapped[UUID] = mapped_column(ForeignKey("source_definitions.id"))
     candidate_id: Mapped[UUID] = mapped_column(ForeignKey("candidates.id"))
-    document_version_id: Mapped[UUID | None] = mapped_column(
-        ForeignKey("document_versions.id")
-    )
+    document_version_id: Mapped[UUID | None] = mapped_column(ForeignKey("document_versions.id"))
     record_kind: Mapped[str] = mapped_column(String(64))
     external_id: Mapped[str] = mapped_column(String(512))
     external_version: Mapped[str] = mapped_column(String(255))
@@ -633,14 +696,10 @@ class AnonymousResearchAllowanceRepository:
                     AnonymousResearchUsageRecord.client_hash,
                 ],
                 set_={
-                    "provider_calls_used": (
-                        AnonymousResearchUsageRecord.provider_calls_used + 1
-                    ),
+                    "provider_calls_used": (AnonymousResearchUsageRecord.provider_calls_used + 1),
                     "updated_at": now,
                 },
-                where=(
-                    AnonymousResearchUsageRecord.provider_calls_used < daily_limit
-                ),
+                where=(AnonymousResearchUsageRecord.provider_calls_used < daily_limit),
             )
             .returning(AnonymousResearchUsageRecord.provider_calls_used)
         )
@@ -682,8 +741,7 @@ class MeteredProviderBudgetRepository:
                 index_elements=[MeteredProviderBudgetRecord.billing_month],
                 set_={
                     "reserved_cents": (
-                        MeteredProviderBudgetRecord.reserved_cents
-                        + reservation_cents
+                        MeteredProviderBudgetRecord.reserved_cents + reservation_cents
                     ),
                     "updated_at": now,
                 },
@@ -731,6 +789,33 @@ class SchedulerStatusSnapshot:
     last_completed_at: datetime | None
     last_result: str | None
     updated_at: datetime
+
+
+@dataclass(frozen=True)
+class DigestPlanApprovalSnapshot:
+    plan_id: UUID
+    digest_id: UUID
+    content_hash: str
+    actor_identifier: str
+    approved_at: datetime
+
+
+@dataclass(frozen=True)
+class DigestWithdrawalSnapshot:
+    digest_id: UUID
+    actor_identifier: str
+    reason: str
+    withdrawn_at: datetime
+
+
+@dataclass(frozen=True)
+class DigestHistorySnapshot:
+    digest: Digest
+    publication_contract: str
+    plan: DigestPlan | None
+    approval: DigestPlanApprovalSnapshot | None
+    withdrawal: DigestWithdrawalSnapshot | None
+    audit_actions: tuple[str, ...]
 
 
 class SchedulerStatusRepository:
@@ -842,6 +927,529 @@ class EditorialRepository:
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
 
+    def prepare_digest_plan(
+        self,
+        publication_date: date,
+        *,
+        provider: EditorialPlanProvider,
+        prepared_at: datetime,
+    ) -> DigestPlan:
+        context = self._editorial_context(publication_date)
+        with Session(self._engine) as session:
+            latest = session.scalar(
+                select(DigestPlanRecord)
+                .where(DigestPlanRecord.publication_date == publication_date)
+                .order_by(DigestPlanRecord.version.desc())
+                .limit(1)
+            )
+            next_version = 1 if latest is None else latest.version + 1
+        plan = build_digest_plan(
+            context,
+            provider,
+            version=next_version,
+            prepared_at=prepared_at,
+        )
+        if latest is not None and latest.content_hash == plan.content_hash:
+            return self._plan(latest)
+        with Session(self._engine) as session, session.begin():
+            locked_latest = session.scalar(
+                select(DigestPlanRecord)
+                .where(DigestPlanRecord.publication_date == publication_date)
+                .order_by(DigestPlanRecord.version.desc())
+                .limit(1)
+                .with_for_update()
+            )
+            if (locked_latest is None and next_version != 1) or (
+                locked_latest is not None and locked_latest.version != next_version - 1
+            ):
+                raise EditorialStateError(
+                    "Digest Plan version changed while the Editorial Agent was preparing"
+                )
+            if locked_latest is not None and locked_latest.content_hash == plan.content_hash:
+                return self._plan(locked_latest)
+            session.add(
+                DigestPlanRecord(
+                    id=plan.id,
+                    publication_date=plan.publication_date,
+                    window_start=plan.window_start,
+                    window_end=plan.window_end,
+                    version=plan.version,
+                    prepared_at=plan.prepared_at,
+                    content=plan.content_payload(),
+                    content_hash=plan.content_hash,
+                    current_state_hash=plan.current_state_hash,
+                    provider_identifier=plan.provider_identifier,
+                    protocol_version=plan.protocol_version,
+                )
+            )
+            session.flush()
+            _persist_raw_audit_event(
+                session,
+                operation_key=f"m3-editorial-plan:{plan.id}:prepared",
+                actor_identifier=plan.provider_identifier,
+                action="digest-plan.prepared",
+                subject_type="digest-plan",
+                subject_id=plan.id,
+                occurred_at=plan.prepared_at,
+                sequence=0,
+                attributes={
+                    "version": plan.version,
+                    "content_hash": plan.content_hash,
+                    "current_state_hash": plan.current_state_hash,
+                    "protocol_version": plan.protocol_version,
+                },
+            )
+        return plan
+
+    def digest_plan(self, plan_id: UUID) -> DigestPlan | None:
+        with Session(self._engine) as session:
+            record = session.get(DigestPlanRecord, plan_id)
+            return self._plan(record) if record is not None else None
+
+    def approve_digest_plan(
+        self,
+        plan_id: UUID,
+        *,
+        expected_content_hash: str,
+        actor_identifier: str,
+        approved_at: datetime,
+    ) -> Digest:
+        normalized_actor = actor_identifier.strip()
+        if not normalized_actor:
+            raise EditorialStateError("Digest Plan approval requires an actor")
+        with Session(self._engine) as session, session.begin():
+            session.connection().exec_driver_sql(
+                """
+                LOCK TABLE
+                    source_definitions,
+                    collection_runs,
+                    candidates,
+                    document_versions,
+                    source_candidate_results,
+                    source_profile_states,
+                    scheduler_status,
+                    stories,
+                    claims,
+                    evidence_spans,
+                    story_presentations,
+                    digest_plans
+                IN SHARE ROW EXCLUSIVE MODE
+                """
+            )
+            record = session.scalar(
+                select(DigestPlanRecord).where(DigestPlanRecord.id == plan_id).with_for_update()
+            )
+            if record is None:
+                raise EditorialStateError(f"Digest Plan {plan_id} does not exist")
+            plan = self._plan(record)
+            if plan.content_hash != expected_content_hash:
+                raise EditorialStateError("Digest Plan content hash does not match approval")
+            existing_approval = session.get(DigestPlanApprovalRecord, plan_id)
+            if existing_approval is not None:
+                if existing_approval.content_hash != expected_content_hash:
+                    raise EditorialStateError(
+                        "Existing Digest Plan approval has a different content hash"
+                    )
+                if existing_approval.actor_identifier != normalized_actor:
+                    raise EditorialStateError(
+                        "Existing Digest Plan approval belongs to a different actor"
+                    )
+                existing_digest = session.get(
+                    DigestRecord,
+                    existing_approval.digest_id,
+                )
+                if existing_digest is None:
+                    raise EditorialStateError(
+                        "Existing Digest Plan approval has no publication record"
+                    )
+                return self._digest(session, existing_digest)
+
+            latest = session.scalar(
+                select(DigestPlanRecord)
+                .where(DigestPlanRecord.publication_date == record.publication_date)
+                .order_by(DigestPlanRecord.version.desc())
+                .limit(1)
+                .with_for_update()
+            )
+            if latest is None or plan.version != latest.version:
+                raise EditorialStateError("Only the latest Digest Plan version may be approved")
+            if any(anomaly.blocking for anomaly in plan.anomalies):
+                raise EditorialStateError("A Digest Plan with a blocking anomaly cannot publish")
+            current_context = self._editorial_context_in_session(
+                session,
+                plan.publication_date,
+                lock=True,
+            )
+            if current_context.current_state_hash != plan.current_state_hash:
+                raise EditorialStateError(
+                    "Persisted Story, Evidence, Source, or Scheduler state changed; "
+                    "prepare a new Plan"
+                )
+            existing_digest = session.scalar(
+                select(DigestRecord).where(DigestRecord.publication_date == plan.publication_date)
+            )
+            if existing_digest is not None:
+                raise EditorialStateError("An existing Digest already uses this publication date")
+
+            included_story_ids: list[UUID] = []
+            for item in plan.stories:
+                story_record = session.get(StoryRecord, item.id)
+                if story_record is None:
+                    raise EditorialStateError(f"Story {item.stable_key!r} no longer exists")
+                if item.inclusion is DigestPlanInclusion.HELD:
+                    continue
+                decision = (
+                    StoryReviewState.ACCEPTED
+                    if item.inclusion is DigestPlanInclusion.INCLUDED
+                    else StoryReviewState.REJECTED
+                )
+                reviewed, event = review_story(
+                    Story(
+                        id=story_record.id,
+                        primary_document_version_id=(story_record.primary_document_version_id),
+                        stable_key=story_record.stable_key,
+                        headline=story_record.headline,
+                        occurred_at=story_record.occurred_at,
+                        review_state=StoryReviewState(story_record.review_state),
+                    ),
+                    decision,
+                    actor_identifier=normalized_actor,
+                    now=approved_at,
+                )
+                story_record.review_state = reviewed.review_state.value
+                if decision is StoryReviewState.ACCEPTED:
+                    session.execute(
+                        insert(StoryPresentationRecord)
+                        .values(
+                            story_id=story_record.id,
+                            summary=item.summary,
+                            why_it_matters=item.why_it_matters,
+                            primary_topic=Topic(item.primary_topic).value,
+                            secondary_topics=[
+                                Topic(topic).value for topic in item.secondary_topics
+                            ],
+                        )
+                        .on_conflict_do_update(
+                            index_elements=[StoryPresentationRecord.story_id],
+                            set_={
+                                "summary": item.summary,
+                                "why_it_matters": item.why_it_matters,
+                                "primary_topic": Topic(item.primary_topic).value,
+                                "secondary_topics": [
+                                    Topic(topic).value for topic in item.secondary_topics
+                                ],
+                            },
+                        )
+                    )
+                    included_story_ids.append(story_record.id)
+                _persist_audit_event(session, event)
+
+            ordered_story_ids = tuple(item.id for item in plan.included_stories)
+            if set(included_story_ids) != set(ordered_story_ids):
+                raise EditorialStateError("Digest Plan included Story decisions are inconsistent")
+            draft = compose_digest(plan.publication_date, ordered_story_ids)
+            published, digest_events = publish_digest(
+                draft,
+                actor_identifier=normalized_actor,
+                now=approved_at,
+            )
+            digest_record = DigestRecord(
+                id=draft.id,
+                stable_key=draft.stable_key,
+                publication_date=draft.publication_date,
+                state=draft.state.value,
+                published_at=draft.published_at,
+                introduction=plan.digest_summary,
+                publication_contract=DigestPublicationContract.M3_EDITORIAL_PLAN.value,
+                digest_plan_id=plan.id,
+            )
+            session.add(digest_record)
+            session.flush()
+            session.add_all(
+                DigestStoryRecord(
+                    digest_id=draft.id,
+                    story_id=story_id,
+                    position=position,
+                )
+                for position, story_id in enumerate(ordered_story_ids)
+            )
+            _persist_audit_event(session, digest_events[0])
+            session.flush()
+            session.add(
+                DigestPlanApprovalRecord(
+                    plan_id=plan.id,
+                    digest_id=draft.id,
+                    content_hash=plan.content_hash,
+                    actor_identifier=normalized_actor,
+                    approved_at=approved_at,
+                )
+            )
+            _persist_raw_audit_event(
+                session,
+                operation_key=f"m3-editorial-plan:{plan.id}:approved",
+                actor_identifier=normalized_actor,
+                action="digest-plan.approved",
+                subject_type="digest-plan",
+                subject_id=plan.id,
+                occurred_at=approved_at,
+                sequence=0,
+                attributes={
+                    "content_hash": plan.content_hash,
+                    "digest_id": str(draft.id),
+                },
+            )
+            session.flush()
+            digest_record.state = published.state.value
+            digest_record.published_at = published.published_at
+            _persist_audit_event(session, digest_events[1])
+            session.flush()
+            return published
+
+    def digest_history(self, publication_date: date) -> DigestHistorySnapshot | None:
+        with Session(self._engine) as session:
+            digest_record = session.scalar(
+                select(DigestRecord)
+                .where(DigestRecord.publication_date == publication_date)
+                .order_by(DigestRecord.published_at.desc())
+                .limit(1)
+            )
+            if digest_record is None:
+                return None
+            plan_record = (
+                session.get(DigestPlanRecord, digest_record.digest_plan_id)
+                if digest_record.digest_plan_id is not None
+                else None
+            )
+            if digest_record.digest_plan_id is not None and plan_record is None:
+                raise EditorialStateError("Digest publication has no persisted Plan")
+            approval_record = (
+                session.get(DigestPlanApprovalRecord, digest_record.digest_plan_id)
+                if digest_record.digest_plan_id is not None
+                else None
+            )
+            approval = (
+                DigestPlanApprovalSnapshot(
+                    plan_id=approval_record.plan_id,
+                    digest_id=approval_record.digest_id,
+                    content_hash=approval_record.content_hash,
+                    actor_identifier=approval_record.actor_identifier,
+                    approved_at=approval_record.approved_at,
+                )
+                if approval_record is not None
+                else None
+            )
+            withdrawal_record = session.get(
+                DigestWithdrawalRecord,
+                digest_record.id,
+            )
+            withdrawal = (
+                DigestWithdrawalSnapshot(
+                    digest_id=withdrawal_record.digest_id,
+                    actor_identifier=withdrawal_record.actor_identifier,
+                    reason=withdrawal_record.reason,
+                    withdrawn_at=withdrawal_record.withdrawn_at,
+                )
+                if withdrawal_record is not None
+                else None
+            )
+            plan = self._plan(plan_record) if plan_record is not None else None
+            subject_ids = {digest_record.id}
+            if plan is not None:
+                subject_ids.add(plan.id)
+                subject_ids.update(item.id for item in plan.stories)
+            audit_actions = tuple(
+                session.scalars(
+                    select(AuditEventRecord.action)
+                    .where(AuditEventRecord.subject_id.in_(subject_ids))
+                    .order_by(
+                        AuditEventRecord.occurred_at,
+                        AuditEventRecord.sequence,
+                        AuditEventRecord.operation_key,
+                    )
+                )
+            )
+            return DigestHistorySnapshot(
+                digest=self._digest(session, digest_record),
+                publication_contract=digest_record.publication_contract,
+                plan=plan,
+                approval=approval,
+                withdrawal=withdrawal,
+                audit_actions=audit_actions,
+            )
+
+    def withdraw_digest(
+        self,
+        publication_date: date,
+        *,
+        actor_identifier: str,
+        reason: str,
+        withdrawn_at: datetime,
+    ) -> DigestWithdrawalSnapshot:
+        normalized_actor = actor_identifier.strip()
+        normalized_reason = reason.strip()
+        if not normalized_actor:
+            raise EditorialStateError("Digest withdrawal requires an actor")
+        if not 20 <= len(normalized_reason) <= 1000:
+            raise EditorialStateError(
+                "Digest withdrawal reason must contain between 20 and 1000 characters"
+            )
+        with Session(self._engine) as session, session.begin():
+            digest = session.scalar(
+                select(DigestRecord)
+                .where(DigestRecord.publication_date == publication_date)
+                .with_for_update()
+            )
+            if digest is None or digest.state != DigestState.PUBLISHED.value:
+                raise EditorialStateError(
+                    f"Published Digest {publication_date.isoformat()} does not exist"
+                )
+            existing = session.get(DigestWithdrawalRecord, digest.id)
+            if existing is not None:
+                if (
+                    existing.actor_identifier != normalized_actor
+                    or existing.reason != normalized_reason
+                ):
+                    raise EditorialStateError(
+                        "Withdrawn Digest retry must preserve actor and reason"
+                    )
+                return DigestWithdrawalSnapshot(
+                    digest_id=existing.digest_id,
+                    actor_identifier=existing.actor_identifier,
+                    reason=existing.reason,
+                    withdrawn_at=existing.withdrawn_at,
+                )
+            session.add(
+                DigestWithdrawalRecord(
+                    digest_id=digest.id,
+                    actor_identifier=normalized_actor,
+                    reason=normalized_reason,
+                    withdrawn_at=withdrawn_at,
+                )
+            )
+            _persist_raw_audit_event(
+                session,
+                operation_key=f"m3-digest:{digest.id}:withdrawn",
+                actor_identifier=normalized_actor,
+                action="digest.withdrawn",
+                subject_type=AuditSubjectType.DIGEST.value,
+                subject_id=digest.id,
+                occurred_at=withdrawn_at,
+                sequence=0,
+                attributes={
+                    "publication_date": publication_date.isoformat(),
+                    "reason": normalized_reason,
+                },
+            )
+            session.flush()
+            return DigestWithdrawalSnapshot(
+                digest_id=digest.id,
+                actor_identifier=normalized_actor,
+                reason=normalized_reason,
+                withdrawn_at=withdrawn_at,
+            )
+
+    def _editorial_context(self, publication_date: date) -> EditorialContext:
+        with Session(self._engine) as session:
+            return self._editorial_context_in_session(session, publication_date)
+
+    def _editorial_context_in_session(
+        self,
+        session: Session,
+        publication_date: date,
+        *,
+        lock: bool = False,
+    ) -> EditorialContext:
+        window_start, window_end = editorial_window_for(publication_date)
+        story_statement = (
+            select(StoryRecord.id)
+            .where(StoryRecord.review_state == StoryReviewState.UNREVIEWED.value)
+            .order_by(StoryRecord.occurred_at, StoryRecord.stable_key)
+        )
+        source_statement = (
+            select(SourceProfileStateRecord, SourceDefinitionRecord)
+            .join(
+                SourceDefinitionRecord,
+                SourceDefinitionRecord.id == SourceProfileStateRecord.source_definition_id,
+            )
+            .order_by(SourceDefinitionRecord.id)
+        )
+        scheduler_statement = select(SchedulerStatusRecord).where(
+            SchedulerStatusRecord.scheduler_key == SchedulerStatusRepository._KEY
+        )
+        if lock:
+            story_statement = story_statement.with_for_update()
+            source_statement = source_statement.with_for_update()
+            scheduler_statement = scheduler_statement.with_for_update()
+        story_ids = session.scalars(story_statement).all()
+        if lock and story_ids:
+            session.scalars(
+                select(StoryPresentationRecord.story_id)
+                .where(StoryPresentationRecord.story_id.in_(story_ids))
+                .with_for_update()
+            ).all()
+            claim_ids = session.scalars(
+                select(ClaimRecord.id).where(ClaimRecord.story_id.in_(story_ids)).with_for_update()
+            ).all()
+            if claim_ids:
+                session.scalars(
+                    select(EvidenceSpanRecord.id)
+                    .where(EvidenceSpanRecord.claim_id.in_(claim_ids))
+                    .with_for_update()
+                ).all()
+        stories = tuple(self._story(session, story_id) for story_id in story_ids)
+        source_health = tuple(
+            SourceHealthInspection(
+                source_definition_id=definition.id,
+                name=definition.name,
+                publisher=definition.publisher,
+                recent_result=state.recent_result,
+                health=state.health,
+                pause_state=state.pause_state,
+                consecutive_failures=state.consecutive_failures,
+                updated_at=state.updated_at,
+            )
+            for state, definition in session.execute(source_statement)
+        )
+        scheduler = session.scalar(scheduler_statement)
+        scheduler_health = (
+            SchedulerHealthInspection(
+                state=scheduler.state,
+                last_result=scheduler.last_result,
+                last_completed_at=scheduler.last_completed_at,
+                updated_at=scheduler.updated_at,
+            )
+            if scheduler is not None
+            else None
+        )
+        return EditorialContext(
+            publication_date=publication_date,
+            window_start=window_start,
+            window_end=window_end,
+            stories=stories,
+            source_health=source_health,
+            scheduler_health=scheduler_health,
+        )
+
+    @staticmethod
+    def _plan(record: DigestPlanRecord) -> DigestPlan:
+        plan = restore_digest_plan(
+            plan_id=record.id,
+            version=record.version,
+            prepared_at=record.prepared_at,
+            content_hash=record.content_hash,
+            payload=record.content,
+        )
+        if (
+            plan.publication_date != record.publication_date
+            or plan.window_start != record.window_start
+            or plan.window_end != record.window_end
+            or plan.current_state_hash != record.current_state_hash
+            or plan.provider_identifier != record.provider_identifier
+            or plan.protocol_version != record.protocol_version
+        ):
+            raise EditorialStateError("Persisted Digest Plan columns do not match content")
+        return plan
+
     def stories(
         self,
         *,
@@ -854,8 +1462,7 @@ class EditorialRepository:
                 select(StoryRecord.id)
                 .join(
                     DocumentVersionRecord,
-                    DocumentVersionRecord.id
-                    == StoryRecord.primary_document_version_id,
+                    DocumentVersionRecord.id == StoryRecord.primary_document_version_id,
                 )
                 .join(
                     CandidateRecord,
@@ -870,9 +1477,7 @@ class EditorialRepository:
                     func.date(DocumentVersionRecord.published_at) == publication_date
                 )
             if review_state is not None:
-                statement = statement.where(
-                    StoryRecord.review_state == review_state.value
-                )
+                statement = statement.where(StoryRecord.review_state == review_state.value)
             story_ids = session.scalars(statement).all()
             return tuple(self._story(session, story_id) for story_id in story_ids)
 
@@ -916,11 +1521,13 @@ class EditorialRepository:
         why_it_matters: str | None = None,
         primary_topic: Topic | None = None,
     ) -> StoryInspection:
+        if decision is StoryReviewState.ACCEPTED:
+            raise EditorialStateError(
+                "Direct Story acceptance is retired; use exact Digest Plan approval"
+            )
         with Session(self._engine) as session, session.begin():
             record = session.scalar(
-                select(StoryRecord)
-                .where(StoryRecord.stable_key == stable_key)
-                .with_for_update()
+                select(StoryRecord).where(StoryRecord.stable_key == stable_key).with_for_update()
             )
             if record is None:
                 raise ValueError(f"Story {stable_key!r} does not exist")
@@ -958,6 +1565,7 @@ class EditorialRepository:
                         summary=record_summary,
                         why_it_matters=record_why,
                         primary_topic=primary_topic.value,
+                        secondary_topics=[],
                     )
                 )
             record.review_state = reviewed.review_state.value
@@ -991,76 +1599,9 @@ class EditorialRepository:
         actor_identifier: str,
         published_at: datetime,
     ) -> Digest:
-        identity = compose_digest(publication_date, ())
-        with Session(self._engine) as session, session.begin():
-            existing = session.get(DigestRecord, identity.id)
-            if existing is not None:
-                if existing.state != DigestState.PUBLISHED.value:
-                    raise EditorialStateError("An existing Digest is not published")
-                existing_story_keys = tuple(
-                    session.scalars(
-                        select(StoryRecord.stable_key)
-                        .join(
-                            DigestStoryRecord,
-                            DigestStoryRecord.story_id == StoryRecord.id,
-                        )
-                        .where(DigestStoryRecord.digest_id == existing.id)
-                        .order_by(DigestStoryRecord.position)
-                    )
-                )
-                if (
-                    existing.introduction != introduction.strip()
-                    or existing_story_keys != story_keys
-                ):
-                    raise EditorialStateError(
-                        "Published Digest retry must use the original introduction and order"
-                    )
-                return self._digest(session, existing)
-
-            normalized_introduction = introduction.strip()
-            if not 20 <= len(normalized_introduction) <= 2000:
-                raise EditorialStateError(
-                    "Digest introduction must contain between 20 and 2000 characters"
-                )
-            story_ids = self._selected_story_ids(session, story_keys, lock=True)
-            draft = compose_digest(publication_date, story_ids)
-            published, events = publish_digest(
-                draft,
-                actor_identifier=actor_identifier,
-                now=published_at,
-            )
-            session.add(
-                DigestRecord(
-                    id=draft.id,
-                    stable_key=draft.stable_key,
-                    publication_date=draft.publication_date,
-                    state=draft.state.value,
-                    published_at=draft.published_at,
-                    introduction=normalized_introduction,
-                    publication_contract=(
-                        DigestPublicationContract.M3_MULTISOURCE.value
-                    ),
-                )
-            )
-            session.flush()
-            session.add_all(
-                DigestStoryRecord(
-                    digest_id=draft.id,
-                    story_id=story_id,
-                    position=position,
-                )
-                for position, story_id in enumerate(draft.story_ids)
-            )
-            _persist_audit_event(session, events[0])
-            session.flush()
-            record = session.get(DigestRecord, draft.id)
-            if record is None:
-                raise ValueError("Digest composition did not create a Digest")
-            record.state = published.state.value
-            record.published_at = published.published_at
-            _persist_audit_event(session, events[1])
-            session.flush()
-            return published
+        raise EditorialStateError(
+            "Direct Digest publication is retired; use exact Digest Plan approval"
+        )
 
     @staticmethod
     def _selected_story_ids(
@@ -1085,41 +1626,34 @@ class EditorialRepository:
             if record is None:
                 raise EditorialStateError(f"Story {stable_key!r} does not exist")
             if record.review_state != StoryReviewState.ACCEPTED.value:
-                raise EditorialStateError(
-                    f"Story {stable_key!r} is not accepted"
-                )
+                raise EditorialStateError(f"Story {stable_key!r} is not accepted")
             if session.get(StoryPresentationRecord, record.id) is None:
                 raise EditorialStateError(
                     f"Story {stable_key!r} has no reviewed reader presentation"
                 )
-            if session.scalar(
-                select(DigestStoryRecord.story_id).where(
-                    DigestStoryRecord.story_id == record.id
+            if (
+                session.scalar(
+                    select(DigestStoryRecord.story_id).where(
+                        DigestStoryRecord.story_id == record.id
+                    )
                 )
-            ) is not None:
-                raise EditorialStateError(
-                    f"Story {stable_key!r} already belongs to a Digest"
-                )
+                is not None
+            ):
+                raise EditorialStateError(f"Story {stable_key!r} already belongs to a Digest")
             publisher = session.scalar(
                 select(CandidateRecord.publisher)
                 .join(
                     DocumentVersionRecord,
                     DocumentVersionRecord.candidate_id == CandidateRecord.id,
                 )
-                .where(
-                    DocumentVersionRecord.id == record.primary_document_version_id
-                )
+                .where(DocumentVersionRecord.id == record.primary_document_version_id)
             )
             if publisher is None:
-                raise EditorialStateError(
-                    f"Story {stable_key!r} has no primary Publisher"
-                )
+                raise EditorialStateError(f"Story {stable_key!r} has no primary Publisher")
             selected_ids.append(record.id)
             publishers.add(publisher)
         if len(publishers) < 3:
-            raise EditorialStateError(
-                "A Digest requires Stories from at least three Publishers"
-            )
+            raise EditorialStateError("A Digest requires Stories from at least three Publishers")
         return tuple(selected_ids)
 
     @staticmethod
@@ -1167,16 +1701,36 @@ class EditorialRepository:
         source = session.execute(
             select(
                 CandidateRecord.publisher,
+                CandidateRecord.canonical_url,
                 DocumentVersionRecord.published_at,
+                DocumentVersionRecord.content_hash,
             )
             .join(
                 DocumentVersionRecord,
                 DocumentVersionRecord.candidate_id == CandidateRecord.id,
             )
-            .where(
-                DocumentVersionRecord.id == story.primary_document_version_id
-            )
+            .where(DocumentVersionRecord.id == story.primary_document_version_id)
         ).one()
+        source_definition = session.execute(
+            select(SourceDefinitionRecord.id, SourceDefinitionRecord.name)
+            .join(
+                SourceCandidateResultRecord,
+                SourceCandidateResultRecord.source_definition_id == SourceDefinitionRecord.id,
+            )
+            .join(
+                CollectionRunRecord,
+                CollectionRunRecord.id == SourceCandidateResultRecord.collection_run_id,
+            )
+            .where(
+                SourceCandidateResultRecord.document_version_id == story.primary_document_version_id
+            )
+            .order_by(
+                CollectionRunRecord.completed_at.desc().nullslast(),
+                CollectionRunRecord.started_at.desc(),
+                SourceDefinitionRecord.id,
+            )
+            .limit(1)
+        ).first()
         presentation = session.get(StoryPresentationRecord, story.id)
         claims: list[ClaimInspection] = []
         claim_records = session.scalars(
@@ -1187,7 +1741,12 @@ class EditorialRepository:
         for claim in claim_records:
             evidence_spans = tuple(
                 EvidenceSpanInspection(
+                    id=row.id,
+                    document_version_id=row.document_version_id,
                     exact_text=row.exact_text,
+                    start_offset=row.start_offset,
+                    end_offset=row.end_offset,
+                    text_hash=row.text_hash,
                     role=EvidenceRole(row.role),
                     relation=EvidenceRelation(row.relation),
                     publisher=row.publisher,
@@ -1195,7 +1754,12 @@ class EditorialRepository:
                 )
                 for row in session.execute(
                     select(
+                        EvidenceSpanRecord.id,
+                        EvidenceSpanRecord.document_version_id,
                         EvidenceSpanRecord.exact_text,
+                        EvidenceSpanRecord.start_offset,
+                        EvidenceSpanRecord.end_offset,
+                        EvidenceSpanRecord.text_hash,
                         EvidenceSpanRecord.role,
                         EvidenceSpanRecord.relation,
                         CandidateRecord.publisher,
@@ -1203,19 +1767,27 @@ class EditorialRepository:
                     )
                     .join(
                         DocumentVersionRecord,
-                        DocumentVersionRecord.id
-                        == EvidenceSpanRecord.document_version_id,
+                        DocumentVersionRecord.id == EvidenceSpanRecord.document_version_id,
                     )
                     .join(
                         CandidateRecord,
                         CandidateRecord.id == DocumentVersionRecord.candidate_id,
                     )
                     .where(EvidenceSpanRecord.claim_id == claim.id)
-                    .order_by(EvidenceSpanRecord.start_offset)
+                    .order_by(
+                        EvidenceSpanRecord.start_offset,
+                        EvidenceSpanRecord.document_version_id,
+                        EvidenceSpanRecord.end_offset,
+                        EvidenceSpanRecord.id,
+                    )
                 )
             )
             claims.append(
-                ClaimInspection(text=claim.text, evidence_spans=evidence_spans)
+                ClaimInspection(
+                    id=claim.id,
+                    text=claim.text,
+                    evidence_spans=evidence_spans,
+                )
             )
         return StoryInspection(
             id=story.id,
@@ -1224,13 +1796,21 @@ class EditorialRepository:
             review_state=StoryReviewState(story.review_state),
             claims=tuple(claims),
             publisher=source.publisher,
+            canonical_url=source.canonical_url,
             original_published_at=source.published_at,
-            summary=presentation.summary if presentation is not None else None,
-            why_it_matters=(
-                presentation.why_it_matters if presentation is not None else None
+            primary_document_version_id=story.primary_document_version_id,
+            primary_document_content_hash=source.content_hash,
+            source_definition_id=(source_definition.id if source_definition is not None else None),
+            source_definition_name=(
+                source_definition.name if source_definition is not None else None
             ),
-            primary_topic=(
-                Topic(presentation.primary_topic) if presentation is not None else None
+            summary=presentation.summary if presentation is not None else None,
+            why_it_matters=(presentation.why_it_matters if presentation is not None else None),
+            primary_topic=(Topic(presentation.primary_topic) if presentation is not None else None),
+            secondary_topics=(
+                tuple(Topic(value) for value in presentation.secondary_topics)
+                if presentation is not None
+                else ()
             ),
         )
 
@@ -1288,8 +1868,7 @@ class FeedCollectionRepository:
         discoveries: tuple[CollectionDiscovery, ...],
     ) -> None:
         definitions_by_id = {
-            source_definition.id: source_definition
-            for source_definition in source_definitions
+            source_definition.id: source_definition for source_definition in source_definitions
         }
         discoveries_by_definition: dict[UUID, list[CollectionDiscovery]] = {
             source_definition.id: [] for source_definition in source_definitions
@@ -1298,9 +1877,10 @@ class FeedCollectionRepository:
             discoveries_by_definition[discovery.source_definition_id].append(discovery)
 
         with Session(self._engine) as session, session.begin():
-            if run.retry_of_run_id is not None and session.get(
-                CollectionRunRecord, run.retry_of_run_id
-            ) is None:
+            if (
+                run.retry_of_run_id is not None
+                and session.get(CollectionRunRecord, run.retry_of_run_id) is None
+            ):
                 raise ValueError(
                     f"Retry parent Collection Run {run.retry_of_run_id} does not exist"
                 )
@@ -1431,9 +2011,7 @@ class MultiSourceCollectionRepository:
                     SourceDefinitionRecord.id
                     == SourceDefinitionCollectionResultRecord.source_definition_id,
                 )
-                .where(
-                    SourceDefinitionCollectionResultRecord.collection_run_id == run.id
-                )
+                .where(SourceDefinitionCollectionResultRecord.collection_run_id == run.id)
             ).all()
         )
         candidates_processed = session.scalar(
@@ -1462,9 +2040,7 @@ class MultiSourceCollectionRepository:
                         SourceProfileStateRecord.source_definition_id,
                         SourceProfileStateRecord.cursor_value,
                     ).where(
-                        SourceProfileStateRecord.source_definition_id.in_(
-                            source_definition_ids
-                        ),
+                        SourceProfileStateRecord.source_definition_id.in_(source_definition_ids),
                         SourceProfileStateRecord.cursor_value.is_not(None),
                     )
                 )
@@ -1499,9 +2075,7 @@ class MultiSourceCollectionRepository:
             core_results = session.scalar(
                 select(
                     func.count(
-                        func.distinct(
-                            SourceDefinitionCollectionResultRecord.source_definition_id
-                        )
+                        func.distinct(SourceDefinitionCollectionResultRecord.source_definition_id)
                     )
                 )
                 .select_from(SourceDefinitionCollectionResultRecord)
@@ -1511,22 +2085,16 @@ class MultiSourceCollectionRepository:
                     == SourceDefinitionCollectionResultRecord.source_definition_id,
                 )
                 .where(
-                    SourceDefinitionCollectionResultRecord.collection_run_id
-                    == collection_run_id,
+                    SourceDefinitionCollectionResultRecord.collection_run_id == collection_run_id,
                     SourceDefinitionRecord.acceptance_group == "core",
                 )
             )
             eligible_contributors = session.scalar(
-                select(
-                    func.count(
-                        func.distinct(SourceCandidateResultRecord.source_definition_id)
-                    )
-                )
+                select(func.count(func.distinct(SourceCandidateResultRecord.source_definition_id)))
                 .select_from(SourceCandidateResultRecord)
                 .join(
                     SourceDefinitionRecord,
-                    SourceDefinitionRecord.id
-                    == SourceCandidateResultRecord.source_definition_id,
+                    SourceDefinitionRecord.id == SourceCandidateResultRecord.source_definition_id,
                 )
                 .where(
                     SourceCandidateResultRecord.collection_run_id == collection_run_id,
@@ -1544,8 +2112,7 @@ class MultiSourceCollectionRepository:
         states: tuple[PersistableSourceState, ...],
     ) -> bool:
         definitions_by_id = {
-            source_definition.id: source_definition
-            for source_definition in source_definitions
+            source_definition.id: source_definition for source_definition in source_definitions
         }
         with Session(self._engine) as session, session.begin():
             if run.operation_key is None:
@@ -1634,9 +2201,7 @@ class MultiSourceCollectionRepository:
             )
         else:
             session.execute(
-                insert(CandidateRecord)
-                .values(**candidate.__dict__)
-                .on_conflict_do_nothing()
+                insert(CandidateRecord).values(**candidate.__dict__).on_conflict_do_nothing()
             )
             persisted_candidate_id = session.scalar(
                 select(CandidateRecord.id).where(
@@ -1681,9 +2246,7 @@ class MultiSourceCollectionRepository:
             persisted_record_id = session.scalar(
                 insert(SourceSpecificRecordRecord)
                 .values(**record_values)
-                .on_conflict_do_nothing(
-                    constraint="uq_source_specific_record_identity"
-                )
+                .on_conflict_do_nothing(constraint="uq_source_specific_record_identity")
                 .returning(SourceSpecificRecordRecord.id)
             )
             if persisted_record_id is None:
@@ -1691,14 +2254,11 @@ class MultiSourceCollectionRepository:
                     select(SourceSpecificRecordRecord.id).where(
                         SourceSpecificRecordRecord.source_definition_id
                         == source_record.source_definition_id,
-                        SourceSpecificRecordRecord.record_kind
-                        == source_record.record_kind,
-                        SourceSpecificRecordRecord.external_id
-                        == source_record.external_id,
+                        SourceSpecificRecordRecord.record_kind == source_record.record_kind,
+                        SourceSpecificRecordRecord.external_id == source_record.external_id,
                         SourceSpecificRecordRecord.external_version
                         == source_record.external_version,
-                        SourceSpecificRecordRecord.record_hash
-                        == source_record.record_hash,
+                        SourceSpecificRecordRecord.record_hash == source_record.record_hash,
                     )
                 )
             if persisted_record_id != source_record.id:
@@ -1715,25 +2275,16 @@ class MultiSourceCollectionRepository:
                 select(SourceProfileStateRecord, SourceDefinitionRecord)
                 .join(
                     SourceDefinitionRecord,
-                    SourceDefinitionRecord.id
-                    == SourceProfileStateRecord.source_definition_id,
+                    SourceDefinitionRecord.id == SourceProfileStateRecord.source_definition_id,
                 )
-                .where(
-                    SourceProfileStateRecord.source_definition_id.in_(
-                        source_definition_ids
-                    )
-                )
+                .where(SourceProfileStateRecord.source_definition_id.in_(source_definition_ids))
                 .order_by(SourceDefinitionRecord.name)
             ).all()
             snapshots: list[SourceStatusSnapshot] = []
             for state, definition in rows:
                 pending_drafts = session.scalar(
                     select(
-                        func.count(
-                            func.distinct(
-                                SourceCandidateResultRecord.document_version_id
-                            )
-                        )
+                        func.count(func.distinct(SourceCandidateResultRecord.document_version_id))
                     )
                     .select_from(SourceCandidateResultRecord)
                     .outerjoin(
@@ -1742,8 +2293,7 @@ class MultiSourceCollectionRepository:
                         == SourceCandidateResultRecord.document_version_id,
                     )
                     .where(
-                        SourceCandidateResultRecord.source_definition_id
-                        == definition.id,
+                        SourceCandidateResultRecord.source_definition_id == definition.id,
                         SourceCandidateResultRecord.evidence_eligible.is_(True),
                         SourceCandidateResultRecord.document_version_id.is_not(None),
                         StoryRecord.id.is_(None),
@@ -1784,9 +2334,7 @@ class MultiSourceCollectionRepository:
                 == SourceCandidateResultRecord.document_version_id,
             )
             .where(
-                SourceCandidateResultRecord.source_definition_id.in_(
-                    source_definition_ids
-                ),
+                SourceCandidateResultRecord.source_definition_id.in_(source_definition_ids),
                 SourceCandidateResultRecord.evidence_eligible.is_(True),
                 SourceCandidateResultRecord.document_version_id.is_not(None),
                 StoryRecord.id.is_(None),
@@ -1843,12 +2391,9 @@ class GeminiDraftRepository:
                     select(StoryRecord.id)
                     .join(
                         DocumentVersionRecord,
-                        StoryRecord.primary_document_version_id
-                        == DocumentVersionRecord.id,
+                        StoryRecord.primary_document_version_id == DocumentVersionRecord.id,
                     )
-                    .where(
-                        DocumentVersionRecord.candidate_id == candidate_id
-                    )
+                    .where(DocumentVersionRecord.candidate_id == candidate_id)
                 )
                 is not None
             )
@@ -1871,9 +2416,7 @@ class GeminiDraftRepository:
         evidence_spans: tuple[EvidenceSpan, ...],
         traces: tuple[StructuredTrace, ...],
     ) -> bool:
-        if not claims or not (
-            len(claims) == len(evidence_spans) == len(traces)
-        ):
+        if not claims or not (len(claims) == len(evidence_spans) == len(traces)):
             raise ValueError("A Gemini draft requires one Evidence Span and Trace per Claim")
         with Session(self._engine) as session, session.begin():
             if session.get(StoryRecord, story.id) is not None:
@@ -1892,8 +2435,7 @@ class GeminiDraftRepository:
                     or trace.evidence_span_id != evidence.id
                     or evidence.exact_text
                     != document.body[evidence.start_offset : evidence.end_offset]
-                    or evidence.text_hash
-                    != sha256(evidence.exact_text.encode("utf-8")).hexdigest()
+                    or evidence.text_hash != sha256(evidence.exact_text.encode("utf-8")).hexdigest()
                 ):
                     raise ValueError("Gemini draft Claim provenance is invalid")
             session.add(
@@ -1969,9 +2511,7 @@ def _persist_source_definition(
         "cursor": source_definition.cursor,
         "storage_policy": source_definition.storage_policy,
         "public_excerpt_policy": source_definition.public_excerpt_policy,
-        "public_excerpt_max_characters": (
-            source_definition.public_excerpt_max_characters
-        ),
+        "public_excerpt_max_characters": (source_definition.public_excerpt_max_characters),
         "pause_conditions": list(source_definition.pause_conditions),
         "canonical_url_prefixes": list(source_definition.canonical_url_prefixes),
         "acceptance_group": acceptance_group,
@@ -1999,13 +2539,9 @@ def _persist_collection_discovery(
 ) -> None:
     candidate = discovery.candidate
     document_version = discovery.document_version
-    session.execute(
-        insert(CandidateRecord).values(**candidate.__dict__).on_conflict_do_nothing()
-    )
+    session.execute(insert(CandidateRecord).values(**candidate.__dict__).on_conflict_do_nothing())
     persisted_candidate_id = session.scalar(
-        select(CandidateRecord.id).where(
-            CandidateRecord.canonical_url == candidate.canonical_url
-        )
+        select(CandidateRecord.id).where(CandidateRecord.canonical_url == candidate.canonical_url)
     )
     if persisted_candidate_id != candidate.id:
         raise ValueError(
@@ -2013,9 +2549,7 @@ def _persist_collection_discovery(
         )
 
     session.execute(
-        insert(DocumentVersionRecord)
-        .values(**document_version.__dict__)
-        .on_conflict_do_nothing()
+        insert(DocumentVersionRecord).values(**document_version.__dict__).on_conflict_do_nothing()
     )
     persisted_document_version_id = session.scalar(
         select(DocumentVersionRecord.id).where(
@@ -2147,6 +2681,36 @@ def _persist_audit_event(session: Session, event: AuditEvent) -> None:
     session.execute(insert(AuditEventRecord).values(**values))
 
 
+def _persist_raw_audit_event(
+    session: Session,
+    *,
+    operation_key: str,
+    actor_identifier: str,
+    action: str,
+    subject_type: str,
+    subject_id: UUID,
+    occurred_at: datetime,
+    sequence: int,
+    attributes: Mapping[str, Any],
+) -> None:
+    session.execute(
+        insert(AuditEventRecord).values(
+            id=uuid5(
+                NAMESPACE_URL,
+                f"ai-intel-agent:audit-event:{operation_key}:{sequence}",
+            ),
+            operation_key=operation_key,
+            actor_identifier=actor_identifier,
+            action=action,
+            subject_type=subject_type,
+            subject_id=subject_id,
+            occurred_at=occurred_at,
+            sequence=sequence,
+            attributes=dict(attributes),
+        )
+    )
+
+
 def _verify_existing_publication(
     session: Session,
     publication: SampleDigestPublication,
@@ -2158,8 +2722,7 @@ def _verify_existing_publication(
         and existing.publication_date == digest.publication_date
         and existing.state == digest.state.value
         and existing.published_at == digest.published_at
-        and existing.publication_contract
-        == DigestPublicationContract.LEGACY_FIXTURE.value
+        and existing.publication_contract == DigestPublicationContract.LEGACY_FIXTURE.value
     )
     actual_story_ids = tuple(
         session.scalars(
@@ -2210,9 +2773,7 @@ def _verify_existing_publication(
 def upgrade_database(database_url: str) -> None:
     configured_root = os.getenv("AI_INTEL_PROJECT_ROOT", "").strip()
     project_root = (
-        Path(configured_root).resolve()
-        if configured_root
-        else Path(__file__).resolve().parents[2]
+        Path(configured_root).resolve() if configured_root else Path(__file__).resolve().parents[2]
     )
     config = Config(str(project_root / "alembic.ini"))
     config.set_main_option(

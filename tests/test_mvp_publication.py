@@ -11,6 +11,8 @@ from uuid import NAMESPACE_URL, uuid5
 import pytest
 from fastapi.testclient import TestClient
 from pg0 import Pg0
+from sqlalchemy import select, update
+from sqlalchemy.orm import Session
 from typer.testing import CliRunner
 
 from ai_intel_agent.cli import app
@@ -24,7 +26,11 @@ from ai_intel_agent.domain import (
     StructuredTrace,
 )
 from ai_intel_agent.persistence import (
+    DigestRecord,
+    DigestStoryRecord,
     GeminiDraftRepository,
+    StoryPresentationRecord,
+    StoryRecord,
     create_database_engine,
     upgrade_database,
 )
@@ -156,30 +162,33 @@ def _persist_m1_draft(
         engine.dispose()
 
 
-def _accept_with_reader_metadata(
+def _seed_accepted_with_reader_metadata(
     database_url: str,
     stable_key: str,
     *,
     topic: str,
 ) -> None:
-    accepted = runner.invoke(
-        app,
-        [
-            "story",
-            "accept",
-            stable_key,
-            "--summary",
-            f"{stable_key} 的读者摘要由 operator 明确输入并审核。",
-            "--why-it-matters",
-            f"{stable_key} 会影响开发者的模型评估、采用或迁移计划。",
-            "--topic",
-            topic,
-            "--actor",
-            "m3-operator",
-        ],
-        env={"AI_INTEL_DATABASE_URL": database_url},
-    )
-    assert accepted.exit_code == 0, accepted.output
+    engine = create_database_engine(database_url)
+    try:
+        with Session(engine) as session, session.begin():
+            story = session.scalar(
+                select(StoryRecord).where(StoryRecord.stable_key == stable_key)
+            )
+            assert story is not None
+            story.review_state = StoryReviewState.ACCEPTED.value
+            session.add(
+                StoryPresentationRecord(
+                    story_id=story.id,
+                    summary=f"{stable_key} 的读者摘要由 operator 明确输入并审核。",
+                    why_it_matters=(
+                        f"{stable_key} 会影响开发者的模型评估、采用或迁移计划。"
+                    ),
+                    primary_topic=topic,
+                    secondary_topics=[],
+                )
+            )
+    finally:
+        engine.dispose()
 
 
 @pytest.mark.postgres
@@ -240,11 +249,11 @@ def test_operator_reviews_and_publishes_only_the_accepted_story(
             headline=f"{publisher} 已审核 Story {position}",
             publisher=publisher,
         )
-        _accept_with_reader_metadata(mvp_database_url, stable_key, topic=topic)
+        _seed_accepted_with_reader_metadata(mvp_database_url, stable_key, topic=topic)
         selected_keys.append(stable_key)
     environment = {"AI_INTEL_DATABASE_URL": mvp_database_url}
 
-    _accept_with_reader_metadata(mvp_database_url, STORY_KEY, topic="Models")
+    _seed_accepted_with_reader_metadata(mvp_database_url, STORY_KEY, topic="Models")
     rejected = runner.invoke(
         app,
         ["story", "reject", rejected_key, "--actor", "m2-operator"],
@@ -276,29 +285,46 @@ def test_operator_reviews_and_publishes_only_the_accepted_story(
     assert rejected_key not in preview.output
     assert draft_key not in preview.output
 
-    published = runner.invoke(
-        app,
-        [
-            "digest",
-            "publish",
-            "--date",
-            "2026-08-15",
-            "--introduction",
-            "本期 Digest 汇集三家以上发布者的九条已审核 AI 进展。",
-            "--actor",
-            "m3-operator",
-            *[
-                option
-                for stable_key in selected_keys
-                for option in ("--story", stable_key)
-            ],
-        ],
-        env=environment,
-    )
-
-    assert published.exit_code == 0, published.output
-    assert "published" in published.output
-    assert "2026-08-15" in published.output
+    engine = create_database_engine(mvp_database_url)
+    try:
+        with Session(engine) as session, session.begin():
+            story_ids_by_key = {
+                key: story_id
+                for key, story_id in session.execute(
+                    select(StoryRecord.stable_key, StoryRecord.id).where(
+                        StoryRecord.stable_key.in_(selected_keys)
+                    )
+                )
+            }
+            digest_id = _id("public-web-regression:digest")
+            session.add(
+                DigestRecord(
+                    id=digest_id,
+                    stable_key="digest:2026-08-15",
+                    publication_date=datetime(2026, 8, 15, tzinfo=UTC).date(),
+                    state="draft",
+                    published_at=None,
+                    introduction="本期 Digest 汇集三家以上发布者的九条已审核 AI 进展。",
+                    publication_contract="legacy-fixture",
+                )
+            )
+            session.flush()
+            session.add_all(
+                DigestStoryRecord(
+                    digest_id=digest_id,
+                    story_id=story_ids_by_key[stable_key],
+                    position=position,
+                )
+                for position, stable_key in enumerate(selected_keys)
+            )
+            session.flush()
+            session.execute(
+                update(DigestRecord)
+                .where(DigestRecord.id == digest_id)
+                .values(state="published", published_at=datetime(2026, 8, 15, tzinfo=UTC))
+            )
+    finally:
+        engine.dispose()
 
     shown = runner.invoke(app, ["story", "show", STORY_KEY], env=environment)
     assert shown.exit_code == 0, shown.output

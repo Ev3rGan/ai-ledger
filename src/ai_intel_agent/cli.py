@@ -22,7 +22,13 @@ from ai_intel_agent.collection import (
     collect_feed_source_definitions,
 )
 from ai_intel_agent.domain import SourceDefinitionCollectionStatus, StoryReviewState, Topic
-from ai_intel_agent.editorial import EditorialStateError, StoryInspection
+from ai_intel_agent.editorial import (
+    DeepSeekEditorialPlanProvider,
+    DigestPlan,
+    EditorialPlanProvider,
+    EditorialStateError,
+    StoryInspection,
+)
 from ai_intel_agent.extraction_benchmark import (
     BenchmarkConfigurationError,
     run_document_extraction_benchmark,
@@ -108,12 +114,12 @@ from ai_intel_agent.source_portfolio_acquisition import HttpSourcePortfolioAdapt
 app = typer.Typer(help="Run the deterministic AI intelligence workflow.")
 story_app = typer.Typer(help="Inspect and review persisted Stories.")
 digest_app = typer.Typer(help="Preview and publish persisted Digests.")
-runtime_benchmark_app = typer.Typer(
-    help="Capture and compare fixed Hong Kong runtime probes."
-)
+digest_plan_app = typer.Typer(help="Prepare, inspect, and approve immutable Digest Plans.")
+runtime_benchmark_app = typer.Typer(help="Capture and compare fixed Hong Kong runtime probes.")
 operator_app = typer.Typer(help="Private production operator commands.")
 app.add_typer(story_app, name="story")
 app.add_typer(digest_app, name="digest")
+digest_app.add_typer(digest_plan_app, name="plan")
 app.add_typer(runtime_benchmark_app, name="benchmark-runtime")
 app.add_typer(operator_app, name="operator")
 console = Console()
@@ -132,11 +138,7 @@ def main() -> None:
 
 
 def _operator_database_url(production: bool) -> str:
-    return (
-        production_database_url(os.environ)
-        if production
-        else database_url_from_environment()
-    )
+    return production_database_url(os.environ) if production else database_url_from_environment()
 
 
 def _persistent_provider_budget(
@@ -159,8 +161,7 @@ def _require_recorded_production_backfill_limit(backfill_limit: int) -> None:
     )
     if backfill_limit > recorded_limit:
         raise ValueError(
-            f"Backfill limit {backfill_limit} exceeds recorded production limit "
-            f"{recorded_limit}"
+            f"Backfill limit {backfill_limit} exceeds recorded production limit {recorded_limit}"
         )
 
 
@@ -168,9 +169,7 @@ def _source_status_payload(
     profiles: tuple[SourceProfile, ...],
     snapshots: tuple[SourceStatusSnapshot, ...],
 ) -> list[dict[str, object]]:
-    snapshots_by_id = {
-        snapshot.source_definition_id: snapshot for snapshot in snapshots
-    }
+    snapshots_by_id = {snapshot.source_definition_id: snapshot for snapshot in snapshots}
     sources: list[dict[str, object]] = []
     for profile in profiles:
         snapshot = snapshots_by_id.get(profile.id)
@@ -181,9 +180,7 @@ def _source_status_payload(
                 "publisher": profile.publisher,
                 "enabled": profile.enabled,
                 "acceptance_group": (
-                    snapshot.acceptance_group
-                    if snapshot is not None
-                    else profile.acceptance_group
+                    snapshot.acceptance_group if snapshot is not None else profile.acceptance_group
                 ),
                 "contribution_role": (
                     snapshot.contribution_role
@@ -196,34 +193,22 @@ def _source_status_payload(
                     else profile.evidence_eligibility
                 ),
                 "body_eligibility": (
-                    snapshot.body_eligibility
-                    if snapshot is not None
-                    else profile.body_eligibility
+                    snapshot.body_eligibility if snapshot is not None else profile.body_eligibility
                 ),
                 "pause_state": (
-                    snapshot.pause_state
-                    if snapshot is not None
-                    else profile.pause_state
+                    snapshot.pause_state if snapshot is not None else profile.pause_state
                 ),
-                "recent_result": (
-                    snapshot.recent_result if snapshot is not None else None
-                ),
+                "recent_result": (snapshot.recent_result if snapshot is not None else None),
                 "cursor": snapshot.cursor_value if snapshot is not None else None,
                 "health": snapshot.health if snapshot is not None else "unknown",
                 "consecutive_failures": (
                     snapshot.consecutive_failures if snapshot is not None else 0
                 ),
                 "last_collection_run_id": (
-                    str(snapshot.last_collection_run_id)
-                    if snapshot is not None
-                    else None
+                    str(snapshot.last_collection_run_id) if snapshot is not None else None
                 ),
-                "updated_at": (
-                    snapshot.updated_at.isoformat() if snapshot is not None else None
-                ),
-                "pending_drafts": (
-                    snapshot.pending_drafts if snapshot is not None else 0
-                ),
+                "updated_at": (snapshot.updated_at.isoformat() if snapshot is not None else None),
+                "pending_drafts": (snapshot.pending_drafts if snapshot is not None else 0),
             }
         )
     return sources
@@ -359,9 +344,7 @@ def operator_source_status(
         try:
             repository = MultiSourceCollectionRepository(engine)
             profiles = _operator_source_profiles(repository)
-            snapshots = repository.source_statuses(
-                {profile.id for profile in profiles}
-            )
+            snapshots = repository.source_statuses({profile.id for profile in profiles})
             universe_profiles = load_source_universe()
             universe_snapshots = repository.source_statuses(
                 {profile.id for profile in universe_profiles}
@@ -701,24 +684,40 @@ def start_local(
 
 def _print_local_mvp_state(state: LocalMvpState, host: str, port: int) -> None:
     if state is LocalMvpState.SCHEDULER_AND_WEB_RUNNING:
-        console.print(
-            f"Local MVP running at http://{host}:{port}; press Ctrl+C to stop safely."
-        )
+        console.print(f"Local MVP running at http://{host}:{port}; press Ctrl+C to stop safely.")
         return
     console.print(f"Local MVP state: {state.value}")
 
 
 @contextmanager
-def _editorial_repository() -> Iterator[EditorialRepository]:
+def _editorial_engine() -> Iterator[Engine]:
     try:
         database_url = database_url_from_environment()
         engine = create_database_engine(database_url)
     except ValueError as error:
         raise typer.BadParameter(str(error)) from error
     try:
-        yield EditorialRepository(engine)
+        yield engine
     finally:
         engine.dispose()
+
+
+@contextmanager
+def _editorial_repository() -> Iterator[EditorialRepository]:
+    with _editorial_engine() as engine:
+        yield EditorialRepository(engine)
+
+
+def _create_editorial_plan_provider(
+    engine: Engine,
+    client: httpx.Client,
+) -> EditorialPlanProvider:
+    configuration = M1ProviderConfiguration.from_environment(os.environ)
+    return DeepSeekEditorialPlanProvider(
+        client,
+        api_key=configuration.api_key,
+        budget=_persistent_provider_budget(engine, configuration),
+    )
 
 
 def _print_story(story: StoryInspection) -> None:
@@ -745,16 +744,10 @@ def _print_story(story: StoryInspection) -> None:
                 markup=False,
                 soft_wrap=True,
             )
-            console.print(
-                f"Evidence Role: {evidence_span.role.value}", markup=False
-            )
-            console.print(
-                f"Evidence Relation: {evidence_span.relation.value}", markup=False
-            )
+            console.print(f"Evidence Role: {evidence_span.role.value}", markup=False)
+            console.print(f"Evidence Relation: {evidence_span.relation.value}", markup=False)
             console.print(f"Publisher: {evidence_span.publisher}", markup=False)
-            console.print(
-                f"Canonical source: {evidence_span.canonical_url}", markup=False
-            )
+            console.print(f"Canonical source: {evidence_span.canonical_url}", markup=False)
 
 
 @story_app.command("list")
@@ -826,9 +819,7 @@ def _review_story(
             )
         except (EditorialStateError, ValueError) as error:
             raise typer.BadParameter(str(error)) from error
-    console.print(
-        f"Story {story.stable_key} is {story.review_state.value}.", markup=False
-    )
+    console.print(f"Story {story.stable_key} is {story.review_state.value}.", markup=False)
 
 
 @story_app.command("accept")
@@ -853,7 +844,7 @@ def accept_story(
         str, typer.Option("--actor", help="Identifier recorded in the audit event.")
     ] = "local-operator",
 ) -> None:
-    """Accept one unreviewed Story."""
+    """Fail closed: exact Digest Plan approval replaced direct acceptance."""
     _review_story(
         stable_key,
         StoryReviewState.ACCEPTED,
@@ -888,6 +879,252 @@ def _digest_date(publication_date: str | None) -> date:
     return _parse_iso_date(publication_date)
 
 
+def _print_digest_plan(plan: DigestPlan) -> None:
+    console.print(
+        f"Digest Plan: {plan.id}\n"
+        f"Publication date: {plan.publication_date.isoformat()}\n"
+        f"Editorial Window: {plan.window_start.isoformat()} -> {plan.window_end.isoformat()}\n"
+        f"Version: {plan.version}\n"
+        f"Prepared at: {plan.prepared_at.isoformat()}\n"
+        f"Content hash: {plan.content_hash}\n"
+        f"Current-state hash: {plan.current_state_hash}\n"
+        f"Provider: {plan.provider_identifier}\n"
+        f"Protocol: {plan.protocol_version}\n"
+        f"Digest summary: {plan.digest_summary}\n"
+        f"Source coverage: {', '.join(plan.source_coverage) or '-'}\n"
+        f"Topic coverage: {', '.join(plan.topic_coverage) or '-'}",
+        markup=False,
+        soft_wrap=True,
+    )
+    console.print("Source health:", markup=False)
+    if not plan.source_health:
+        console.print("- unavailable", markup=False)
+    for source in plan.source_health:
+        console.print(
+            f"- {source.name} [{source.source_definition_id}] "
+            f"publisher={source.publisher} result={source.recent_result} "
+            f"health={source.health} pause={source.pause_state} "
+            f"failures={source.consecutive_failures} updated={source.updated_at.isoformat()}",
+            markup=False,
+            soft_wrap=True,
+        )
+    console.print("Scheduler health:", markup=False)
+    if plan.scheduler_health is None:
+        console.print("- unavailable", markup=False)
+    else:
+        scheduler = plan.scheduler_health
+        console.print(
+            f"- state={scheduler.state} result={scheduler.last_result or '-'} "
+            f"completed={scheduler.last_completed_at.isoformat() if scheduler.last_completed_at else '-'} "
+            f"updated={scheduler.updated_at.isoformat()}",
+            markup=False,
+            soft_wrap=True,
+        )
+    console.print("Stories:", markup=False)
+    for item in plan.stories:
+        console.print(
+            f"- {item.stable_key} inclusion={item.inclusion.value} "
+            f"order={item.order if item.order is not None else '-'}\n"
+            f"  Headline: {item.headline}\n"
+            f"  Source: {item.publisher} | {item.source_definition_name or '-'} | "
+            f"{item.canonical_url}\n"
+            f"  Source time: "
+            f"{item.original_published_at.isoformat() if item.original_published_at else '-'}\n"
+            f"  Summary: {item.summary}\n"
+            f"  Why it matters: {item.why_it_matters}\n"
+            f"  Topics: {item.primary_topic}; "
+            f"secondary={', '.join(item.secondary_topics) or '-'}\n"
+            f"  Exclusion reason: {item.exclusion_reason or '-'}",
+            markup=False,
+            soft_wrap=True,
+        )
+        for claim in item.claims:
+            console.print(f"  Claim [{claim.id}]: {claim.text}", markup=False, soft_wrap=True)
+            for evidence in claim.evidence_spans:
+                console.print(
+                    f"    Evidence [{evidence.id}] document={evidence.document_version_id} "
+                    f"offsets={evidence.start_offset}:{evidence.end_offset} "
+                    f"hash={evidence.text_hash} role={evidence.role.value} "
+                    f"relation={evidence.relation.value} publisher={evidence.publisher}\n"
+                    f"    Exact text: {evidence.exact_text}\n"
+                    f"    Canonical source: {evidence.canonical_url}",
+                    markup=False,
+                    soft_wrap=True,
+                )
+    console.print("Anomalies:", markup=False)
+    if not plan.anomalies:
+        console.print("- none", markup=False)
+    for anomaly in plan.anomalies:
+        console.print(
+            f"- {anomaly.code} blocking={str(anomaly.blocking).lower()} "
+            f"story={anomaly.story_stable_key or '-'}: {anomaly.message}",
+            markup=False,
+            soft_wrap=True,
+        )
+
+
+@digest_plan_app.command("prepare")
+def prepare_digest_plan_command(
+    publication_date: Annotated[
+        str | None,
+        typer.Option("--date", help="Digest publication date in YYYY-MM-DD form."),
+    ] = None,
+) -> None:
+    """Have the Editorial Agent persist one immutable versioned Digest Plan."""
+    with _editorial_engine() as engine, httpx.Client(timeout=60.0) as client:
+        repository = EditorialRepository(engine)
+        try:
+            provider = _create_editorial_plan_provider(engine, client)
+            plan = repository.prepare_digest_plan(
+                _digest_date(publication_date),
+                provider=provider,
+                prepared_at=datetime.now(UTC),
+            )
+        except (EditorialStateError, ValueError) as error:
+            raise typer.BadParameter(str(error)) from error
+    _print_digest_plan(plan)
+
+
+@digest_plan_app.command("show")
+def show_digest_plan_command(plan_id: UUID) -> None:
+    """Display one complete immutable Digest Plan."""
+    with _editorial_repository() as repository:
+        try:
+            plan = repository.digest_plan(plan_id)
+        except (EditorialStateError, ValueError) as error:
+            raise typer.BadParameter(str(error)) from error
+    if plan is None:
+        raise typer.BadParameter(f"Digest Plan {plan_id} does not exist")
+    _print_digest_plan(plan)
+
+
+@digest_plan_app.command("approve")
+def approve_digest_plan_command(
+    plan_id: UUID,
+    content_hash: Annotated[
+        str,
+        typer.Option(
+            "--content-hash",
+            help="Exact SHA-256 displayed for the immutable Digest Plan.",
+        ),
+    ],
+    actor: Annotated[
+        str, typer.Option("--actor", help="Identifier recorded in the approval audit.")
+    ] = "local-operator",
+) -> None:
+    """Review the complete Plan and atomically publish exactly that version."""
+    with _editorial_repository() as repository:
+        try:
+            plan = repository.digest_plan(plan_id)
+            if plan is None:
+                raise EditorialStateError(f"Digest Plan {plan_id} does not exist")
+            _print_digest_plan(plan)
+            digest = repository.approve_digest_plan(
+                plan_id,
+                expected_content_hash=content_hash,
+                actor_identifier=actor,
+                approved_at=datetime.now(UTC),
+            )
+        except (EditorialStateError, ValueError) as error:
+            raise typer.BadParameter(str(error)) from error
+    console.print(
+        f"Digest Plan {plan.id} published with {len(digest.story_ids)} Stories.",
+        markup=False,
+    )
+
+
+@digest_app.command("withdraw")
+def withdraw_digest_command(
+    publication_date: Annotated[
+        str,
+        typer.Option("--date", help="Published Digest date in YYYY-MM-DD form."),
+    ],
+    reason: Annotated[
+        str,
+        typer.Option(
+            "--reason",
+            help="Audited whole-Digest withdrawal reason (20-1000 characters).",
+        ),
+    ],
+    actor: Annotated[
+        str, typer.Option("--actor", help="Identifier recorded in the withdrawal audit.")
+    ] = "local-operator",
+) -> None:
+    """Withdraw one complete Digest from every public projection."""
+    digest_date = _digest_date(publication_date)
+    with _editorial_repository() as repository:
+        try:
+            withdrawal = repository.withdraw_digest(
+                digest_date,
+                actor_identifier=actor,
+                reason=reason,
+                withdrawn_at=datetime.now(UTC),
+            )
+        except (EditorialStateError, ValueError) as error:
+            raise typer.BadParameter(str(error)) from error
+    console.print(
+        f"Digest {digest_date.isoformat()} [{withdrawal.digest_id}] "
+        "withdrawn from public visibility; immutable history is retained.",
+        markup=False,
+    )
+
+
+@digest_app.command("history")
+def digest_history_command(
+    publication_date: Annotated[
+        str,
+        typer.Option("--date", help="Published Digest date in YYYY-MM-DD form."),
+    ],
+) -> None:
+    """Display immutable Plan, approval, publication, withdrawal, and audit history."""
+    digest_date = _digest_date(publication_date)
+    with _editorial_repository() as repository:
+        try:
+            history = repository.digest_history(digest_date)
+        except (EditorialStateError, ValueError) as error:
+            raise typer.BadParameter(str(error)) from error
+    if history is None:
+        raise typer.BadParameter(
+            f"Editorial Plan history for {digest_date.isoformat()} does not exist"
+        )
+    if history.plan is None:
+        console.print(
+            f"Plan: unavailable for retained {history.publication_contract} publication",
+            markup=False,
+        )
+    else:
+        _print_digest_plan(history.plan)
+    console.print(
+        f"Publication: digest={history.digest.id} state={history.digest.state.value} "
+        f"published_at={history.digest.published_at.isoformat() if history.digest.published_at else '-'}",
+        markup=False,
+    )
+    if history.approval is None:
+        console.print("Approval: unavailable", markup=False)
+    else:
+        console.print(
+            f"Approval: actor={history.approval.actor_identifier} "
+            f"approved_at={history.approval.approved_at.isoformat()} "
+            f"content_hash={history.approval.content_hash}",
+            markup=False,
+        )
+    if history.withdrawal is None:
+        console.print("Withdrawal: none", markup=False)
+    else:
+        console.print(
+            f"Withdrawal: actor={history.withdrawal.actor_identifier} "
+            f"withdrawn_at={history.withdrawal.withdrawn_at.isoformat()} "
+            f"reason={history.withdrawal.reason}",
+            markup=False,
+            soft_wrap=True,
+        )
+    console.print(
+        "Audit actions: " + ", ".join(history.audit_actions),
+        markup=False,
+        soft_wrap=True,
+    )
+
+
 @digest_app.command("preview")
 def preview_digest(
     publication_date: Annotated[
@@ -916,9 +1153,7 @@ def preview_digest(
         console.print("No accepted Stories are eligible.")
         return
     for item in preview.stories:
-        console.print(
-            f"{item.stable_key}\t{item.headline}", markup=False, soft_wrap=True
-        )
+        console.print(f"{item.stable_key}\t{item.headline}", markup=False, soft_wrap=True)
 
 
 @digest_app.command("publish")
@@ -945,7 +1180,7 @@ def publish_digest_command(
         str, typer.Option("--actor", help="Identifier recorded in audit events.")
     ] = "local-operator",
 ) -> None:
-    """Compose and publish a Digest from eligible accepted Stories."""
+    """Fail closed: exact Digest Plan approval replaced direct publication."""
     with _editorial_repository() as repository:
         try:
             digest = repository.publish_digest(
@@ -1294,9 +1529,7 @@ def evaluate_model_routes(
     try:
         configuration = load_candidate_configuration()
         protocol = load_protocol_configuration()
-        credentials = ModelEvaluationCredentials.from_environment(
-            configuration=configuration
-        )
+        credentials = ModelEvaluationCredentials.from_environment(configuration=configuration)
         evaluation = run_model_routing_evaluation(
             output,
             client=HttpModelEvaluationClient(
@@ -1312,8 +1545,7 @@ def evaluate_model_routes(
 
     eligible = sum(route is not None for route in evaluation.recommendations.values())
     console.print(
-        f"[green]Evaluated DeepSeek and Kimi routes for {eligible}/5 task classes:[/] "
-        f"{output}"
+        f"[green]Evaluated DeepSeek and Kimi routes for {eligible}/5 task classes:[/] {output}"
     )
 
 
@@ -1420,6 +1652,8 @@ def compare_hong_kong_runtimes(
 
     recommendation = comparison["recommendation"] or "none"
     console.print(f"[green]Recommended Hong Kong runtime: {recommendation}[/] ({output})")
+
+
 @app.command("calibrate-retrieval")
 def calibrate_retrieval(
     output: Annotated[
