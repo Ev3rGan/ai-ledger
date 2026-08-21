@@ -627,7 +627,9 @@ def test_production_bundle_prepares_exact_sha_hybrid_acceptance_without_model_su
     assert "http://127.0.0.1:8000/health/ready" in operator
     assert "operator retrieval status --production --require-hybrid" in operator
     assert '"p50_ms"' in operator and '"p95_ms"' in operator
-    assert 'docker top "$web_container" -eo rss' in operator
+    assert 'service_rss_output="$(docker top "$web_container" -eo pid,rss)"' in operator
+    assert "NR > 1 { total += $2; rows += 1 }" in operator
+    assert "if (rows == 0) exit 1" in operator
     assert 'validate_release "$previous_release"' in operator
     assert 'validate_image_revision "$previous_release"' in operator
 
