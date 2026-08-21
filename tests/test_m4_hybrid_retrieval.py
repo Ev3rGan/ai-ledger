@@ -418,6 +418,7 @@ def test_runtime_profile_pins_the_approved_models_and_rebuild_contract() -> None
     assert profile.reranker.model_id == "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
     assert profile.reranker.source_repository == profile.reranker.model_id
     assert profile.reranker.revision == "1427fd652930e4ba29e8149678df786c240d8825"
+    assert profile.reranker.artifact_path == "onnx/model_quint8_avx2.onnx"
     assert profile.reranker.artifact_sha256 == (
         "6c2513767fb63d008a4377bef7a7a3555433d9436342bb53e35a3a72ffc52d4b"
     )
@@ -435,7 +436,7 @@ def test_model_artifact_gate_is_exact_offline_and_requires_avx2(tmp_path: Path) 
     embedding_dir.mkdir(parents=True)
     (reranker_dir / "onnx").mkdir(parents=True)
     embedding_artifact = embedding_dir / "model_optimized.onnx"
-    reranker_artifact = reranker_dir / "onnx" / "model_uint8_avx2.onnx"
+    reranker_artifact = reranker_dir / "onnx" / "model_quint8_avx2.onnx"
     embedding_artifact.write_bytes(b"fixture embedding artifact")
     reranker_artifact.write_bytes(b"fixture reranker artifact")
     configuration = RetrievalModelConfiguration.from_environment(

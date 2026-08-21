@@ -43,7 +43,7 @@ from ai_intel_agent.publication import (
 PROFILE_RESOURCE = "accepted_knowledge_retrieval.v1.json"
 PROFILE_SCHEMA_VERSION = "accepted-knowledge-retrieval.v1"
 APPROVED_PROFILE_ID = "accepted-knowledge-minilm-mmarco-2026-08-19.v1"
-APPROVED_PROFILE_SHA256 = "f68f5cf1ea0eee81db20d61a9644f7e2bd2aae92e0e6261f2cd6a7d95fa34e46"
+APPROVED_PROFILE_SHA256 = "b27e5caac923c1982a5dfda6e1bdc509ba829d2a1e1e9498fb327bda9f2b709a"
 APPROVED_EMBEDDING_MODEL_ID = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 APPROVED_EMBEDDING_SOURCE_REPOSITORY = "qdrant/paraphrase-multilingual-MiniLM-L12-v2-onnx-Q"
 APPROVED_EMBEDDING_REVISION = "faf4aa4225822f3bc6376869cb1164e8e3feedd0"
@@ -2373,7 +2373,7 @@ def _validate_approved_profile(profile: AcceptedKnowledgeProfile) -> None:
         or reranker.model_id != APPROVED_RERANKER_MODEL_ID
         or reranker.source_repository != APPROVED_RERANKER_SOURCE_REPOSITORY
         or reranker.revision != APPROVED_RERANKER_REVISION
-        or reranker.artifact_path != "onnx/model_uint8_avx2.onnx"
+        or reranker.artifact_path != "onnx/model_quint8_avx2.onnx"
         or reranker.artifact_sha256 != APPROVED_RERANKER_SHA256
         or reranker.quantization != "avx2-uint8"
         or reranker.required_cpu_feature != "avx2"

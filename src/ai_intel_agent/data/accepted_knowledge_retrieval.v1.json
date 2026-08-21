@@ -27,7 +27,7 @@
     "model_id": "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
     "source_repository": "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
     "revision": "1427fd652930e4ba29e8149678df786c240d8825",
-    "artifact_path": "onnx/model_uint8_avx2.onnx",
+    "artifact_path": "onnx/model_quint8_avx2.onnx",
     "artifact_sha256": "6c2513767fb63d008a4377bef7a7a3555433d9436342bb53e35a3a72ffc52d4b",
     "quantization": "avx2-uint8",
     "required_cpu_feature": "avx2",
