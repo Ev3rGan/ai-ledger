@@ -17,7 +17,7 @@ COPY pyproject.toml uv.lock README.md alembic.ini ./
 COPY alembic ./alembic
 COPY src ./src
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends git \
+    && apt-get install --yes --no-install-recommends git git-lfs \
     && rm -rf /var/lib/apt/lists/* \
     && python -m pip install --no-cache-dir uv==0.12.3 \
     && uv sync --locked --no-dev --no-editable --extra retrieval

@@ -607,7 +607,7 @@ def test_production_bundle_prepares_exact_sha_hybrid_acceptance_without_model_su
     operator = (project_root / "deploy/m1/operate.sh").read_text(encoding="utf-8")
 
     assert "--extra retrieval" in dockerfile
-    assert "apt-get install --yes --no-install-recommends git" in dockerfile
+    assert "apt-get install --yes --no-install-recommends git git-lfs" in dockerfile
     assert "AI_INTEL_EMBEDDING_MODEL_DIR" in compose
     assert "AI_INTEL_RERANKER_MODEL_DIR" in compose
     assert "AI_INTEL_RETRIEVAL_THREADS" in compose
