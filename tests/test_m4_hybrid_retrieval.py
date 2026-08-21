@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from collections.abc import Iterator, Sequence
 from dataclasses import replace
 from datetime import UTC, date, datetime
@@ -40,7 +41,9 @@ from ai_intel_agent.accepted_knowledge import (
     RetrievalModelConfiguration,
     RetrievalQuery,
     RetrievalRuntimeStageStatus,
+    _read_git_snapshot_blob,
     _run_git_snapshot_check,
+    _verify_git_model_snapshot,
     build_document_chunks,
     load_accepted_knowledge_profile,
     record_retrieval_backend_startup_state,
@@ -570,6 +573,336 @@ def test_git_snapshot_checks_scope_safe_directory_to_the_model_root(
             "HEAD",
         )
     ]
+
+
+_MATERIALIZED_TOKENIZER = b"read-only materialized tokenizer fixture\n"
+_VALID_LFS_POINTER = (
+    b"version https://git-lfs.github.com/spec/v1\n"
+    b"oid sha256:1625006737468c58d17e0df18b6b2781977a0a0f23a7b4e74d4b370fc9dfa749\n"
+    b"size 41\n"
+)
+
+
+def _git(model_dir: Path, *arguments: str) -> str:
+    completed = subprocess.run(
+        ("git", "-C", str(model_dir), *arguments),
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    return completed.stdout.strip()
+
+
+def _create_readonly_lfs_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    pointer: bytes = _VALID_LFS_POINTER,
+) -> tuple[Path, str, Path]:
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    isolated_global_config = tmp_path / "isolated.gitconfig"
+    isolated_global_config.write_text("", encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(isolated_global_config))
+
+    _git(model_dir, "init", "--quiet")
+    _git(model_dir, "config", "user.name", "M4 Test")
+    _git(model_dir, "config", "user.email", "m4-test@example.invalid")
+    _git(
+        model_dir,
+        "remote",
+        "add",
+        "origin",
+        "https://huggingface.co/fixture/read-only-lfs",
+    )
+    (model_dir / ".gitattributes").write_bytes(
+        b"tokenizer.json filter=lfs diff=lfs merge=lfs -text\n"
+    )
+    (model_dir / "config.json").write_bytes(b'{"model":"fixture"}\n')
+    (model_dir / "tokenizer.json").write_bytes(pointer)
+    _git(model_dir, "add", ".gitattributes", "config.json")
+    pointer_blob = _git(
+        model_dir,
+        "hash-object",
+        "-w",
+        "--no-filters",
+        "tokenizer.json",
+    )
+    _git(
+        model_dir,
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        f"100644,{pointer_blob},tokenizer.json",
+    )
+    _git(model_dir, "commit", "--quiet", "-m", "fixture snapshot")
+    revision = _git(model_dir, "rev-parse", "HEAD")
+    (model_dir / "tokenizer.json").write_bytes(_MATERIALIZED_TOKENIZER)
+    lfs_tmp = model_dir / ".git" / "lfs" / "tmp"
+    lfs_tmp.mkdir(parents=True, exist_ok=True)
+    write_attempt = lfs_tmp / "write-attempt"
+    _git(
+        model_dir,
+        "config",
+        "filter.lfs.clean",
+        "echo invoked > .git/lfs/tmp/write-attempt && false",
+    )
+    _git(model_dir, "config", "filter.lfs.required", "true")
+    return model_dir, revision, write_attempt
+
+
+def test_git_snapshot_verification_reads_materialized_lfs_metadata_without_clean_filter_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir, revision, write_attempt = _create_readonly_lfs_snapshot(
+        tmp_path,
+        monkeypatch,
+    )
+
+    try:
+        _verify_git_model_snapshot(
+            model_dir,
+            "fixture/read-only-lfs",
+            revision,
+            ("config.json", "tokenizer.json"),
+        )
+    finally:
+        assert not write_attempt.exists(), (
+            "read-only verification invoked the write-requiring LFS clean filter"
+        )
+
+
+def test_git_snapshot_verification_does_not_follow_local_replace_refs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir, revision, write_attempt = _create_readonly_lfs_snapshot(
+        tmp_path,
+        monkeypatch,
+    )
+    original_blob = _git(model_dir, "rev-parse", f"{revision}:config.json")
+    replacement = tmp_path / "replacement-config.json"
+    replacement.write_bytes(b'{"model":"replacement"}\n')
+    replacement_blob = _git(
+        model_dir,
+        "hash-object",
+        "-w",
+        "--no-filters",
+        str(replacement),
+    )
+    _git(model_dir, "replace", original_blob, replacement_blob)
+    (model_dir / "config.json").write_bytes(replacement.read_bytes())
+
+    with pytest.raises(AcceptedKnowledgeConfigurationError, match="differs"):
+        _verify_git_model_snapshot(
+            model_dir,
+            "fixture/read-only-lfs",
+            revision,
+            ("config.json", "tokenizer.json"),
+        )
+    assert not write_attempt.exists()
+
+
+def test_git_snapshot_blob_read_disables_replace_objects_without_new_git_options(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[tuple[str, ...]] = []
+
+    def run(command: Sequence[str], **kwargs: object):
+        del kwargs
+        commands.append(tuple(command))
+        return type("Completed", (), {"returncode": 1, "stdout": b""})()
+
+    monkeypatch.setattr("ai_intel_agent.accepted_knowledge.subprocess.run", run)
+
+    with pytest.raises(AcceptedKnowledgeConfigurationError, match="approved revision"):
+        _read_git_snapshot_blob(tmp_path, "a" * 40, "missing.json")
+
+    assert commands == [
+        (
+            "git",
+            "--no-replace-objects",
+            "-c",
+            f"safe.directory={tmp_path.resolve()}",
+            "-C",
+            str(tmp_path.resolve()),
+            "cat-file",
+            "blob",
+            f"{'a' * 40}:missing.json",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("config_key", "config_value"),
+    (
+        ("extensions.partialClone", "origin"),
+        ("remote.origin.promisor", "true"),
+    ),
+)
+def test_git_snapshot_verification_rejects_partial_or_promisor_repositories(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config_key: str,
+    config_value: str,
+) -> None:
+    model_dir, revision, write_attempt = _create_readonly_lfs_snapshot(
+        tmp_path,
+        monkeypatch,
+    )
+    _git(model_dir, "config", config_key, config_value)
+
+    with pytest.raises(
+        AcceptedKnowledgeConfigurationError,
+        match="partial or promisor",
+    ):
+        _verify_git_model_snapshot(
+            model_dir,
+            "fixture/read-only-lfs",
+            revision,
+            ("config.json", "tokenizer.json"),
+        )
+    assert not write_attempt.exists()
+
+
+@pytest.mark.parametrize("config_source", ("include", "worktree"))
+def test_git_snapshot_verification_checks_all_effective_promisor_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config_source: str,
+) -> None:
+    model_dir, revision, write_attempt = _create_readonly_lfs_snapshot(
+        tmp_path,
+        monkeypatch,
+    )
+    if config_source == "include":
+        included_config = tmp_path / "promisor.gitconfig"
+        included_config.write_text(
+            '[remote "origin"]\n\tpromisor = true\n',
+            encoding="utf-8",
+        )
+        _git(model_dir, "config", "include.path", str(included_config))
+    else:
+        _git(model_dir, "config", "extensions.worktreeConfig", "true")
+        _git(model_dir, "config", "--worktree", "remote.origin.promisor", "true")
+
+    with pytest.raises(
+        AcceptedKnowledgeConfigurationError,
+        match="partial or promisor",
+    ):
+        _verify_git_model_snapshot(
+            model_dir,
+            "fixture/read-only-lfs",
+            revision,
+            ("config.json", "tokenizer.json"),
+        )
+    assert not write_attempt.exists()
+
+
+@pytest.mark.parametrize(
+    ("pointer", "expected_error"),
+    (
+        (
+            b"version https://git-lfs.github.com/spec/v1\n"
+            + b"oid sha256:"
+            + (b"0" * 64)
+            + b"\nsize 41\n",
+            "differs",
+        ),
+        (
+            (
+                b"version https://git-lfs.github.com/spec/v1\n"
+                b"oid sha256:1625006737468c58d17e0df18b6b2781977a0a0f23a7b4e74d4b370fc9dfa749\n"
+                b"size 40\n"
+            ),
+            "differs",
+        ),
+        (
+            b"version https://git-lfs.github.com/spec/v1\noid sha256:not-a-sha256\nsize 41\n",
+            "malformed Git LFS pointer",
+        ),
+    ),
+)
+def test_git_snapshot_verification_rejects_invalid_lfs_pointer_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pointer: bytes,
+    expected_error: str,
+) -> None:
+    model_dir, revision, write_attempt = _create_readonly_lfs_snapshot(
+        tmp_path,
+        monkeypatch,
+        pointer=pointer,
+    )
+
+    with pytest.raises(AcceptedKnowledgeConfigurationError, match=expected_error):
+        _verify_git_model_snapshot(
+            model_dir,
+            "fixture/read-only-lfs",
+            revision,
+            ("config.json", "tokenizer.json"),
+        )
+    assert not write_attempt.exists()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"), (("tamper", "differs"), ("missing", "unavailable"))
+)
+def test_git_snapshot_verification_rejects_changed_or_missing_ordinary_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    expected_error: str,
+) -> None:
+    model_dir, revision, write_attempt = _create_readonly_lfs_snapshot(
+        tmp_path,
+        monkeypatch,
+    )
+    config_path = model_dir / "config.json"
+    if mutation == "tamper":
+        config_path.write_bytes(b'{"model":"tampered"}\n')
+    else:
+        config_path.unlink()
+
+    with pytest.raises(AcceptedKnowledgeConfigurationError, match=expected_error):
+        _verify_git_model_snapshot(
+            model_dir,
+            "fixture/read-only-lfs",
+            revision,
+            ("config.json", "tokenizer.json"),
+        )
+    assert not write_attempt.exists()
+
+
+@pytest.mark.parametrize(
+    ("boundary", "expected_error"), (("revision", "revision"), ("remote", "repository"))
+)
+def test_git_snapshot_verification_preserves_revision_and_official_remote_gates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+    expected_error: str,
+) -> None:
+    model_dir, revision, write_attempt = _create_readonly_lfs_snapshot(
+        tmp_path,
+        monkeypatch,
+    )
+    if boundary == "revision":
+        revision = "0" * 40
+    else:
+        _git(model_dir, "remote", "set-url", "origin", "https://example.invalid/wrong")
+
+    with pytest.raises(AcceptedKnowledgeConfigurationError, match=expected_error):
+        _verify_git_model_snapshot(
+            model_dir,
+            "fixture/read-only-lfs",
+            revision,
+            ("config.json", "tokenizer.json"),
+        )
+    assert not write_attempt.exists()
 
 
 def test_fastembed_adapters_enforce_normalization_token_limit_and_fixed_rerank_batch() -> None:

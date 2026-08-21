@@ -78,6 +78,11 @@ TOKEN = re.compile(
 )
 CHINESE_CHARACTER = re.compile(r"[\u3400-\u9fff]")
 QUERY_TERM = re.compile(r"[0-9A-Za-z][0-9A-Za-z._+-]*|[\u3400-\u9fff]{2,}")
+GIT_LFS_POINTER = re.compile(
+    rb"version https://git-lfs.github.com/spec/v1\n"
+    rb"oid sha256:([0-9a-f]{64})\n"
+    rb"size (0|[1-9][0-9]*)\n"
+)
 GENERIC_QUESTION_TERMS = frozenset(
     {"发生了什么", "是什么", "怎么样", "有什么新消息", "有什么更新", "有哪些变化", "如何"}
 )
@@ -2135,6 +2140,7 @@ def _verify_git_model_snapshot(
         raise AcceptedKnowledgeConfigurationError(
             "Retrieval model directory must be the root of its Git snapshot"
         )
+    _reject_git_snapshot_lazy_fetch(resolved_root)
     observed_revision = _run_git_snapshot_check(
         resolved_root,
         "rev-parse",
@@ -2157,21 +2163,120 @@ def _verify_git_model_snapshot(
             "Retrieval model snapshot repository does not match the approved Profile"
         )
     for relative_path in metadata_files:
-        _approved_artifact_path(resolved_root, relative_path)
-        committed_blob = _run_git_snapshot_check(
+        _verify_git_snapshot_metadata(
             resolved_root,
-            "rev-parse",
-            f"HEAD:{relative_path}",
-        )
-        working_tree_blob = _run_git_snapshot_check(
-            resolved_root,
-            "hash-object",
+            revision,
             relative_path,
         )
-        if working_tree_blob != committed_blob:
-            raise AcceptedKnowledgeConfigurationError(
-                "Retrieval model metadata differs from the approved Git snapshot"
+
+
+def _verify_git_snapshot_metadata(
+    model_dir: Path,
+    revision: str,
+    relative_path: str,
+) -> None:
+    working_path = _approved_artifact_path(model_dir, relative_path)
+    committed_content = _read_git_snapshot_blob(model_dir, revision, relative_path)
+    pointer = _parse_git_lfs_pointer(committed_content)
+    try:
+        if pointer is not None:
+            expected_sha256, expected_size = pointer
+            matches = (
+                working_path.stat().st_size == expected_size
+                and _sha256_file(working_path) == expected_sha256
             )
+        else:
+            matches = working_path.read_bytes() == committed_content
+    except OSError as error:
+        raise AcceptedKnowledgeConfigurationError(
+            "Retrieval model metadata could not be read"
+        ) from error
+    if not matches:
+        raise AcceptedKnowledgeConfigurationError(
+            "Retrieval model metadata differs from the approved Git snapshot"
+        )
+
+
+def _parse_git_lfs_pointer(content: bytes) -> tuple[str, int] | None:
+    if not content.startswith(b"version https://git-lfs.github.com/spec/"):
+        return None
+    match = GIT_LFS_POINTER.fullmatch(content)
+    if match is None:
+        raise AcceptedKnowledgeConfigurationError(
+            "Retrieval model metadata has a malformed Git LFS pointer"
+        )
+    return match.group(1).decode("ascii"), int(match.group(2))
+
+
+def _read_git_snapshot_blob(
+    model_dir: Path,
+    revision: str,
+    relative_path: str,
+) -> bytes:
+    resolved_root = model_dir.resolve()
+    try:
+        completed = subprocess.run(
+            (
+                "git",
+                "--no-replace-objects",
+                "-c",
+                f"safe.directory={resolved_root}",
+                "-C",
+                str(resolved_root),
+                "cat-file",
+                "blob",
+                f"{revision}:{relative_path}",
+            ),
+            check=False,
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise AcceptedKnowledgeConfigurationError(
+            "Retrieval model Git snapshot could not be verified"
+        ) from error
+    if completed.returncode != 0:
+        raise AcceptedKnowledgeConfigurationError(
+            "Retrieval model Git snapshot does not match the approved revision"
+        )
+    return completed.stdout
+
+
+def _reject_git_snapshot_lazy_fetch(model_dir: Path) -> None:
+    resolved_root = model_dir.resolve()
+    try:
+        completed = subprocess.run(
+            (
+                "git",
+                "--no-replace-objects",
+                "-c",
+                f"safe.directory={resolved_root}",
+                "-C",
+                str(resolved_root),
+                "config",
+                "--includes",
+                "--get-regexp",
+                r"^(extensions\.partial[Cc]lone|remote\..*\.promisor)$",
+            ),
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise AcceptedKnowledgeConfigurationError(
+            "Retrieval model Git snapshot could not be verified"
+        ) from error
+    if completed.returncode == 0:
+        raise AcceptedKnowledgeConfigurationError(
+            "Retrieval model Git snapshot must not be a partial or promisor repository"
+        )
+    if completed.returncode != 1:
+        raise AcceptedKnowledgeConfigurationError(
+            "Retrieval model Git snapshot completeness could not be verified"
+        )
 
 
 def _run_git_snapshot_check(
