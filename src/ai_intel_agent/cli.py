@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -145,6 +146,9 @@ DEFAULT_MODEL_ROUTING_OUTPUT = Path("reports/model-routing-evaluation.md")
 DEFAULT_RUNTIME_BENCHMARK_OUTPUT = Path("reports/hong-kong-runtime-benchmark.md")
 DEFAULT_RETRIEVAL_CALIBRATION_OUTPUT = Path("reports/retrieval-calibration.md")
 DEFAULT_RETRIEVAL_PROFILE_OUTPUT = Path("reports/retrieval-profile.v1.json")
+RETRIEVAL_TIME_BOUNDARY_PATTERN = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})"
+)
 
 
 @app.callback()
@@ -180,6 +184,20 @@ def _retrieval_backends_from_environment() -> ApprovedRetrievalBackends:
             ),
         )
     return load_approved_fastembed_backends(configuration)
+
+
+def _parse_retrieval_time_boundary(value: str | None, *, label: str) -> datetime | None:
+    if value is None:
+        return None
+    if RETRIEVAL_TIME_BOUNDARY_PATTERN.fullmatch(value) is None:
+        raise ValueError(
+            f"{label} must use timezone-aware ISO-8601 form, for example "
+            "2026-08-19T08:00:00Z or 2026-08-19T16:00:00+08:00"
+        )
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError(f"{label} is not a valid ISO-8601 timestamp") from error
 
 
 def _require_recorded_production_backfill_limit(backfill_limit: int) -> None:
@@ -412,11 +430,11 @@ def operator_retrieval_query(
         typer.Option("--date", help="Require this original publication date."),
     ] = None,
     occurred_from: Annotated[
-        datetime | None,
+        str | None,
         typer.Option("--occurred-from", help="Inclusive Story occurrence lower bound."),
     ] = None,
     occurred_to: Annotated[
-        datetime | None,
+        str | None,
         typer.Option("--occurred-to", help="Exclusive Story occurrence upper bound."),
     ] = None,
     production: Annotated[
@@ -428,6 +446,14 @@ def operator_retrieval_query(
     try:
         parsed_publication_date = (
             date.fromisoformat(publication_date) if publication_date is not None else None
+        )
+        parsed_occurred_from = _parse_retrieval_time_boundary(
+            occurred_from,
+            label="occurred_from",
+        )
+        parsed_occurred_to = _parse_retrieval_time_boundary(
+            occurred_to,
+            label="occurred_to",
         )
         database_url = _operator_database_url(production)
         backends = _retrieval_backends_from_environment()
@@ -444,8 +470,8 @@ def operator_retrieval_query(
                         publisher=publisher,
                         topic=topic,
                         publication_date=parsed_publication_date,
-                        occurred_from=occurred_from,
-                        occurred_to=occurred_to,
+                        occurred_from=parsed_occurred_from,
+                        occurred_to=parsed_occurred_to,
                     ),
                 )
             )
