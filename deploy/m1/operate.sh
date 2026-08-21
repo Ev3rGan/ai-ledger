@@ -372,7 +372,8 @@ PY
   compose "$current_release" exec --no-TTY web \
     ai-intel-agent operator retrieval status --production --require-hybrid
   web_container="$(compose "$current_release" ps --quiet web)"
-  service_rss_kib="$(docker top "$web_container" -eo rss | awk 'NR > 1 { total += $1 } END { print total + 0 }')"
+  service_rss_output="$(docker top "$web_container" -eo pid,rss)"
+  service_rss_kib="$(printf '%s\n' "$service_rss_output" | awk 'NR > 1 { total += $2; rows += 1 } END { if (rows == 0) exit 1; print total + 0 }')"
   python3 - "$service_rss_kib" "$maximum_rss_mb" <<'PY'
 import json
 import sys
