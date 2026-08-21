@@ -15,11 +15,13 @@ from urllib.parse import quote
 from uuid import UUID
 
 import httpx
-from sqlalchemy import exists, func, select
 from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session
 
-from ai_intel_agent.domain import DigestState, EvidenceRelation, EvidenceRole, StoryReviewState
+from ai_intel_agent.accepted_knowledge import (
+    AcceptedKnowledgeOperation,
+    AcceptedKnowledgeRetrieval,
+    RetrievalQuery,
+)
 from ai_intel_agent.model_routing_evaluation import (
     ModelCandidate,
     ModelEvaluationConfigurationError,
@@ -29,29 +31,9 @@ from ai_intel_agent.model_routing_evaluation import (
 )
 from ai_intel_agent.persistence import (
     AnonymousResearchAllowanceRepository,
-    ClaimRecord,
-    DigestRecord,
-    DigestStoryRecord,
-    EvidenceSpanRecord,
-    StoryRecord,
 )
-from ai_intel_agent.publication import bounded_public_evidence_excerpt
 
-QUERY_TERM = re.compile(r"[0-9A-Za-z][0-9A-Za-z._+-]*|[\u3400-\u9fff]{2,}")
 CHINESE_CHARACTER = re.compile(r"[\u3400-\u9fff]")
-GENERIC_QUESTION_TERMS = frozenset(
-    {
-        "发生了什么",
-        "是什么",
-        "怎么样",
-        "有什么新消息",
-        "有什么更新",
-        "有哪些变化",
-        "如何",
-    }
-)
-QUESTION_PREFIXES = ("请问", "关于", "的")
-QUESTION_SUFFIXES = ("是多少", "是什么", "怎么样", "如何", "多少", "了吗", "吗", "呢")
 FORBIDDEN_ANSWER_URL = re.compile(
     r"https?://|www\.|"
     r"(?:[a-z][a-z0-9+.-]*):(?:[^\s]|$)|"
@@ -214,30 +196,21 @@ class DeepSeekResearchProvider:
                         and attempts < self._routing_protocol.retry_policy.max_attempts
                     ):
                         self._sleeper(
-                            self._routing_protocol.retry_policy.backoff_seconds[
-                                attempts - 1
-                            ]
+                            self._routing_protocol.retry_policy.backoff_seconds[attempts - 1]
                         )
                         continue
                     if not response.is_success:
                         raise ResearchError(
-                            "DeepSeek Research request returned "
-                            f"HTTP {response.status_code}"
+                            f"DeepSeek Research request returned HTTP {response.status_code}"
                         )
-                    if "text/event-stream" not in response.headers.get(
-                        "content-type", ""
-                    ):
-                        raise ResearchError(
-                            "DeepSeek Research response was not an SSE stream"
-                        )
+                    if "text/event-stream" not in response.headers.get("content-type", ""):
+                        raise ResearchError("DeepSeek Research response was not an SSE stream")
                     yield from self._stream_content(response)
                     return
             except httpx.RequestError as error:
                 if attempts >= self._routing_protocol.retry_policy.max_attempts:
                     raise ResearchError("DeepSeek Research request failed") from error
-                self._sleeper(
-                    self._routing_protocol.retry_policy.backoff_seconds[attempts - 1]
-                )
+                self._sleeper(self._routing_protocol.retry_policy.backoff_seconds[attempts - 1])
         raise ResearchError("DeepSeek Research request did not complete")
 
     def _stream_content(self, response: httpx.Response) -> Iterator[str]:
@@ -282,73 +255,36 @@ class DeepSeekResearchProvider:
 
 
 class ResearchRepository:
-    """Retrieve only accepted Evidence published through a Digest."""
+    """Adapt the shared accepted-knowledge operation to the Research contract."""
 
-    def __init__(self, engine: Engine) -> None:
-        self._engine = engine
+    def __init__(
+        self,
+        engine: Engine | None = None,
+        *,
+        retrieval: AcceptedKnowledgeOperation | None = None,
+    ) -> None:
+        if retrieval is None:
+            if engine is None:
+                raise ValueError("ResearchRepository requires an Engine or Retrieval operation")
+            retrieval = AcceptedKnowledgeRetrieval(engine)
+        self._retrieval = retrieval
 
     def retrieve(self, question: str, *, limit: int = 5) -> ResearchEvidenceSet:
-        query_text = _fts_query_text(question)
-        if not query_text:
+        if not question.strip() or limit < 1:
             return ResearchEvidenceSet(question=question, evidence=())
-
-        searchable_text = func.concat_ws(
-            " ",
-            StoryRecord.headline,
-            ClaimRecord.text,
-            EvidenceSpanRecord.exact_text,
+        result = self._retrieval.retrieve(RetrievalQuery(text=question))
+        evidence = tuple(
+            ResearchEvidence(
+                story_id=hit.story_id,
+                story_stable_key=hit.story_stable_key,
+                story_headline=hit.story_headline,
+                claim_id=hit.claim_id,
+                claim_text=hit.claim_text,
+                evidence_span_id=hit.evidence_span_id,
+                exact_text=hit.exact_text,
+            )
+            for hit in result.hits[:limit]
         )
-        search_vector = func.to_tsvector("simple", searchable_text)
-        query = func.websearch_to_tsquery("simple", query_text)
-        is_published = exists(
-            select(DigestStoryRecord.story_id)
-            .join(DigestRecord, DigestRecord.id == DigestStoryRecord.digest_id)
-            .where(
-                DigestStoryRecord.story_id == StoryRecord.id,
-                DigestRecord.state == DigestState.PUBLISHED.value,
-            )
-        )
-        statement = (
-            select(
-                StoryRecord.id.label("story_id"),
-                StoryRecord.stable_key,
-                StoryRecord.headline,
-                ClaimRecord.id.label("claim_id"),
-                ClaimRecord.text.label("claim_text"),
-                EvidenceSpanRecord.id.label("evidence_span_id"),
-                EvidenceSpanRecord.exact_text,
-                func.ts_rank_cd(search_vector, query).label("rank"),
-            )
-            .join(ClaimRecord, ClaimRecord.story_id == StoryRecord.id)
-            .join(EvidenceSpanRecord, EvidenceSpanRecord.claim_id == ClaimRecord.id)
-            .where(
-                StoryRecord.review_state == StoryReviewState.ACCEPTED.value,
-                EvidenceSpanRecord.relation == EvidenceRelation.SUPPORTS.value,
-                EvidenceSpanRecord.role != EvidenceRole.COMMUNITY.value,
-                is_published,
-                search_vector.op("@@")(query),
-            )
-            .order_by(
-                func.ts_rank_cd(search_vector, query).desc(),
-                StoryRecord.occurred_at.desc(),
-                ClaimRecord.position,
-                EvidenceSpanRecord.start_offset,
-            )
-            .limit(limit)
-        )
-        with Session(self._engine) as session:
-            evidence = tuple(
-                ResearchEvidence(
-                    story_id=row.story_id,
-                    story_stable_key=row.stable_key,
-                    story_headline=row.headline,
-                    claim_id=row.claim_id,
-                    claim_text=row.claim_text,
-                    evidence_span_id=row.evidence_span_id,
-                    exact_text=bounded_public_evidence_excerpt(row.exact_text),
-                )
-                for row in session.execute(statement)
-            )
         return ResearchEvidenceSet(question=question, evidence=evidence)
 
 
@@ -407,20 +343,26 @@ def stream_research_events(
         yield from _insufficient_evidence_events(version)
         return
     if provider is None:
-        yield "error", {
-            "version": version,
-            "code": "provider-unavailable",
-            "message": "Research Provider 当前不可用。",
-        }
+        yield (
+            "error",
+            {
+                "version": version,
+                "code": "provider-unavailable",
+                "message": "Research Provider 当前不可用。",
+            },
+        )
         yield "done", {"version": version, "status": "failed"}
         return
 
     if allowance is not None and not allowance.reserve(anonymous_client_id or ""):
-        yield "refusal", {
-            "version": version,
-            "code": "anonymous-allowance-exhausted",
-            "message": "匿名 Research 今日额度已用尽，请明日再试。",
-        }
+        yield (
+            "refusal",
+            {
+                "version": version,
+                "code": "anonymous-allowance-exhausted",
+                "message": "匿名 Research 今日额度已用尽，请明日再试。",
+            },
+        )
         yield "done", {"version": version, "status": "refused"}
         return
 
@@ -428,11 +370,14 @@ def stream_research_events(
     try:
         answer = _validated_provider_answer(provider, evidence_set, protocol)
     except Exception:  # noqa: BLE001 - external Provider failures must fail closed.
-        yield "error", {
-            "version": version,
-            "code": "provider-failed",
-            "message": "Research Provider 输出未通过验证。",
-        }
+        yield (
+            "error",
+            {
+                "version": version,
+                "code": "provider-failed",
+                "message": "Research Provider 输出未通过验证。",
+            },
+        )
         yield "done", {"version": version, "status": "failed"}
         return
 
@@ -441,24 +386,27 @@ def stream_research_events(
         return
 
     for start in range(0, len(answer.text), ANSWER_DELTA_CHARACTERS):
-        yield "answer.delta", {
-            "version": version,
-            "text": answer.text[start : start + ANSWER_DELTA_CHARACTERS]
-        }
+        yield (
+            "answer.delta",
+            {"version": version, "text": answer.text[start : start + ANSWER_DELTA_CHARACTERS]},
+        )
     for citation in answer.citations:
         story_url = f"/stories/{quote(citation.story_stable_key, safe='')}"
-        yield "citation", {
-            "version": version,
-            "story_id": str(citation.story_id),
-            "story_title": citation.story_headline,
-            "story_url": story_url,
-            "claim_id": str(citation.claim_id),
-            "claim_text": citation.claim_text,
-            "claim_url": f"{story_url}#claim-{citation.claim_id}",
-            "evidence_span_id": str(citation.evidence_span_id),
-            "evidence_text": citation.exact_text,
-            "evidence_url": f"{story_url}#evidence-{citation.evidence_span_id}",
-        }
+        yield (
+            "citation",
+            {
+                "version": version,
+                "story_id": str(citation.story_id),
+                "story_title": citation.story_headline,
+                "story_url": story_url,
+                "claim_id": str(citation.claim_id),
+                "claim_text": citation.claim_text,
+                "claim_url": f"{story_url}#claim-{citation.claim_id}",
+                "evidence_span_id": str(citation.evidence_span_id),
+                "evidence_text": citation.exact_text,
+                "evidence_url": f"{story_url}#evidence-{citation.evidence_span_id}",
+            },
+        )
     yield "done", {"version": version, "status": "answered"}
 
 
@@ -542,9 +490,7 @@ def load_research_protocol() -> ResearchProtocol:
 
     maximum_evidence_items = int(payload["maximum_evidence_items"])
     maximum_output_tokens = int(payload["maximum_output_tokens"])
-    maximum_provider_output_characters = int(
-        payload["maximum_provider_output_characters"]
-    )
+    maximum_provider_output_characters = int(payload["maximum_provider_output_characters"])
     if (
         not 1 <= maximum_evidence_items <= 10
         or maximum_output_tokens <= 0
@@ -609,9 +555,7 @@ def _validated_provider_answer(
     citations: list[ResearchEvidence] = []
     seen: set[tuple[UUID, UUID, UUID]] = set()
     for raw_citation in raw_citations:
-        citation_required_keys = set(
-            protocol.output_contract["citation_required_keys"]
-        )
+        citation_required_keys = set(protocol.output_contract["citation_required_keys"])
         if not isinstance(raw_citation, dict) or set(raw_citation) != citation_required_keys:
             raise ResearchError("Provider citation shape is invalid")
         try:
@@ -627,34 +571,6 @@ def _validated_provider_answer(
         seen.add(key)
         citations.append(retrieved[key])
     return ResearchAnswer(text=answer.strip(), citations=tuple(citations))
-
-
-def _fts_query_text(question: str) -> str:
-    terms = tuple(
-        normalized
-        for term in QUERY_TERM.findall(question)
-        if (normalized := _normalized_query_term(term)) is not None
-    )
-    return " ".join(dict.fromkeys(terms))
-
-
-def _normalized_query_term(term: str) -> str | None:
-    if term in GENERIC_QUESTION_TERMS:
-        return None
-    if CHINESE_CHARACTER.search(term) is None:
-        return term
-    normalized = term
-    for prefix in QUESTION_PREFIXES:
-        if normalized.startswith(prefix) and len(normalized) > len(prefix):
-            normalized = normalized.removeprefix(prefix)
-            break
-    for suffix in QUESTION_SUFFIXES:
-        if normalized.endswith(suffix) and len(normalized) > len(suffix):
-            normalized = normalized.removesuffix(suffix)
-            break
-    if not normalized or normalized in GENERIC_QUESTION_TERMS:
-        return None
-    return normalized
 
 
 def _insufficient_evidence_events(
@@ -677,9 +593,7 @@ def _selected_research_candidate(
     candidates: tuple[ModelCandidate, ...],
     identifier: str,
 ) -> ModelCandidate:
-    matches = tuple(
-        candidate for candidate in candidates if candidate.identifier == identifier
-    )
+    matches = tuple(candidate for candidate in candidates if candidate.identifier == identifier)
     if len(matches) != 1 or matches[0].provider != "deepseek":
         raise ResearchError("Approved Research DeepSeek route is unavailable")
     return matches[0]

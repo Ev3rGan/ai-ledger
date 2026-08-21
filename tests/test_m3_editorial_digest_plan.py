@@ -1438,7 +1438,7 @@ def test_0009_to_0010_upgrade_preserves_predecessor_state_and_runs_cli_seam(
                     )
                     == "succeeded"
                 )
-                assert session.scalar(text("SELECT version_num FROM alembic_version")) == "0010"
+                assert session.scalar(text("SELECT version_num FROM alembic_version")) == "0011"
                 assert (
                     session.scalar(
                         text(

@@ -35,7 +35,7 @@ exec 9>"${state_dir}/operate.lock"
 flock 9
 
 usage() {
-  printf '%s\n' 'usage: operate.sh validate RELEASE_ENV | start RELEASE_ENV | stop | restart | upgrade RELEASE_ENV | rollback | status | logs | backup | restore-isolated BACKUP_BASENAME | operator COMMAND... | audit-no-secrets'
+  printf '%s\n' 'usage: operate.sh validate RELEASE_ENV | start RELEASE_ENV | stop | restart | upgrade RELEASE_ENV | rollback | retrieval-rebuild | accept-retrieval QUERY SAMPLES MAX_P95_MS MAX_RSS_MB | status | logs | backup | restore-isolated BACKUP_BASENAME | operator COMMAND... | audit-no-secrets'
 }
 
 validate_release() {
@@ -109,6 +109,9 @@ compose() {
     "AI_INTEL_PROVIDER_MONTHLY_BUDGET_CENTS=$(release_value "$release_file" AI_INTEL_PROVIDER_MONTHLY_BUDGET_CENTS)" \
     "AI_INTEL_PROVIDER_REQUEST_RESERVATION_CENTS=$(release_value "$release_file" AI_INTEL_PROVIDER_REQUEST_RESERVATION_CENTS)" \
     "AI_INTEL_SCHEDULE_BACKFILL_LIMIT=$(release_value "$release_file" AI_INTEL_SCHEDULE_BACKFILL_LIMIT)" \
+    "AI_INTEL_EMBEDDING_MODEL_DIR=$(release_value "$release_file" AI_INTEL_EMBEDDING_MODEL_DIR)" \
+    "AI_INTEL_RERANKER_MODEL_DIR=$(release_value "$release_file" AI_INTEL_RERANKER_MODEL_DIR)" \
+    "AI_INTEL_RETRIEVAL_THREADS=$(release_value "$release_file" AI_INTEL_RETRIEVAL_THREADS)" \
     "AI_INTEL_BACKUP_INTERVAL_SECONDS=$(release_value "$release_file" AI_INTEL_BACKUP_INTERVAL_SECONDS)" \
     "AI_INTEL_BACKUP_RETENTION_DAYS=$(release_value "$release_file" AI_INTEL_BACKUP_RETENTION_DAYS)" \
     docker compose --env-file "$release_file" --file "${release_dir}/deploy/m1/production.compose.yml" "$@"
@@ -131,6 +134,21 @@ validate_candidate_contract() {
     printf '%s\n' 'AI_INTEL_SCHEDULE_BACKFILL_LIMIT must be between 1 and 5' >&2
     exit 2
   }
+  grep -Eq '^AI_INTEL_RETRIEVAL_THREADS=([1-9]|[1-5][0-9]|6[0-4])$' "$release_file" || {
+    printf '%s\n' 'AI_INTEL_RETRIEVAL_THREADS must be between 1 and 64' >&2
+    exit 2
+  }
+  for model_key in AI_INTEL_EMBEDDING_MODEL_DIR AI_INTEL_RERANKER_MODEL_DIR; do
+    model_dir="$(release_value "$release_file" "$model_key")"
+    case "$model_dir" in
+      /*) ;;
+      *) printf '%s\n' "${model_key} must be an absolute path" >&2; exit 2;;
+    esac
+    test -d "$model_dir" || {
+      printf '%s\n' "${model_key} is not an available directory" >&2
+      exit 2
+    }
+  done
 }
 
 validate_candidate() {
@@ -294,6 +312,80 @@ require_current() {
   }
 }
 
+rebuild_retrieval() {
+  compose "$current_release" --profile ops run --rm retrieval-index
+}
+
+accept_retrieval() {
+  query="$1"
+  samples="$2"
+  maximum_p95_ms="$3"
+  maximum_rss_mb="$4"
+  case "$samples" in
+    ''|*[!0-9]*) printf '%s\n' 'SAMPLES must be a positive integer' >&2; exit 2;;
+  esac
+  test "$samples" -ge 5 || {
+    printf '%s\n' 'SAMPLES must be at least 5' >&2
+    exit 2
+  }
+  test -f "$previous_release" || {
+    printf '%s\n' 'no rollback release is recorded' >&2
+    exit 2
+  }
+  validate_release "$current_release"
+  validate_image_revision "$current_release"
+  validate_release "$previous_release"
+  validate_image_revision "$previous_release"
+  compose "$current_release" exec --no-TTY web \
+    ai-intel-agent operator retrieval artifacts
+  compose "$current_release" exec --no-TTY web python -c \
+    "import json,urllib.request; response=urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=5); payload=json.load(response); assert response.status == 200 and payload == {'status': 'ready'}; print(json.dumps({'health':'ready'}, separators=(',', ':')))"
+  compose "$current_release" exec --no-TTY web \
+    python - "$query" "$samples" "$maximum_p95_ms" <<'PY'
+import json
+import math
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+query, raw_samples, raw_maximum = sys.argv[1:]
+samples = int(raw_samples)
+maximum = float(raw_maximum)
+url = "http://127.0.0.1:8000/browse?" + urllib.parse.urlencode({"q": query})
+urllib.request.urlopen(url, timeout=30).read()
+observations = []
+for _ in range(samples):
+    started = time.perf_counter()
+    response = urllib.request.urlopen(url, timeout=30)
+    response.read()
+    if response.status != 200:
+        raise SystemExit("Retrieval probe returned a non-200 response")
+    observations.append((time.perf_counter() - started) * 1000.0)
+observations.sort()
+p50 = observations[math.ceil(0.50 * samples) - 1]
+p95 = observations[math.ceil(0.95 * samples) - 1]
+print(json.dumps({"samples": samples, "p50_ms": p50, "p95_ms": p95}, separators=(",", ":")))
+if p95 > maximum:
+    raise SystemExit("Retrieval P95 exceeds the acceptance limit")
+PY
+  compose "$current_release" exec --no-TTY web \
+    ai-intel-agent operator retrieval status --production --require-hybrid
+  web_container="$(compose "$current_release" ps --quiet web)"
+  service_rss_kib="$(docker top "$web_container" -eo rss | awk 'NR > 1 { total += $1 } END { print total + 0 }')"
+  python3 - "$service_rss_kib" "$maximum_rss_mb" <<'PY'
+import json
+import sys
+
+observed_kib, raw_maximum = sys.argv[1:]
+rss_mb = float(observed_kib) / 1024.0
+maximum = float(raw_maximum)
+print(json.dumps({"service_rss_mb": rss_mb}, separators=(",", ":")))
+if rss_mb > maximum:
+    raise SystemExit("Web service RSS exceeds the acceptance limit")
+PY
+}
+
 case "$operation" in
   "validate")
     test "$#" -eq 2 || { usage; exit 2; }
@@ -362,6 +454,16 @@ case "$operation" in
       }
       exit 1
     fi
+    ;;
+  "retrieval-rebuild")
+    test "$#" -eq 1 || { usage; exit 2; }
+    require_current
+    rebuild_retrieval
+    ;;
+  "accept-retrieval")
+    test "$#" -eq 5 || { usage; exit 2; }
+    require_current
+    accept_retrieval "$2" "$3" "$4" "$5"
     ;;
   "status")
     require_current

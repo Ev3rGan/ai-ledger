@@ -1,0 +1,66 @@
+{
+  "schema_version": "accepted-knowledge-retrieval.v1",
+  "profile_id": "accepted-knowledge-minilm-mmarco-2026-08-19.v1",
+  "embedding": {
+    "provider": "fastembed",
+    "model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    "source_repository": "qdrant/paraphrase-multilingual-MiniLM-L12-v2-onnx-Q",
+    "revision": "faf4aa4225822f3bc6376869cb1164e8e3feedd0",
+    "artifact_path": "model_optimized.onnx",
+    "artifact_sha256": "634d0f66c29dc934c8fa72b8a4fe91dd4d420a22f1d82a241058d4316e659a99",
+    "pooling": "mean",
+    "normalization": "l2",
+    "token_limit": 128,
+    "dimensions": 384,
+    "distance_metric": "cosine",
+    "runtime_version": "fastembed==0.8.0",
+    "rebuild_lifecycle": "new-profile-then-atomic-activate",
+    "metadata_files": [
+      "config.json",
+      "special_tokens_map.json",
+      "tokenizer.json",
+      "tokenizer_config.json"
+    ]
+  },
+  "reranker": {
+    "provider": "fastembed",
+    "model_id": "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+    "source_repository": "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+    "revision": "1427fd652930e4ba29e8149678df786c240d8825",
+    "artifact_path": "onnx/model_uint8_avx2.onnx",
+    "artifact_sha256": "6c2513767fb63d008a4377bef7a7a3555433d9436342bb53e35a3a72ffc52d4b",
+    "quantization": "avx2-uint8",
+    "required_cpu_feature": "avx2",
+    "runtime_version": "fastembed==0.8.0",
+    "metadata_files": [
+      "config.json",
+      "special_tokens_map.json",
+      "tokenizer.json",
+      "tokenizer_config.json"
+    ]
+  },
+  "chunking": {
+    "strategy": "type-aware-token-windows",
+    "tokenizer": "unicode-script-windows-with-minilm-wordpiece-validation-v1",
+    "document_types": {
+      "technical_note": {"max_tokens": 96, "overlap_tokens": 24},
+      "documentation": {"max_tokens": 112, "overlap_tokens": 28},
+      "release": {"max_tokens": 88, "overlap_tokens": 22},
+      "paper": {"max_tokens": 112, "overlap_tokens": 28}
+    }
+  },
+  "retrieval": {
+    "lexical_candidates": 12,
+    "semantic_candidates": 12,
+    "entity_candidates": 8,
+    "rerank_depth": 8,
+    "final_top_k": 5
+  },
+  "fusion": {
+    "method": "weighted-reciprocal-rank-fusion",
+    "rrf_k": 60,
+    "weights": {"lexical": 0.2, "semantic": 0.6, "exact_entity": 0.2}
+  },
+  "entity_policy": "technical-identifiers-v1",
+  "fallback_channels": ["lexical", "exact_entity"]
+}

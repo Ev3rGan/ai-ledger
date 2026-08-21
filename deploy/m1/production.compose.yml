@@ -38,6 +38,11 @@ x-provider-environment: &provider-environment
   AI_INTEL_PROVIDER_MONTHLY_BUDGET_CENTS: ${AI_INTEL_PROVIDER_MONTHLY_BUDGET_CENTS:-11500}
   AI_INTEL_PROVIDER_REQUEST_RESERVATION_CENTS: ${AI_INTEL_PROVIDER_REQUEST_RESERVATION_CENTS:-100}
 
+x-retrieval-environment: &retrieval-environment
+  AI_INTEL_EMBEDDING_MODEL_DIR: /opt/ai-ledger/models/embedding
+  AI_INTEL_RERANKER_MODEL_DIR: /opt/ai-ledger/models/reranker
+  AI_INTEL_RETRIEVAL_THREADS: ${AI_INTEL_RETRIEVAL_THREADS:?required}
+
 services:
   caddy:
     image: caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
@@ -93,7 +98,7 @@ services:
     <<: *app
     command: ["serve", "--production", "--host", "0.0.0.0", "--port", "8000"]
     environment:
-      <<: [*database-environment, *provider-environment]
+      <<: [*database-environment, *provider-environment, *retrieval-environment]
       AI_INTEL_RELEASE: ${AI_INTEL_RELEASE:?required}
       AI_INTEL_SCHEDULE_BACKFILL_LIMIT: ${AI_INTEL_SCHEDULE_BACKFILL_LIMIT:?required}
       AI_INTEL_ANONYMOUS_ID_SALT_FILE: /run/secrets/anonymous-id-salt
@@ -104,6 +109,9 @@ services:
       - database-password
       - deepseek-api-key
       - anonymous-id-salt
+    volumes:
+      - ${AI_INTEL_EMBEDDING_MODEL_DIR:?required}:/opt/ai-ledger/models/embedding:ro
+      - ${AI_INTEL_RERANKER_MODEL_DIR:?required}:/opt/ai-ledger/models/reranker:ro
     expose:
       - "8000"
     networks:
@@ -176,6 +184,21 @@ services:
     environment: *database-environment
     secrets:
       - database-password
+    networks:
+      - database
+
+  retrieval-index:
+    <<: *app
+    profiles: ["ops"]
+    restart: "no"
+    command: ["operator", "retrieval", "index", "--complete", "--production"]
+    environment:
+      <<: [*database-environment, *retrieval-environment]
+    secrets:
+      - database-password
+    volumes:
+      - ${AI_INTEL_EMBEDDING_MODEL_DIR:?required}:/opt/ai-ledger/models/embedding:ro
+      - ${AI_INTEL_RERANKER_MODEL_DIR:?required}:/opt/ai-ledger/models/reranker:ro
     networks:
       - database
 

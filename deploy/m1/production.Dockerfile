@@ -16,8 +16,11 @@ WORKDIR /opt/ai-ledger
 COPY pyproject.toml uv.lock README.md alembic.ini ./
 COPY alembic ./alembic
 COPY src ./src
-RUN python -m pip install --no-cache-dir uv==0.12.3 \
-    && uv sync --locked --no-dev --no-editable
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m pip install --no-cache-dir uv==0.12.3 \
+    && uv sync --locked --no-dev --no-editable --extra retrieval
 
 USER 10001:10001
 ENTRYPOINT ["ai-intel-agent"]

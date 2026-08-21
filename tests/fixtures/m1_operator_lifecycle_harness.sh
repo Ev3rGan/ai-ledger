@@ -53,6 +53,8 @@ write_release() {
   release_sha="$2"
   release_dir="$3"
   image_digit="$4"
+  embedding_model_dir="$5"
+  reranker_model_dir="$6"
   cat >"$release_file" <<EOF
 AI_INTEL_IMAGE=registry.example/ai-ledger@sha256:$(printf '%064d' 0 | tr 0 "$image_digit")
 AI_INTEL_RELEASE=$release_sha
@@ -69,6 +71,9 @@ AI_INTEL_PROVIDER_REQUEST_RESERVATION_CENTS=100
 AI_INTEL_SCHEDULE_BACKFILL_LIMIT=5
 AI_INTEL_BACKUP_INTERVAL_SECONDS=86400
 AI_INTEL_BACKUP_RETENTION_DAYS=14
+AI_INTEL_EMBEDDING_MODEL_DIR=$embedding_model_dir
+AI_INTEL_RERANKER_MODEL_DIR=$reranker_model_dir
+AI_INTEL_RETRIEVAL_THREADS=2
 EOF
 }
 
@@ -79,8 +84,11 @@ new_fixture() {
   fake_bin="$fixture/bin"
   current_dir="$fixture/current-release"
   candidate_dir="$fixture/candidate-release"
+  embedding_model_dir="$fixture/models/embedding"
+  reranker_model_dir="$fixture/models/reranker"
   mkdir -p "$state_dir" "$fake_bin" \
-    "$current_dir/deploy/m1" "$candidate_dir/deploy/m1" "$fixture/offsite"
+    "$current_dir/deploy/m1" "$candidate_dir/deploy/m1" "$fixture/offsite" \
+    "$embedding_model_dir" "$reranker_model_dir"
 
   printf '%s\n' "$current_release" >"$current_dir/.fake-head"
   printf '%s\n' "$candidate_release" >"$candidate_dir/.fake-head"
@@ -91,8 +99,10 @@ new_fixture() {
 
   current_file="$state_dir/current.env"
   candidate_file="$fixture/candidate.env"
-  write_release "$current_file" "$current_release" "$current_dir" a
-  write_release "$candidate_file" "$candidate_release" "$candidate_dir" b
+  write_release "$current_file" "$current_release" "$current_dir" a \
+    "$embedding_model_dir" "$reranker_model_dir"
+  write_release "$candidate_file" "$candidate_release" "$candidate_dir" b \
+    "$embedding_model_dir" "$reranker_model_dir"
   runtime_state="$fixture/runtime.state"
   printf 'release=%s\nsubnet=%s\nip_range=none\nowner=compose\nconnected=1\n' \
     "$current_release" "$legacy_subnet" >"$runtime_state"
