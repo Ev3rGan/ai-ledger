@@ -149,34 +149,37 @@ def _persist_m2_draft(
     return stable_key
 
 
-def _accept_story(
+def _seed_accepted_story(
     database_url: str,
     stable_key: str,
     *,
     topic: str,
 ) -> None:
-    result = runner.invoke(
-        app,
-        [
-            "story",
-            "accept",
-            stable_key,
-            "--summary",
-            f"{stable_key} 的摘要由 operator 明确输入并经过审核。",
-            "--why-it-matters",
-            f"{stable_key} 会影响 AI 开发者的技术评估与采用计划。",
-            "--topic",
-            topic,
-            "--actor",
-            "m3-operator",
-        ],
-        env={"AI_INTEL_DATABASE_URL": database_url},
-    )
-    assert result.exit_code == 0, result.output
+    engine = create_database_engine(database_url)
+    try:
+        with Session(engine) as session, session.begin():
+            story = session.scalar(
+                select(StoryRecord).where(StoryRecord.stable_key == stable_key)
+            )
+            assert story is not None
+            story.review_state = StoryReviewState.ACCEPTED.value
+            session.add(
+                StoryPresentationRecord(
+                    story_id=story.id,
+                    summary=f"{stable_key} 的摘要由 operator 明确输入并经过审核。",
+                    why_it_matters=(
+                        f"{stable_key} 会影响 AI 开发者的技术评估与采用计划。"
+                    ),
+                    primary_topic=topic,
+                    secondary_topics=[],
+                )
+            )
+    finally:
+        engine.dispose()
 
 
 @pytest.mark.postgres
-def test_operator_filters_inspects_and_accepts_m2_draft_with_explicit_reader_metadata(
+def test_operator_filters_and_inspects_but_cannot_directly_accept_m2_draft(
     m3_database_url: str,
 ) -> None:
     target_key = _persist_m2_draft(
@@ -245,16 +248,15 @@ def test_operator_filters_inspects_and_accepts_m2_draft_with_explicit_reader_met
         env=environment,
     )
 
-    assert accepted.exit_code == 0, accepted.output
-    assert "accepted" in accepted.output
-    accepted_story = runner.invoke(app, ["story", "show", target_key], env=environment)
-    assert "TechCrunch 报道了一项新的 AI 模型进展。" in accepted_story.output
-    assert "该进展会影响开发者选择模型与规划迁移窗口。" in accepted_story.output
-    assert "Models" in accepted_story.output
+    assert accepted.exit_code != 0
+    assert "exact Digest Plan" in accepted.output
+    assert "approval" in accepted.output
+    unchanged_story = runner.invoke(app, ["story", "show", target_key], env=environment)
+    assert "Review state: unreviewed" in unchanged_story.output
 
 
 @pytest.mark.postgres
-def test_operator_explicitly_selects_and_orders_valid_multisource_digest_atomically(
+def test_direct_multisource_digest_publication_is_retired(
     m3_database_url: str,
 ) -> None:
     publishers = (
@@ -277,7 +279,7 @@ def test_operator_explicitly_selects_and_orders_valid_multisource_digest_atomica
                     tzinfo=UTC,
                 ),
             )
-            _accept_story(m3_database_url, stable_key, topic=topic)
+            _seed_accepted_story(m3_database_url, stable_key, topic=topic)
             keys_by_publisher[publisher].append(stable_key)
 
     environment = {"AI_INTEL_DATABASE_URL": m3_database_url}
@@ -298,20 +300,6 @@ def test_operator_explicitly_selects_and_orders_valid_multisource_digest_atomica
             arguments.extend(("--story", story_key))
         return runner.invoke(app, arguments, env=environment)
 
-    too_few = publish(
-        keys_by_publisher["TechCrunch"]
-        + keys_by_publisher["Hugging Face"][:2]
-        + keys_by_publisher["The Decoder"][:1]
-    )
-    assert too_few.exit_code != 0
-    assert "8 and 12" in too_few.output
-
-    only_two_sources = publish(
-        keys_by_publisher["TechCrunch"] + keys_by_publisher["Hugging Face"]
-    )
-    assert only_two_sources.exit_code != 0
-    assert "three Publishers" in only_two_sources.output
-
     selected_order = [
         keys_by_publisher["The Decoder"][2],
         keys_by_publisher["TechCrunch"][1],
@@ -325,55 +313,15 @@ def test_operator_explicitly_selects_and_orders_valid_multisource_digest_atomica
     ]
     published = publish(selected_order)
 
-    assert published.exit_code == 0, published.output
-    assert "published with 9 Stories" in published.output
-    assert "".join(introduction.split()) in "".join(published.output.split())
+    assert published.exit_code != 0
+    assert "exact Digest Plan" in published.output
+    assert "approval" in published.output
 
     operational_result = runner.invoke(app, ["operator", "status"], env=environment)
     assert operational_result.exit_code == 0, operational_result.output
     operational = json.loads(operational_result.output)
-    assert operational["latest_digest"]["publication_date"] == "2026-08-18"
-    assert operational["latest_digest"]["story_count"] == 9
-    assert operational["latest_digest"]["published_at"] is not None
+    assert operational["latest_digest"] is None
     assert operational["pending_reviews"] == 0
-
-    preview_arguments = ["digest", "preview", "--date", "2026-08-19"]
-    for story_key in selected_order:
-        preview_arguments.extend(("--story", story_key))
-    already_composed = runner.invoke(app, preview_arguments, env=environment)
-    assert already_composed.exit_code != 0
-    assert "already belongs to a Digest" in already_composed.output
-
-    unpublished_key = _persist_m2_draft(
-        m3_database_url,
-        identity="presentation-move-target",
-        publisher="TechCrunch",
-        published_at=datetime(2026, 8, 17, 20, tzinfo=UTC),
-    )
-    engine = create_database_engine(m3_database_url)
-    try:
-        with Session(engine) as session:
-            published_story_id = session.scalar(
-                select(StoryRecord.id).where(
-                    StoryRecord.stable_key == selected_order[0]
-                )
-            )
-            unpublished_story_id = session.scalar(
-                select(StoryRecord.id).where(
-                    StoryRecord.stable_key == unpublished_key
-                )
-            )
-            with pytest.raises(
-                ProgrammingError,
-                match="published Story presentation is immutable",
-            ):
-                session.execute(
-                    update(StoryPresentationRecord)
-                    .where(StoryPresentationRecord.story_id == published_story_id)
-                    .values(story_id=unpublished_story_id)
-                )
-    finally:
-        engine.dispose()
 
 
 @pytest.mark.postgres
@@ -386,13 +334,13 @@ def test_database_rejects_every_invalid_m3_publication_entry_path(
         publisher="TechCrunch",
         published_at=datetime(2026, 8, 17, 21, tzinfo=UTC),
     )
-    _accept_story(m3_database_url, story_key, topic="Models")
+    _seed_accepted_story(m3_database_url, story_key, topic="Models")
     engine = create_database_engine(m3_database_url)
     try:
         direct_publish_id = _id("direct-published-digest")
         with Session(engine) as session, pytest.raises(
             ProgrammingError,
-            match="between 8 and 12 Stories",
+            match="exact Digest Plan approval is required",
         ):
             session.add(
                 DigestRecord(
@@ -432,7 +380,7 @@ def test_database_rejects_every_invalid_m3_publication_entry_path(
 
         with Session(engine) as session, pytest.raises(
             ProgrammingError,
-            match="between 8 and 12 Stories",
+            match="exact Digest Plan approval is required",
         ):
             session.execute(
                 update(DigestRecord)
@@ -535,7 +483,7 @@ def test_0006_published_story_remains_visible_after_0007_upgrade_without_backfil
 
 
 @pytest.mark.postgres
-def test_reader_scans_verifies_browses_and_finds_only_published_m3_digest(
+def test_reader_scans_verifies_browses_and_finds_only_public_fixture_digest(
     m3_database_url: str,
 ) -> None:
     publisher_topics = (
@@ -558,7 +506,7 @@ def test_reader_scans_verifies_browses_and_finds_only_published_m3_digest(
                     tzinfo=UTC,
                 ),
             )
-            _accept_story(m3_database_url, stable_key, topic=topic)
+            _seed_accepted_story(m3_database_url, stable_key, topic=topic)
             selected_order.append(stable_key)
 
     unreviewed_key = _persist_m2_draft(
@@ -586,23 +534,50 @@ def test_reader_scans_verifies_browses_and_finds_only_published_m3_digest(
         env=environment,
     )
     assert rejected.exit_code == 0, rejected.output
-    _accept_story(m3_database_url, unpublished_key, topic="Business")
+    _seed_accepted_story(m3_database_url, unpublished_key, topic="Business")
 
     introduction = "本期聚焦三个发布者在模型、研究和产业方向的九项已审核进展。"
-    publish_arguments = [
-        "digest",
-        "publish",
-        "--date",
-        "2026-08-18",
-        "--introduction",
-        introduction,
-        "--actor",
-        "m3-operator",
-    ]
-    for stable_key in selected_order:
-        publish_arguments.extend(("--story", stable_key))
-    published = runner.invoke(app, publish_arguments, env=environment)
-    assert published.exit_code == 0, published.output
+    engine = create_database_engine(m3_database_url)
+    try:
+        with Session(engine) as session, session.begin():
+            story_ids_by_key = {
+                key: story_id
+                for key, story_id in session.execute(
+                    select(StoryRecord.stable_key, StoryRecord.id).where(
+                        StoryRecord.stable_key.in_(selected_order)
+                    )
+                )
+            }
+            assert len(story_ids_by_key) == 9
+            digest_id = _id("public-web-regression:digest")
+            session.add(
+                DigestRecord(
+                    id=digest_id,
+                    stable_key="digest:2026-08-18",
+                    publication_date=date(2026, 8, 18),
+                    state="draft",
+                    published_at=None,
+                    introduction=introduction,
+                    publication_contract="legacy-fixture",
+                )
+            )
+            session.flush()
+            session.add_all(
+                DigestStoryRecord(
+                    digest_id=digest_id,
+                    story_id=story_ids_by_key[stable_key],
+                    position=position,
+                )
+                for position, stable_key in enumerate(selected_order)
+            )
+            session.flush()
+            session.execute(
+                update(DigestRecord)
+                .where(DigestRecord.id == digest_id)
+                .values(state="published", published_at=datetime(2026, 8, 18, tzinfo=UTC))
+            )
+    finally:
+        engine.dispose()
 
     first_story_key = selected_order[0]
     first_story_url = f"/stories/{quote(first_story_key, safe='')}"

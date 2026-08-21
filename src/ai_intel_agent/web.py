@@ -13,20 +13,37 @@ from xml.etree import ElementTree
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import func, select
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session
 
-from ai_intel_agent.domain import EvidenceRelation, EvidenceRole, EvidenceState, Topic
-from ai_intel_agent.persistence import create_database_engine
+from ai_intel_agent.domain import (
+    EvidenceRelation,
+    EvidenceRole,
+    EvidenceState,
+    StoryReviewState,
+    Topic,
+)
+from ai_intel_agent.persistence import (
+    ClaimRecord,
+    EvidenceSpanRecord,
+    StoryRecord,
+    create_database_engine,
+)
 from ai_intel_agent.publication import (
     PublicClaim,
     PublicDigest,
     PublicEvidence,
     PublicPublicationRepository,
     PublicStory,
+    bounded_public_evidence_excerpt,
 )
 from ai_intel_agent.research import (
     PersistentAnonymousResearchAllowance,
+    ResearchEvidence,
+    ResearchEvidenceSet,
     ResearchProvider,
-    ResearchRepository,
+    _fts_query_text,
     stream_research_events,
 )
 
@@ -48,6 +65,70 @@ EVIDENCE_RELATION_LABELS: dict[EvidenceRelation, str] = {
 }
 
 
+class _PublicResearchRepository:
+    """Apply the public visibility projection before Research sees Evidence."""
+
+    def __init__(
+        self,
+        engine: Engine,
+    ) -> None:
+        self._engine = engine
+
+    def retrieve(self, question: str, *, limit: int = 5) -> ResearchEvidenceSet:
+        query_text = _fts_query_text(question)
+        if not query_text:
+            return ResearchEvidenceSet(question=question, evidence=())
+        searchable_text = func.concat_ws(
+            " ",
+            StoryRecord.headline,
+            ClaimRecord.text,
+            EvidenceSpanRecord.exact_text,
+        )
+        search_vector = func.to_tsvector("simple", searchable_text)
+        query = func.websearch_to_tsquery("simple", query_text)
+        statement = (
+            select(
+                StoryRecord.id.label("story_id"),
+                StoryRecord.stable_key,
+                StoryRecord.headline,
+                ClaimRecord.id.label("claim_id"),
+                ClaimRecord.text.label("claim_text"),
+                EvidenceSpanRecord.id.label("evidence_span_id"),
+                EvidenceSpanRecord.exact_text,
+            )
+            .join(ClaimRecord, ClaimRecord.story_id == StoryRecord.id)
+            .join(EvidenceSpanRecord, EvidenceSpanRecord.claim_id == ClaimRecord.id)
+            .where(
+                StoryRecord.review_state == StoryReviewState.ACCEPTED.value,
+                EvidenceSpanRecord.relation == EvidenceRelation.SUPPORTS.value,
+                EvidenceSpanRecord.role != EvidenceRole.COMMUNITY.value,
+                PublicPublicationRepository.public_story_exists(StoryRecord.id),
+                search_vector.op("@@")(query),
+            )
+            .order_by(
+                func.ts_rank_cd(search_vector, query).desc(),
+                StoryRecord.occurred_at.desc(),
+                ClaimRecord.position,
+                EvidenceSpanRecord.start_offset,
+            )
+            .limit(limit)
+        )
+        with Session(self._engine) as session:
+            evidence = tuple(
+                ResearchEvidence(
+                    story_id=row.story_id,
+                    story_stable_key=row.stable_key,
+                    story_headline=row.headline,
+                    claim_id=row.claim_id,
+                    claim_text=row.claim_text,
+                    evidence_span_id=row.evidence_span_id,
+                    exact_text=bounded_public_evidence_excerpt(row.exact_text),
+                )
+                for row in session.execute(statement)
+            )
+        return ResearchEvidenceSet(question=question, evidence=evidence)
+
+
 class ResearchQuestion(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -65,15 +146,14 @@ def create_app(
         raise ValueError("Anonymous Research limit and identity salt must be configured together")
     engine = create_database_engine(database_url)
     repository = PublicPublicationRepository(engine)
-    research_repository = ResearchRepository(engine)
+    research_repository = _PublicResearchRepository(engine)
     research_allowance = (
         PersistentAnonymousResearchAllowance(
             engine,
             daily_limit=anonymous_research_daily_limit,
             identity_salt=anonymous_identity_salt,
         )
-        if anonymous_research_daily_limit is not None
-        and anonymous_identity_salt is not None
+        if anonymous_research_daily_limit is not None and anonymous_identity_salt is not None
         else None
     )
 
@@ -116,14 +196,16 @@ def create_app(
             digest = digests[0]
             publishers = sorted({story.publisher for story in digest.stories})
             coverage = "".join(
-                f'<li class="badge">{escape(publisher)}</li>'
-                for publisher in publishers
+                f'<li class="badge">{escape(publisher)}</li>' for publisher in publishers
             )
-            recent = "".join(
-                f'<li><a href="/digests/{item.publication_date.isoformat()}">'
-                f"{item.publication_date.isoformat()}</a></li>"
-                for item in digests[1:6]
-            ) or "<li>暂无更早的 Digest。</li>"
+            recent = (
+                "".join(
+                    f'<li><a href="/digests/{item.publication_date.isoformat()}">'
+                    f"{item.publication_date.isoformat()}</a></li>"
+                    for item in digests[1:6]
+                )
+                or "<li>暂无更早的 Digest。</li>"
+            )
             content = (
                 '<section class="hero"><p class="eyebrow">AI Intelligence</p>'
                 "<h1>今日 AI Digest</h1>"
@@ -137,8 +219,7 @@ def create_app(
                 f'<div class="story-grid">{_render_story_cards(digest.stories, _relative_story_url)}</div>'
                 "</section>"
                 '<section aria-labelledby="recent-heading"><h2 id="recent-heading">近期 Digest</h2>'
-                f'<ul class="digest-list">{recent}</ul></section>'
-                + _render_entry_points()
+                f'<ul class="digest-list">{recent}</ul></section>' + _render_entry_points()
             )
         return HTMLResponse(_render_page("AI Intelligence", content))
 
@@ -162,9 +243,29 @@ def create_app(
         )
         return HTMLResponse(_render_page(f"Digest {publication_date.isoformat()}", content))
 
-    @app.get(
-        "/stories/{stable_key}", response_class=HTMLResponse, name="story_page"
-    )
+    @app.get("/archive", response_class=HTMLResponse, name="archive")
+    def archive() -> HTMLResponse:
+        digests = repository.published_digests()
+        entries = (
+            "".join(
+                '<section class="archive-entry">'
+                f'<h2><a href="/digests/{digest.publication_date.isoformat()}">'
+                f"{digest.publication_date.isoformat()} AI Digest</a></h2>"
+                f'<p class="lede">{escape(digest.introduction)}</p>'
+                f'<div class="story-grid">{_render_story_cards(digest.stories, _relative_story_url)}</div>'
+                "</section>"
+                for digest in digests
+            )
+            or '<p class="empty-state">暂无已发布 Digest。</p>'
+        )
+        content = (
+            '<header class="page-header"><p class="eyebrow">Published history</p>'
+            '<h1>Digest archive</h1><p class="lede">浏览仍公开可见的历史 Digest。</p>'
+            f"</header>{entries}"
+        )
+        return HTMLResponse(_render_page("Digest archive", content))
+
+    @app.get("/stories/{stable_key}", response_class=HTMLResponse, name="story_page")
     def story_page(stable_key: str) -> HTMLResponse:
         story = repository.published_story(stable_key)
         if story is None:
@@ -210,7 +311,7 @@ def create_app(
         content = (
             '<header class="page-header"><p class="eyebrow">Published knowledge</p>'
             '<h1>Browse</h1><p class="lede">按关键词、发布者、主题和原始发布日期查找已发布内容。</p>'
-            f"</header>{form}<p class=\"muted\">找到 {len(stories)} 条 Story</p>{results}"
+            f'</header>{form}<p class="muted">找到 {len(stories)} 条 Story</p>{results}'
         )
         return HTMLResponse(_render_page("Browse", content))
 
@@ -248,9 +349,7 @@ def create_app(
             digest_url=lambda value: str(
                 request.url_for("digest_page", publication_date=value.isoformat())
             ),
-            story_url=lambda value: str(
-                request.url_for("story_page", stable_key=value)
-            ),
+            story_url=lambda value: str(request.url_for("story_page", stable_key=value)),
         )
         return Response(
             content=body,
@@ -338,7 +437,8 @@ def _render_page(title: str, content: str) -> str:
         ".story-card,.key-fact{padding:1rem}.nav-links{gap:.75rem}.browse-form button{grid-column:auto}}"
         "</style></head><body>"
         '<nav class="site-nav"><a class="brand" href="/">AI Intelligence</a>'
-        '<div class="nav-links"><a href="/">首页</a><a href="/browse">Browse</a>'
+        '<div class="nav-links"><a href="/">首页</a><a href="/archive">Archive</a>'
+        '<a href="/browse">Browse</a>'
         '<a href="/research">Research</a><a href="/rss">RSS</a></div></nav><main>'
         f"{content}</main></body></html>"
     )
@@ -358,12 +458,9 @@ def _relative_story_url(stable_key: str) -> str:
     return f"/stories/{quote(stable_key, safe='')}"
 
 
-def _render_story_cards(
-    stories: tuple[PublicStory, ...], story_url: Callable[[str], str]
-) -> str:
+def _render_story_cards(stories: tuple[PublicStory, ...], story_url: Callable[[str], str]) -> str:
     return "".join(
-        _render_story_card(story, headline_url=story_url(story.stable_key))
-        for story in stories
+        _render_story_card(story, headline_url=story_url(story.stable_key)) for story in stories
     )
 
 
@@ -374,19 +471,23 @@ def _render_story_card(story: PublicStory, *, headline_url: str) -> str:
         else "时间未知"
     )
     topic = (
-        f'<p class="topic">{escape(story.primary_topic.value)}</p>'
+        f'<p class="topic">{escape(story.primary_topic.value)}'
+        + (
+            " · " + " · ".join(escape(item.value) for item in story.secondary_topics)
+            if story.secondary_topics
+            else ""
+        )
+        + "</p>"
         if story.primary_topic is not None
         else ""
     )
-    summary = (
-        f"<p>{escape(story.summary)}</p>" if story.summary is not None else ""
-    )
+    summary = f"<p>{escape(story.summary)}</p>" if story.summary is not None else ""
     return (
         '<article class="story-card">'
         f"{topic}"
         f'<h2><a href="{escape(headline_url, quote=True)}">{escape(story.headline)}</a></h2>'
         f'{summary}<p class="story-meta">'
-        f'<span>{escape(story.publisher)}</span><span>{published}</span></p></article>'
+        f"<span>{escape(story.publisher)}</span><span>{published}</span></p></article>"
     )
 
 
@@ -403,31 +504,38 @@ def _render_story_detail(story: PublicStory) -> str:
         if source_url is not None
         else ""
     )
-    key_facts = "".join(
-        _render_claim(claim, position=position)
-        for position, claim in enumerate(story.claims, start=1)
-    ) or '<p class="empty-state">暂无可公开的关键事实。</p>'
+    key_facts = (
+        "".join(
+            _render_claim(claim, position=position)
+            for position, claim in enumerate(story.claims, start=1)
+        )
+        or '<p class="empty-state">暂无可公开的关键事实。</p>'
+    )
     topic = (
-        f'<p class="eyebrow">{escape(story.primary_topic.value)}</p>'
+        f'<p class="eyebrow">{escape(story.primary_topic.value)}'
+        + (
+            " · " + " · ".join(escape(item.value) for item in story.secondary_topics)
+            if story.secondary_topics
+            else ""
+        )
+        + "</p>"
         if story.primary_topic is not None
         else ""
     )
     summary = (
-        f'<p class="story-summary">{escape(story.summary)}</p>'
-        if story.summary is not None
-        else ""
+        f'<p class="story-summary">{escape(story.summary)}</p>' if story.summary is not None else ""
     )
     importance = (
         '<section class="importance"><h2>为什么重要</h2>'
-        f'<p>{escape(story.why_it_matters)}</p></section>'
+        f"<p>{escape(story.why_it_matters)}</p></section>"
         if story.why_it_matters is not None
         else ""
     )
     return (
         '<article class="story-detail"><header class="page-header">'
         f'{topic}<h1>{escape(story.headline)}</h1>{summary}<p class="story-meta">'
-        f'<span>{escape(story.publisher)}</span><span>原始发布时间 {published}</span></p>{source_link}'
-        f'</header>{importance}'
+        f"<span>{escape(story.publisher)}</span><span>原始发布时间 {published}</span></p>{source_link}"
+        f"</header>{importance}"
         '<section aria-labelledby="facts-heading"><h2 id="facts-heading">关键事实</h2>'
         f"{key_facts}</section></article>"
     )
@@ -671,9 +779,9 @@ def _render_rss(
 
     for digest in digests:
         item = ElementTree.SubElement(channel, "item")
-        ElementTree.SubElement(item, "title").text = (
-            f"AI Intelligence Digest · {digest.publication_date.isoformat()}"
-        )
+        ElementTree.SubElement(
+            item, "title"
+        ).text = f"AI Intelligence Digest · {digest.publication_date.isoformat()}"
         ElementTree.SubElement(item, "link").text = digest_url(digest.publication_date)
         ElementTree.SubElement(item, "guid", isPermaLink="false").text = digest.stable_key
         ElementTree.SubElement(item, "pubDate").text = format_datetime(digest.published_at)

@@ -4,9 +4,11 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from uuid import UUID
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, exists, func, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, aliased
+from sqlalchemy.sql.elements import ColumnElement
+from sqlalchemy.sql.selectable import Exists
 
 from ai_intel_agent.domain import (
     DigestState,
@@ -22,6 +24,7 @@ from ai_intel_agent.persistence import (
     ClaimRecord,
     DigestRecord,
     DigestStoryRecord,
+    DigestWithdrawalRecord,
     DocumentVersionRecord,
     EvidenceSpanRecord,
     StoryPresentationRecord,
@@ -55,9 +58,7 @@ class PublicClaim:
         if not non_community:
             return EvidenceState.INSUFFICIENT_EVIDENCE
 
-        if any(
-            item.relation is EvidenceRelation.CONTRADICTS for item in non_community
-        ):
+        if any(item.relation is EvidenceRelation.CONTRADICTS for item in non_community):
             return EvidenceState.CONFLICT
 
         corroborating_sources = {
@@ -66,9 +67,8 @@ class PublicClaim:
             if item.relation is EvidenceRelation.SUPPORTS
             and item.role in (EvidenceRole.PRIMARY, EvidenceRole.INDEPENDENT)
         }
-        independently_confirmed = (
-            len(corroborating_sources) > 1
-            and any(item.role is EvidenceRole.INDEPENDENT for item in non_community)
+        independently_confirmed = len(corroborating_sources) > 1 and any(
+            item.role is EvidenceRole.INDEPENDENT for item in non_community
         )
         if independently_confirmed:
             return EvidenceState.MULTI_SOURCE
@@ -83,6 +83,7 @@ class PublicStory:
     summary: str | None
     why_it_matters: str | None
     primary_topic: Topic | None
+    secondary_topics: tuple[Topic, ...]
     publisher: str
     canonical_url: str
     original_published_at: datetime | None
@@ -114,6 +115,7 @@ class _StoryBuilder:
     summary: str | None
     why_it_matters: str | None
     primary_topic: Topic | None
+    secondary_topics: tuple[Topic, ...]
     publisher: str
     canonical_url: str
     original_published_at: datetime | None
@@ -169,6 +171,30 @@ class PublicPublicationRepository:
             )
 
     @staticmethod
+    def public_story_exists(story_id: ColumnElement[UUID]) -> Exists:
+        """Correlate one Story with a still-visible supported publication."""
+        return exists(
+            select(DigestStoryRecord.story_id)
+            .join(DigestRecord, DigestRecord.id == DigestStoryRecord.digest_id)
+            .where(
+                DigestStoryRecord.story_id == story_id,
+                DigestRecord.state == DigestState.PUBLISHED.value,
+                DigestRecord.publication_contract.in_(
+                    (
+                        DigestPublicationContract.LEGACY_FIXTURE.value,
+                        DigestPublicationContract.M3_MULTISOURCE.value,
+                        DigestPublicationContract.M3_EDITORIAL_PLAN.value,
+                    )
+                ),
+                ~exists(
+                    select(DigestWithdrawalRecord.digest_id).where(
+                        DigestWithdrawalRecord.digest_id == DigestRecord.id
+                    )
+                ),
+            )
+        )
+
+    @staticmethod
     def _published_digests_statement() -> Select[tuple[DigestRecord]]:
         return (
             select(DigestRecord)
@@ -178,15 +204,19 @@ class PublicPublicationRepository:
                     (
                         DigestPublicationContract.LEGACY_FIXTURE.value,
                         DigestPublicationContract.M3_MULTISOURCE.value,
+                        DigestPublicationContract.M3_EDITORIAL_PLAN.value,
+                    )
+                ),
+                ~exists(
+                    select(DigestWithdrawalRecord.digest_id).where(
+                        DigestWithdrawalRecord.digest_id == DigestRecord.id
                     )
                 ),
             )
             .order_by(DigestRecord.publication_date.desc())
         )
 
-    def _to_public_digest(
-        self, session: Session, record: DigestRecord
-    ) -> PublicDigest:
+    def _to_public_digest(self, session: Session, record: DigestRecord) -> PublicDigest:
         if record.published_at is None:
             raise ValueError("A published Digest must have a publication time")
         return PublicDigest(
@@ -220,6 +250,7 @@ class PublicPublicationRepository:
                 StoryPresentationRecord.summary,
                 StoryPresentationRecord.why_it_matters,
                 StoryPresentationRecord.primary_topic,
+                StoryPresentationRecord.secondary_topics,
                 primary_candidate.publisher.label("primary_publisher"),
                 primary_candidate.canonical_url.label("primary_canonical_url"),
                 primary_document.published_at.label("original_published_at"),
@@ -247,9 +278,7 @@ class PublicPublicationRepository:
                 primary_candidate.id == primary_document.candidate_id,
             )
             .outerjoin(ClaimRecord, ClaimRecord.story_id == StoryRecord.id)
-            .outerjoin(
-                EvidenceSpanRecord, EvidenceSpanRecord.claim_id == ClaimRecord.id
-            )
+            .outerjoin(EvidenceSpanRecord, EvidenceSpanRecord.claim_id == ClaimRecord.id)
             .outerjoin(
                 evidence_document,
                 evidence_document.id == EvidenceSpanRecord.document_version_id,
@@ -264,6 +293,12 @@ class PublicPublicationRepository:
                     (
                         DigestPublicationContract.LEGACY_FIXTURE.value,
                         DigestPublicationContract.M3_MULTISOURCE.value,
+                        DigestPublicationContract.M3_EDITORIAL_PLAN.value,
+                    )
+                ),
+                ~exists(
+                    select(DigestWithdrawalRecord.digest_id).where(
+                        DigestWithdrawalRecord.digest_id == DigestRecord.id
                     )
                 ),
                 StoryRecord.review_state == StoryReviewState.ACCEPTED.value,
@@ -298,13 +333,9 @@ class PublicPublicationRepository:
                 | matching_claim
             )
         if publisher is not None and publisher.strip():
-            statement = statement.where(
-                primary_candidate.publisher == publisher.strip()
-            )
+            statement = statement.where(primary_candidate.publisher == publisher.strip())
         if topic is not None:
-            statement = statement.where(
-                StoryPresentationRecord.primary_topic == topic.value
-            )
+            statement = statement.where(StoryPresentationRecord.primary_topic == topic.value)
         if publication_date is not None:
             statement = statement.where(
                 primary_document.published_at.is_not(None),
@@ -322,10 +353,9 @@ class PublicPublicationRepository:
                     summary=row.summary,
                     why_it_matters=row.why_it_matters,
                     primary_topic=(
-                        Topic(row.primary_topic)
-                        if row.primary_topic is not None
-                        else None
+                        Topic(row.primary_topic) if row.primary_topic is not None else None
                     ),
+                    secondary_topics=tuple(Topic(value) for value in (row.secondary_topics or ())),
                     publisher=row.primary_publisher,
                     canonical_url=row.primary_canonical_url,
                     original_published_at=row.original_published_at,
@@ -359,6 +389,7 @@ class PublicPublicationRepository:
                 summary=story.summary,
                 why_it_matters=story.why_it_matters,
                 primary_topic=story.primary_topic,
+                secondary_topics=story.secondary_topics,
                 publisher=story.publisher,
                 canonical_url=story.canonical_url,
                 original_published_at=story.original_published_at,

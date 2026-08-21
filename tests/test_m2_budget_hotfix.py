@@ -104,7 +104,7 @@ def test_populated_0008_budget_migrates_to_11500_hard_cap(
     budget_hotfix_database_url: str,
 ) -> None:
     config = _seed_0008_budget(budget_hotfix_database_url)
-    command.upgrade(config, "head")
+    command.upgrade(config, "0009")
 
     engine = create_database_engine(budget_hotfix_database_url)
     try:
@@ -189,7 +189,7 @@ def test_budget_cap_downgrade_is_fail_closed_and_restores_0008_constraint(
     budget_hotfix_database_url: str,
 ) -> None:
     config = _seed_0008_budget(budget_hotfix_database_url)
-    command.upgrade(config, "head")
+    command.upgrade(config, "0009")
     engine = create_database_engine(budget_hotfix_database_url)
     try:
         with engine.begin() as connection:
