@@ -63,10 +63,12 @@ Create a dedicated host group with numeric GID 10001, then set the directory and
 services which need a mounted secret; each service receives only its own required secret files.
 Do not print their contents during setup or acceptance.
 
-Set `AI_INTEL_PROVIDER_MONTHLY_BUDGET_CENTS` no higher than `11500`. Set
-`AI_INTEL_PROVIDER_REQUEST_RESERVATION_CENTS` to a conservative upper bound for one request using
-the current Provider price and configured maximum tokens. Web and Scheduler atomically reserve
-that amount in the same PostgreSQL monthly ledger before every request attempt. The ledger never
+Set `AI_INTEL_PROVIDER_MONTHLY_BUDGET_CENTS` no higher than `50000`. This is the
+application's conservative reservation ceiling; actual-spend controls remain at the Provider
+account boundary. Set `AI_INTEL_PROVIDER_REQUEST_RESERVATION_CENTS` to exactly `100` cents.
+That is the conservative upper bound for one request under the current Provider price and
+configured maximum tokens. Web and Scheduler atomically reserve that amount in the same
+PostgreSQL monthly ledger before every request attempt. The ledger never
 refunds a reservation, so retries and failed calls remain safely counted and all production
 metered calls stop before the configured aggregate cap can be exceeded.
 The file-backed `collect-gemini` and `collect-sources` operator commands detect this production
