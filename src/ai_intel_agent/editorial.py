@@ -501,6 +501,62 @@ def editorial_window_for(publication_date: date) -> tuple[datetime, datetime]:
     return end - timedelta(days=1), end
 
 
+_PAST_EDITORIAL_WINDOW_EXCLUSION_REASON = (
+    "Source time is before the current Editorial Window."
+)
+_FUTURE_EDITORIAL_WINDOW_HOLD_REASON = (
+    "Source time has not entered the current Editorial Window."
+)
+
+
+def _normalize_editorial_window_proposals(
+    context: EditorialContext,
+    proposals_by_key: dict[str, EditorialStoryProposal],
+) -> dict[str, EditorialStoryProposal]:
+    normalized = dict(proposals_by_key)
+    for story in context.stories:
+        source_time = story.original_published_at
+        if source_time is not None and source_time < context.window_start:
+            normalized[story.stable_key] = replace(
+                normalized[story.stable_key],
+                inclusion=DigestPlanInclusion.EXCLUDED,
+                order=None,
+                exclusion_reason=_PAST_EDITORIAL_WINDOW_EXCLUSION_REASON,
+            )
+        elif source_time is not None and source_time >= context.window_end:
+            normalized[story.stable_key] = replace(
+                normalized[story.stable_key],
+                inclusion=DigestPlanInclusion.HELD,
+                order=None,
+                exclusion_reason=_FUTURE_EDITORIAL_WINDOW_HOLD_REASON,
+            )
+
+    provider_included = tuple(
+        item
+        for item in proposals_by_key.values()
+        if item.inclusion is DigestPlanInclusion.INCLUDED
+    )
+    provider_orders = tuple(item.order for item in provider_included)
+    if (
+        any(order is None for order in provider_orders)
+        or len(set(provider_orders)) != len(provider_orders)
+        or set(provider_orders) != set(range(len(provider_orders)))
+    ):
+        return normalized
+
+    included_by_provider_order = sorted(
+        (
+            item
+            for item in normalized.values()
+            if item.inclusion is DigestPlanInclusion.INCLUDED
+        ),
+        key=lambda item: item.order if item.order is not None else -1,
+    )
+    for order, item in enumerate(included_by_provider_order):
+        normalized[item.stable_key] = replace(item, order=order)
+    return normalized
+
+
 def prepare_digest_plan(
     context: EditorialContext,
     provider: EditorialPlanProvider,
@@ -521,6 +577,7 @@ def prepare_digest_plan(
         raise EditorialStateError(
             "Editorial Provider must return exactly one proposal for every pending Story"
         )
+    proposals_by_key = _normalize_editorial_window_proposals(context, proposals_by_key)
     provider_identifier = proposal.provider_identifier.strip()
     protocol_version = proposal.protocol_version.strip()
     if not provider_identifier or not protocol_version:
@@ -886,13 +943,20 @@ def _digest_plan_anomalies(
             )
 
         observed_time = item.original_published_at
-        if observed_time is None or not (
-            context.window_start <= observed_time < context.window_end
-        ):
+        if observed_time is None or observed_time < context.window_start:
             anomalies.append(
                 DigestPlanAnomaly(
                     code="stale-material",
                     message="Story is outside the current Editorial Window",
+                    blocking=item.inclusion is DigestPlanInclusion.INCLUDED,
+                    story_stable_key=item.stable_key,
+                )
+            )
+        elif observed_time >= context.window_end:
+            anomalies.append(
+                DigestPlanAnomaly(
+                    code="future-material",
+                    message="Story source time has not entered the current Editorial Window",
                     blocking=item.inclusion is DigestPlanInclusion.INCLUDED,
                     story_stable_key=item.stable_key,
                 )

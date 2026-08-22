@@ -50,6 +50,7 @@ from ai_intel_agent.editorial import (
     editorial_window_for,
     load_editorial_agent_protocol,
     prepare_digest_plan,
+    restore_digest_plan,
 )
 from ai_intel_agent.persistence import (
     CandidateRecord,
@@ -201,6 +202,80 @@ class _RecordingExcludeUnsupportedEditorialProvider(_ExcludeUnsupportedEditorial
     def prepare(self, context: EditorialContext) -> EditorialPlanProposal:
         self.contexts.append(context)
         return super().prepare(context)
+
+
+class _StaticEditorialProvider:
+    identifier = "fake-editorial:window-safety"
+    protocol_version = "editorial-digest-plan-window-safety-test.v1"
+
+    def __init__(self, proposals: tuple[EditorialStoryProposal, ...]) -> None:
+        self._proposals = proposals
+
+    def prepare(self, context: EditorialContext) -> EditorialPlanProposal:
+        assert {item.stable_key for item in self._proposals} == {
+            story.stable_key for story in context.stories
+        }
+        return EditorialPlanProposal(
+            digest_summary="本期 Digest 对 Editorial Window 进行确定性安全归一化并保留完整证据。",
+            stories=self._proposals,
+            provider_identifier=self.identifier,
+            protocol_version=self.protocol_version,
+        )
+
+
+def _editorial_context_for(stories: tuple[StoryInspection, ...]) -> EditorialContext:
+    publication_date = date(2026, 8, 21)
+    window_start, window_end = editorial_window_for(publication_date)
+    observed_at = datetime(2026, 8, 20, 16, tzinfo=UTC)
+    sources = {
+        story.source_definition_id: story.publisher
+        for story in stories
+        if story.source_definition_id is not None
+    }
+    return EditorialContext(
+        publication_date=publication_date,
+        window_start=window_start,
+        window_end=window_end,
+        stories=stories,
+        source_health=tuple(
+            SourceHealthInspection(
+                source_definition_id=source_id,
+                name=f"{publisher} feed",
+                publisher=publisher,
+                recent_result="success",
+                health="healthy",
+                pause_state="active",
+                consecutive_failures=0,
+                updated_at=observed_at,
+            )
+            for source_id, publisher in sorted(sources.items(), key=lambda item: str(item[0]))
+        ),
+        scheduler_health=SchedulerHealthInspection(
+            state="waiting",
+            last_result="succeeded",
+            last_completed_at=observed_at - timedelta(hours=1),
+            updated_at=observed_at,
+        ),
+    )
+
+
+def _editorial_story_proposal(
+    story: StoryInspection,
+    *,
+    inclusion: DigestPlanInclusion,
+    order: int | None,
+    exclusion_reason: str | None,
+) -> EditorialStoryProposal:
+    return EditorialStoryProposal(
+        stable_key=story.stable_key,
+        inclusion=inclusion,
+        order=order,
+        summary=f"{story.publisher} 提供了足够完整的读者摘要，说明这项 AI 进展的核心内容。",
+        why_it_matters="这项进展会影响开发者的模型选择、验证工作以及后续迁移计划。",
+        primary_topic=Topic.MODELS.value,
+        secondary_topics=(Topic.PRODUCTS_AND_TOOLS.value,),
+        exclusion_reason=exclusion_reason,
+    )
 
 
 @pytest.fixture
@@ -520,6 +595,174 @@ def _persist_visible_legacy_research_story(database_url: str) -> str:
     finally:
         engine.dispose()
     return stable_key
+
+
+def test_editorial_window_normalization_excludes_past_stories_before_persisting_plan() -> None:
+    source_ids = tuple(_id(f"window-past-source:{position}") for position in range(4))
+    publishers = ("Gemini", "TechCrunch", "Hugging Face", "QbitAI")
+    window_start, _ = editorial_window_for(date(2026, 8, 21))
+    stories = tuple(
+        replace(
+            _story(
+                position,
+                publisher=publishers[position % len(publishers)],
+                source_id=source_ids[position % len(source_ids)],
+            ),
+            original_published_at=(
+                window_start - timedelta(hours=4 - position)
+                if position < 4
+                else window_start + timedelta(hours=position - 4)
+            ),
+        )
+        for position in range(12)
+    )
+    context = _editorial_context_for(stories)
+    provider = _StaticEditorialProvider(
+        tuple(
+            _editorial_story_proposal(
+                story,
+                inclusion=DigestPlanInclusion.INCLUDED,
+                order=position,
+                exclusion_reason=None,
+            )
+            for position, story in enumerate(stories)
+        )
+    )
+    prepared_at = datetime(2026, 8, 20, 16, tzinfo=UTC)
+
+    plan = prepare_digest_plan(context, provider, version=1, prepared_at=prepared_at)
+
+    assert tuple(story.stable_key for story in plan.excluded_stories) == tuple(
+        f"story:{position}" for position in range(4)
+    )
+    assert {
+        (story.order, story.exclusion_reason) for story in plan.excluded_stories
+    } == {(None, "Source time is before the current Editorial Window.")}
+    assert tuple(story.stable_key for story in plan.included_stories) == tuple(
+        f"story:{position}" for position in range(4, 12)
+    )
+    assert tuple(story.order for story in plan.included_stories) == tuple(range(8))
+    assert plan.excluded_stories[0].claims == stories[0].claims
+    stale_anomalies = tuple(
+        anomaly for anomaly in plan.anomalies if anomaly.code == "stale-material"
+    )
+    assert {anomaly.story_stable_key for anomaly in stale_anomalies} == {
+        f"story:{position}" for position in range(4)
+    }
+    assert not any(anomaly.blocking for anomaly in stale_anomalies)
+    assert not any(anomaly.blocking for anomaly in plan.anomalies)
+    assert plan.current_state_hash == context.current_state_hash
+    assert (
+        restore_digest_plan(
+            plan_id=plan.id,
+            version=plan.version,
+            prepared_at=plan.prepared_at,
+            content_hash=plan.content_hash,
+            payload=plan.content_payload(),
+        )
+        == plan
+    )
+    assert prepare_digest_plan(context, provider, version=1, prepared_at=prepared_at) == plan
+
+
+def test_editorial_window_normalization_holds_future_without_upgrading_provider_decisions(
+) -> None:
+    source_ids = tuple(_id(f"window-future-source:{position}") for position in range(4))
+    publishers = ("Gemini", "TechCrunch", "Hugging Face", "QbitAI")
+    window_start, window_end = editorial_window_for(date(2026, 8, 21))
+    stories = tuple(
+        replace(
+            _story(
+                position,
+                publisher=publishers[position % len(publishers)],
+                source_id=source_ids[position % len(source_ids)],
+            ),
+            original_published_at=(
+                window_end
+                if position == 0
+                else window_start + timedelta(hours=position - 1)
+            ),
+        )
+        for position in range(11)
+    )
+    context = _editorial_context_for(stories)
+    provider_order = (
+        "story:7",
+        "story:3",
+        "story:10",
+        "story:4",
+        "story:0",
+        "story:9",
+        "story:5",
+        "story:8",
+        "story:6",
+    )
+    orders_by_key = {stable_key: order for order, stable_key in enumerate(provider_order)}
+    provider = _StaticEditorialProvider(
+        tuple(
+            _editorial_story_proposal(
+                story,
+                inclusion=(
+                    DigestPlanInclusion.EXCLUDED
+                    if story.stable_key == "story:1"
+                    else (
+                        DigestPlanInclusion.HELD
+                        if story.stable_key == "story:2"
+                        else DigestPlanInclusion.INCLUDED
+                    )
+                ),
+                order=orders_by_key.get(story.stable_key),
+                exclusion_reason=(
+                    "Provider excluded this in-window Story."
+                    if story.stable_key == "story:1"
+                    else (
+                        "Provider held this in-window Story."
+                        if story.stable_key == "story:2"
+                        else None
+                    )
+                ),
+            )
+            for story in stories
+        )
+    )
+
+    plan = prepare_digest_plan(
+        context,
+        provider,
+        version=1,
+        prepared_at=datetime(2026, 8, 20, 16, tzinfo=UTC),
+    )
+
+    stories_by_key = {story.stable_key: story for story in plan.stories}
+    assert stories_by_key["story:0"].inclusion is DigestPlanInclusion.HELD
+    assert stories_by_key["story:0"].order is None
+    assert (
+        stories_by_key["story:0"].exclusion_reason
+        == "Source time has not entered the current Editorial Window."
+    )
+    assert stories_by_key["story:1"].inclusion is DigestPlanInclusion.EXCLUDED
+    assert (
+        stories_by_key["story:1"].exclusion_reason
+        == "Provider excluded this in-window Story."
+    )
+    assert stories_by_key["story:2"].inclusion is DigestPlanInclusion.HELD
+    assert stories_by_key["story:2"].exclusion_reason == "Provider held this in-window Story."
+    expected_included_order = tuple(
+        stable_key for stable_key in provider_order if stable_key != "story:0"
+    )
+    assert tuple(story.stable_key for story in plan.included_stories) == expected_included_order
+    assert tuple(story.order for story in plan.included_stories) == tuple(range(8))
+    future_anomalies = tuple(
+        anomaly for anomaly in plan.anomalies if anomaly.code == "future-material"
+    )
+    assert len(future_anomalies) == 1
+    assert future_anomalies[0].story_stable_key == "story:0"
+    assert not future_anomalies[0].blocking
+    assert not any(
+        anomaly.code == "stale-material" and anomaly.story_stable_key == "story:0"
+        for anomaly in plan.anomalies
+    )
+    assert not any(anomaly.blocking for anomaly in plan.anomalies)
 
 
 def test_editorial_agent_prepares_one_complete_traceable_plan_without_rewriting_evidence() -> None:
