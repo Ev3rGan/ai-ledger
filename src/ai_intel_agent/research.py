@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
 import re
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
@@ -74,6 +75,8 @@ FORBIDDEN_REASONING = re.compile(
 ANSWER_DELTA_CHARACTERS = 12
 APPROVED_RESEARCH_ROUTE = "deepseek:v4-pro"
 ACCEPTED_PUBLISHED_SCOPE = "accepted-published-knowledge"
+_LOGGER = logging.getLogger(__name__)
+_DIAGNOSTIC_CAPTURE_TAG = "[DEBUG-M5-G-CAPTURE]"
 YEAR_RANGE = re.compile(
     r"(?<!\d)(20\d{2})\s*(?:年)?\s*(?:-|–|—|至|到)\s*(20\d{2})\s*年?"
 )
@@ -116,6 +119,20 @@ class ResearchTaskType(StrEnum):
     COMPARISON = "comparison"
     TIMELINE = "timeline"
     MULTI_HOP = "multi-hop"
+
+
+class _DiagnosticFailureCode(StrEnum):
+    PROVIDER_STREAM = "provider-stream"
+    INVALID_JSON = "invalid-json"
+    OUTPUT_SCHEMA_SHAPE = "output-schema-shape"
+    ANSWER_SUPPORT_MISMATCH = "answer-support-mismatch"
+    REQUIREMENT_UNCOVERED = "requirement-uncovered"
+    REQUIREMENT_OMITTED = "requirement-omitted"
+    CITATION_INVALID = "citation-invalid"
+    CITATION_OUTSIDE_SET = "citation-outside-set"
+    DIMENSION_TIME_MISMATCH = "dimension-time-mismatch"
+    COLLAPSED_DISTINCT_STORIES = "collapsed-distinct-stories"
+    OTHER_VALIDATION = "other-validation"
 
 
 class ResearchTimeSemantic(StrEnum):
@@ -309,6 +326,161 @@ class ResearchAnswer:
     text: str
     citations: tuple[ResearchEvidence, ...]
     statements: tuple[ResearchSupportedStatement, ...]
+
+
+# [DEBUG-M5-G-CAPTURE] Temporary, allowlisted production diagnostic seam.
+class _ResearchProviderValidationError(ResearchError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        cited_distinct_story_count: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.cited_distinct_story_count = cited_distinct_story_count
+
+
+_DIAGNOSTIC_FAILURE_BY_MESSAGE = {
+    "Provider output is not valid JSON": _DiagnosticFailureCode.INVALID_JSON,
+    "Provider output keys do not match the Research contract": (
+        _DiagnosticFailureCode.OUTPUT_SCHEMA_SHAPE
+    ),
+    "Provider abstention shape is invalid": _DiagnosticFailureCode.OUTPUT_SCHEMA_SHAPE,
+    "Provider support item shape is invalid": _DiagnosticFailureCode.OUTPUT_SCHEMA_SHAPE,
+    "Provider answer content is invalid": _DiagnosticFailureCode.ANSWER_SUPPORT_MISMATCH,
+    "Provider answer must map every statement to Evidence": (
+        _DiagnosticFailureCode.ANSWER_SUPPORT_MISMATCH
+    ),
+    "Provider answer does not match its supported statements": (
+        _DiagnosticFailureCode.ANSWER_SUPPORT_MISMATCH
+    ),
+    "Provider support requirement identities are invalid": (
+        _DiagnosticFailureCode.REQUIREMENT_UNCOVERED
+    ),
+    "Provider support does not cover its retrieval requirement": (
+        _DiagnosticFailureCode.REQUIREMENT_UNCOVERED
+    ),
+    "Provider answer omitted a required evidence step": (
+        _DiagnosticFailureCode.REQUIREMENT_OMITTED
+    ),
+    "Provider answer must cite retrieved Evidence": _DiagnosticFailureCode.CITATION_INVALID,
+    "Every material statement must cite Evidence": _DiagnosticFailureCode.CITATION_INVALID,
+    "Provider citations must be a list": _DiagnosticFailureCode.CITATION_INVALID,
+    "Provider citation shape is invalid": _DiagnosticFailureCode.CITATION_INVALID,
+    "Provider citation identity is invalid": _DiagnosticFailureCode.CITATION_INVALID,
+    "Provider citation is outside the retrieved Evidence Set": (
+        _DiagnosticFailureCode.CITATION_OUTSIDE_SET
+    ),
+    "Comparison support crossed an entity-dimension requirement": (
+        _DiagnosticFailureCode.DIMENSION_TIME_MISMATCH
+    ),
+    "Comparison support cited Evidence from another entity-dimension requirement": (
+        _DiagnosticFailureCode.DIMENSION_TIME_MISMATCH
+    ),
+    "Comparison output lost a requested dimension": (
+        _DiagnosticFailureCode.DIMENSION_TIME_MISMATCH
+    ),
+    "Comparison output mixed in a timeline semantic": (
+        _DiagnosticFailureCode.DIMENSION_TIME_MISMATCH
+    ),
+    "Non-comparison output returned a comparison dimension": (
+        _DiagnosticFailureCode.DIMENSION_TIME_MISMATCH
+    ),
+    "Timeline output conflated or invented a time semantic": (
+        _DiagnosticFailureCode.DIMENSION_TIME_MISMATCH
+    ),
+    "Timeline output ignored the requested time semantic": (
+        _DiagnosticFailureCode.DIMENSION_TIME_MISMATCH
+    ),
+    "Non-timeline output returned a timeline semantic": (
+        _DiagnosticFailureCode.DIMENSION_TIME_MISMATCH
+    ),
+    "Comparison output omitted a requested dimension": (
+        _DiagnosticFailureCode.DIMENSION_TIME_MISMATCH
+    ),
+    "Advanced Research collapsed distinct Stories": (
+        _DiagnosticFailureCode.COLLAPSED_DISTINCT_STORIES
+    ),
+}
+
+_DIAGNOSTIC_STAGE_BY_FAILURE_CODE = {
+    _DiagnosticFailureCode.PROVIDER_STREAM: "provider-stream",
+    _DiagnosticFailureCode.INVALID_JSON: "json-parse",
+    _DiagnosticFailureCode.OUTPUT_SCHEMA_SHAPE: "output-schema",
+    _DiagnosticFailureCode.ANSWER_SUPPORT_MISMATCH: "answer-support-validation",
+    _DiagnosticFailureCode.REQUIREMENT_UNCOVERED: "requirement-validation",
+    _DiagnosticFailureCode.REQUIREMENT_OMITTED: "requirement-validation",
+    _DiagnosticFailureCode.CITATION_INVALID: "citation-validation",
+    _DiagnosticFailureCode.CITATION_OUTSIDE_SET: "citation-validation",
+    _DiagnosticFailureCode.DIMENSION_TIME_MISMATCH: "dimension-time-validation",
+    _DiagnosticFailureCode.COLLAPSED_DISTINCT_STORIES: "distinct-story-validation",
+    _DiagnosticFailureCode.OTHER_VALIDATION: "other-validation",
+}
+
+
+def _diagnostic_failure_code(error: Exception) -> _DiagnosticFailureCode:
+    if not isinstance(error, ResearchError):
+        return _DiagnosticFailureCode.OTHER_VALIDATION
+    message = str(error)
+    if message.startswith(("DeepSeek Research", "DeepSeek returned")) or message in {
+        "Provider stream chunks must be text",
+        "Provider output exceeded its bounded size",
+    }:
+        return _DiagnosticFailureCode.PROVIDER_STREAM
+    return _DIAGNOSTIC_FAILURE_BY_MESSAGE.get(
+        message,
+        _DiagnosticFailureCode.OTHER_VALIDATION,
+    )
+
+
+def _emit_provider_failure_diagnostic(
+    error: Exception,
+    *,
+    intent: QueryIntent,
+    evidence_set: ResearchEvidenceSet,
+) -> None:
+    story_by_evidence_key = {
+        item.citation_key: item.story_id for item in evidence_set.evidence
+    }
+    requirement_story_sets = tuple(
+        {
+            story_by_evidence_key[key]
+            for key in requirement.evidence_keys
+            if key in story_by_evidence_key
+        }
+        for requirement in evidence_set.requirements
+    )
+    intersection = set(requirement_story_sets[0]) if requirement_story_sets else set()
+    for story_ids in requirement_story_sets[1:]:
+        intersection.intersection_update(story_ids)
+    failure_code = _diagnostic_failure_code(error)
+    cited_distinct_story_count = getattr(
+        error,
+        "cited_distinct_story_count",
+        None,
+    )
+    if not isinstance(cited_distinct_story_count, int):
+        cited_distinct_story_count = None
+    payload = {
+        "cited_distinct_story_count": cited_distinct_story_count,
+        "evidence_count": len(evidence_set.evidence),
+        "failure_code": failure_code.value,
+        "per_requirement_story_counts": [
+            len(story_ids) for story_ids in requirement_story_sets
+        ],
+        "requirement_count": len(evidence_set.requirements),
+        "requirement_story_intersection_count": len(intersection),
+        "retrieved_distinct_story_count": len(
+            {item.story_id for item in evidence_set.evidence}
+        ),
+        "task_type": intent.task_type.value,
+        "validation_stage": _DIAGNOSTIC_STAGE_BY_FAILURE_CODE[failure_code],
+    }
+    _LOGGER.warning(
+        "%s %s",
+        _DIAGNOSTIC_CAPTURE_TAG,
+        json.dumps(payload, separators=(",", ":"), sort_keys=True),
+    )
 
 
 def interpret_query_intent(question: str) -> QueryIntent:
@@ -1244,7 +1416,12 @@ def stream_research_events(
         )
         yield "done", {"version": version, "status": "failed"}
         return
-    except Exception:  # noqa: BLE001 - external Provider failures must fail closed.
+    except Exception as error:  # noqa: BLE001 - Provider failures must fail closed.
+        _emit_provider_failure_diagnostic(
+            error,
+            intent=intent,
+            evidence_set=evidence_set,
+        )
         yield (
             "error",
             {
@@ -1644,7 +1821,10 @@ def _validated_v2_provider_answer(
         and len(intent.entities) >= 2
         and len(cited_stories) < 2
     ):
-        raise ResearchError("Advanced Research collapsed distinct Stories")
+        raise _ResearchProviderValidationError(
+            "Advanced Research collapsed distinct Stories",
+            cited_distinct_story_count=len(cited_stories),
+        )
     return ResearchAnswer(
         text=answer_text,
         citations=tuple(citations),

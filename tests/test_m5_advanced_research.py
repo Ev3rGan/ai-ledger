@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, datetime
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -216,6 +217,171 @@ class CrossDimensionComparisonProvider:
             },
             ensure_ascii=False,
         )
+
+
+class DiagnosticFailureProvider:
+    def __init__(self, failure: str) -> None:
+        self.failure = failure
+        self.output = ""
+
+    def stream(self, evidence_set: object):
+        if self.failure == "invalid-json":
+            self.output = "SENSITIVE-PROVIDER-PAYLOAD{"
+            yield self.output
+            return
+
+        evidence = evidence_set.evidence[0]
+        citation = {
+            "story_id": str(evidence.story_id),
+            "claim_id": str(evidence.claim_id),
+            "evidence_span_id": str(evidence.evidence_span_id),
+        }
+        support = [
+            {
+                "statement": "Cursor 的敏感比较结论。",
+                "citations": [citation],
+                "requirement_ids": ["requirement-1"],
+                "dimension": "代码托管定位",
+                "time_semantic": None,
+            },
+            {
+                "statement": "GitHub 的敏感比较结论。",
+                "citations": [citation],
+                "requirement_ids": ["requirement-2"],
+                "dimension": "代码托管定位",
+                "time_semantic": None,
+            },
+        ]
+        self.output = json.dumps(
+            {
+                "answer": "\n".join(item["statement"] for item in support),
+                "support": support,
+            },
+            ensure_ascii=False,
+        )
+        yield self.output
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code", "expected_stage", "expected_cited_story_count"),
+    (
+        ("invalid-json", "invalid-json", "json-parse", None),
+        (
+            "collapsed-distinct-stories",
+            "collapsed-distinct-stories",
+            "distinct-story-validation",
+            1,
+        ),
+    ),
+)
+def test_provider_failure_diagnostic_capture_is_sanitized_and_publicly_unchanged(
+    caplog: pytest.LogCaptureFixture,
+    failure: str,
+    expected_code: str,
+    expected_stage: str,
+    expected_cited_story_count: int | None,
+) -> None:
+    question = "比较 Cursor 和 GitHub 在代码托管定位方面的敏感诊断问题？"
+    shared_hit = AcceptedKnowledgeHit(
+        story_id=_id("sensitive-story"),
+        story_stable_key="https://sensitive.invalid/story",
+        story_headline="敏感 Story 标题",
+        claim_id=_id("sensitive-claim"),
+        claim_text="敏感 Claim 文本",
+        evidence_span_id=_id("sensitive-evidence"),
+        exact_text="敏感 Evidence 文本",
+        chunk_id=None,
+    )
+    repository = ResearchRepository(
+        retrieval=ExactQueryAcceptedKnowledge(
+            {
+                "Cursor 代码托管定位": shared_hit,
+                "GitHub 代码托管定位": shared_hit,
+            }
+        ),
+        metadata_loader=FixtureEvidenceMetadata({}),
+    )
+    provider = DiagnosticFailureProvider(failure)
+
+    with caplog.at_level(logging.WARNING, logger="ai_intel_agent.research"):
+        events = list(
+            stream_research_events(
+                question,
+                repository=repository,
+                provider=provider,
+            )
+        )
+
+    assert [event for event, _ in events] == [
+        "status",
+        "status",
+        "status",
+        "error",
+        "done",
+    ]
+    assert [
+        payload["state"]
+        for event, payload in events
+        if event == "status"
+    ] == ["retrieving", "evidence-assembled", "generating"]
+    assert events[-2:] == [
+        (
+            "error",
+            {
+                "version": "research-sse-2026-08-15.v1",
+                "code": "provider-failed",
+                "message": "Research Provider 输出未通过验证。",
+            },
+        ),
+        (
+            "done",
+            {
+                "version": "research-sse-2026-08-15.v1",
+                "status": "failed",
+            },
+        ),
+    ]
+    public_events = json.dumps(events, ensure_ascii=False)
+    assert "[DEBUG-M5-G-CAPTURE]" not in public_events
+    assert "failure_code" not in public_events
+    assert "validation_stage" not in public_events
+
+    records = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("[DEBUG-M5-G-CAPTURE] ")
+    ]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    diagnostic = json.loads(
+        records[0].getMessage().removeprefix("[DEBUG-M5-G-CAPTURE] ")
+    )
+    assert diagnostic == {
+        "cited_distinct_story_count": expected_cited_story_count,
+        "evidence_count": 1,
+        "failure_code": expected_code,
+        "per_requirement_story_counts": [1, 1],
+        "requirement_count": 2,
+        "requirement_story_intersection_count": 1,
+        "retrieved_distinct_story_count": 1,
+        "task_type": "comparison",
+        "validation_stage": expected_stage,
+    }
+    captured = records[0].getMessage()
+    sensitive_values = (
+        question,
+        provider.output,
+        shared_hit.story_stable_key,
+        shared_hit.story_headline,
+        shared_hit.claim_text,
+        shared_hit.exact_text,
+        str(shared_hit.story_id),
+        str(shared_hit.claim_id),
+        str(shared_hit.evidence_span_id),
+        "Cursor 的敏感比较结论。",
+        "GitHub 的敏感比较结论。",
+    )
+    assert all(value not in captured for value in sensitive_values)
 
 
 def test_comparison_evidence_set_preserves_dimensions_claim_qualifiers_and_roles() -> None:
