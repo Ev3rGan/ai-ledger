@@ -615,7 +615,7 @@ class MeteredProviderBudgetRecord(Base):
     __tablename__ = "metered_provider_budget"
     __table_args__ = (
         CheckConstraint(
-            "reserved_cents >= 1 AND reserved_cents <= 11500",
+            "reserved_cents >= 1 AND reserved_cents <= 50000",
             name="ck_metered_provider_budget_range",
         ),
     )
@@ -856,9 +856,9 @@ class AnonymousResearchAllowanceRepository:
 
 
 class MeteredProviderBudgetRepository:
-    """Reserve a conservative request cost under the aggregate USD 115 cap."""
+    """Reserve a conservative request cost under the aggregate USD 500 cap."""
 
-    MAXIMUM_MONTHLY_CENTS = 11_500
+    MAXIMUM_MONTHLY_CENTS = 50_000
 
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
@@ -873,7 +873,7 @@ class MeteredProviderBudgetRepository:
         if billing_month.day != 1:
             raise ValueError("Provider budget month must be the first day of a month")
         if not 1 <= monthly_limit_cents <= self.MAXIMUM_MONTHLY_CENTS:
-            raise ValueError("Provider monthly budget must be between 1 and 11500 cents")
+            raise ValueError("Provider monthly budget must be between 1 and 50000 cents")
         if not 1 <= reservation_cents <= monthly_limit_cents:
             raise ValueError("Provider request reservation must fit the monthly budget")
 
