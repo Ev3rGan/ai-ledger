@@ -106,7 +106,61 @@ MULTI_HOP_MARKER = re.compile(
     r"\bhow\b.*\b(?:affect|lead|cause|influence)\b",
     re.IGNORECASE,
 )
-ENTITY_STOPWORDS = frozenset({"AI", "Research", "Timeline"})
+SIMPLE_LOOKUP_PRICE_QUESTION = re.compile(
+    r"价格|定价|价钱|售价|多少钱|费用|收费|成本|免费|"
+    r"\bprice\b|\bpricing\b|\bcosts?\b|\bfees?\b|\bhow\s+much\b|"
+    r"\b(?:is|are)\s+(?:[0-9A-Za-z._/+:-]+\s+){0,10}"
+    r"(?:currently\s+)?free(?:\s+(?:to\s+use|of\s+charge))?\s*(?:[?？]|$)|"
+    r"\bfree\s+(?:tier|plan|version|access)\b",
+    re.IGNORECASE,
+)
+SIMPLE_LOOKUP_PRICE_CUE = re.compile(
+    r"价格|定价|价钱|售价|费用|收费|成本|"
+    r"\bprice\b|\bpricing\b|\bpriced\b|\bcosts?\b|\bfees?\b",
+    re.IGNORECASE,
+)
+SIMPLE_LOOKUP_MONETARY_VALUE = re.compile(
+    r"(?:[$¥￥€£]\s*\d+(?:[.,]\d+)?)|"
+    r"(?:\b(?:USD|CNY|RMB|EUR|GBP)\b\s*\d+(?:[.,]\d+)?)|"
+    r"(?:\d+(?:[.,]\d+)?\s*(?:美元|人民币|元|美分|"
+    r"\b(?:USD|CNY|RMB|EUR|GBP|dollars?|cents?|yuan)\b))",
+    re.IGNORECASE,
+)
+SIMPLE_LOOKUP_AFFIRMATIVE_FREE_VALUE = re.compile(
+    r"免费(?:提供|使用|开放|可用)?\s*$|"
+    r"(?:提供|开放)(?:了)?免费(?:版本|套餐|层级)?|"
+    r"\b(?:is|are|remains?|becomes?|will\s+be)\s+(?:currently\s+)?free\b|"
+    r"\bfree\s+(?:tier|plan|version|access)\s+"
+    r"(?:is|remains?)\s+(?:available|offered)\b",
+    re.IGNORECASE,
+)
+SIMPLE_LOOKUP_NEGATED_FREE_VALUE = re.compile(
+    r"(?:不|并不|不是|并非|不再|从未|没有|无)[^。！？；;]{0,8}免费|"
+    r"\b(?:not|never|isn't|wasn't|weren't|aren't|without|no)\b"
+    r"[^.!?。！？；;]{0,24}\bfree\b",
+    re.IGNORECASE,
+)
+ENTITY_STOPWORDS = frozenset(
+    {
+        "AI",
+        "Research",
+        "Timeline",
+        "How",
+        "What",
+        "Does",
+        "Do",
+        "Is",
+        "Are",
+        "When",
+        "Where",
+        "Why",
+        "Which",
+        "Can",
+    }
+)
+ENTITY_STOPWORDS_CASEFOLDED = frozenset(
+    value.casefold() for value in ENTITY_STOPWORDS
+)
 ENTITY_SCOPED_COMPARISON_DIMENSIONS = frozenset(
     {
         "主要差异",
@@ -1857,6 +1911,8 @@ def _hit_matches_retrieval_requirement(
     intent: QueryIntent,
 ) -> bool:
     searchable = _retrieval_hit_searchable(hit)
+    if intent.task_type is ResearchTaskType.SIMPLE_LOOKUP:
+        return _simple_lookup_hit_supports_requested_attribute(hit, intent)
     if intent.task_type is ResearchTaskType.MULTI_HOP:
         return bool(spec.match_terms) and any(
             term in searchable for term in spec.match_terms
@@ -1870,6 +1926,50 @@ def _hit_matches_retrieval_requirement(
     terms = _semantic_match_terms(spec.dimension)
     minimum_matches = max(1, ceil(len(terms) / 2))
     return sum(term in searchable for term in terms) >= minimum_matches
+
+
+def _simple_lookup_hit_supports_requested_attribute(
+    hit: AcceptedKnowledgeHit,
+    intent: QueryIntent,
+) -> bool:
+    if SIMPLE_LOOKUP_PRICE_QUESTION.search(intent.question) is None:
+        return True
+    subject_entities = tuple(
+        normalized
+        for entity in intent.entities
+        for normalized in (
+            re.sub(
+                r"^(?:how|what|is|are|does|do)\s+",
+                "",
+                entity,
+                flags=re.IGNORECASE,
+            ).strip(),
+        )
+        if normalized and normalized.casefold() not in {"how", "what", "is", "are"}
+    )
+    if not subject_entities:
+        return False
+    claim_evidence_text = f"{hit.claim_text}。{hit.exact_text}"
+    for statement in re.split(
+        r"(?<!\d)\.|\.(?!\d)|[!?。！？；;]+",
+        claim_evidence_text,
+    ):
+        searchable_statement = statement.casefold()
+        if not any(
+            entity.casefold() in searchable_statement for entity in subject_entities
+        ):
+            continue
+        if (
+            SIMPLE_LOOKUP_PRICE_CUE.search(statement) is not None
+            and SIMPLE_LOOKUP_MONETARY_VALUE.search(statement) is not None
+        ):
+            return True
+        if (
+            SIMPLE_LOOKUP_AFFIRMATIVE_FREE_VALUE.search(statement) is not None
+            and SIMPLE_LOOKUP_NEGATED_FREE_VALUE.search(statement) is None
+        ):
+            return True
+    return False
 
 
 def _isolated_retrieval_requirement_hits(
@@ -2091,7 +2191,7 @@ def _query_entities(
         normalized = value.strip(" ，,。！？?：:；;")
         if (
             normalized
-            and normalized not in ENTITY_STOPWORDS
+            and normalized.casefold() not in ENTITY_STOPWORDS_CASEFOLDED
             and normalized.casefold() not in introduced_products
             and normalized.casefold() not in {item.casefold() for item in entities}
         ):
