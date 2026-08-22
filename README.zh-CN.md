@@ -23,7 +23,7 @@
 | RSS | `/rss` 与 `/rss.xml` | 订阅说明页与机器可读 Feed |
 | Research | `/research` | 仅基于已接受知识、带可点击引用的回答，或明确拒答 |
 
-## 能力地图
+## 当前可用能力
 
 M1-M4 能力已部署；可用状态与代码树集成状态分开记录。
 
@@ -45,7 +45,7 @@ M1-M4 能力已部署；可用状态与代码树集成状态分开记录。
 | [#71 M2](https://github.com/Ev3rGan/ai-ledger/issues/71) | Focused source portfolio | 已交付 |
 | [#72 M3](https://github.com/Ev3rGan/ai-ledger/issues/72) | Editorial Agent Digest Plan | 已交付 |
 | [#73 M4](https://github.com/Ev3rGan/ai-ledger/issues/73) | MiniLM Hybrid Retrieval and mMARCO | 已交付 |
-| [#74 M5](https://github.com/Ev3rGan/ai-ledger/issues/74) | Comparison、timeline 与 bounded multi-hop Research | Integrated release candidate；#74 负责 exact-SHA production acceptance |
+| [#74 M5](https://github.com/Ev3rGan/ai-ledger/issues/74) | Comparison, timeline, and multi-hop Research | Integrated release candidate；#74 负责 exact-SHA production acceptance |
 
 “已交付”表示对应里程碑已跨过其发布门禁。M5 在 #74 完成 exact merged SHA 验收前，不得表述为 production accepted。
 

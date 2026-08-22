@@ -23,7 +23,7 @@ Collection and drafting are bounded and traceable. Operators retain direct Story
 | RSS | `/rss` and `/rss.xml` | A subscription page and machine-readable feed |
 | Research | `/research` | Accepted-knowledge answers with clickable citations or an explicit refusal |
 
-## Capability Map
+## What Works Today
 
 M1-M4 capabilities are deployed. Availability is tracked separately from source-tree integration.
 
@@ -45,7 +45,7 @@ M1-M4 capabilities are deployed. Availability is tracked separately from source-
 | [#71 M2](https://github.com/Ev3rGan/ai-ledger/issues/71) | Focused source portfolio | Delivered |
 | [#72 M3](https://github.com/Ev3rGan/ai-ledger/issues/72) | Editorial Agent Digest Plan | Delivered |
 | [#73 M4](https://github.com/Ev3rGan/ai-ledger/issues/73) | MiniLM Hybrid Retrieval and mMARCO | Delivered |
-| [#74 M5](https://github.com/Ev3rGan/ai-ledger/issues/74) | Comparison, timeline, and bounded multi-hop Research | Integrated release candidate; #74 owns exact-SHA production acceptance |
+| [#74 M5](https://github.com/Ev3rGan/ai-ledger/issues/74) | Comparison, timeline, and multi-hop Research | Integrated release candidate; #74 owns exact-SHA production acceptance |
 
 Delivered milestones have crossed their release gates. M5 is not production accepted until the exact merged SHA completes the acceptance owned by #74.
 
