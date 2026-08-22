@@ -10,7 +10,7 @@ An evidence-grounded AI daily that turns approved public sources into reviewed D
 
 **Approved sources** → **collection + article-body gate** → **DeepSeek draft** → **human/Agent editorial boundary** → **Digest + public knowledge** → **cited Research**
 
-Collection and drafting are bounded and traceable. Today, an operator accepts or rejects each Story and explicitly publishes each Digest. The planned Editorial Agent may prepare one complete Digest Plan, but an administrator must approve that exact plan once; the Agent never publishes by itself.
+Collection and drafting are bounded and traceable. Operators retain direct Story review and publication controls. For assisted composition, the Editorial Agent prepares one complete, versioned, immutable Digest Plan; an operator approves that exact plan once, and the approval transaction accepts its included Stories and publishes the unchanged Digest. The Agent never publishes or mutates an approved plan by itself.
 
 ## Public Surfaces
 
@@ -23,28 +23,31 @@ Collection and drafting are bounded and traceable. Today, an operator accepts or
 | RSS | `/rss` and `/rss.xml` | A subscription page and machine-readable feed |
 | Research | `/research` | Accepted-knowledge answers with clickable citations or an explicit refusal |
 
-## What Works Today
+## Capability Map
 
-| Capability | Current v2 behavior |
-| --- | --- |
-| Bounded acquisition | Versioned Source Profiles, isolated source failures, canonical identity, article-body quality gates, cursors, and replay-safe operation keys |
-| Traceable drafting | The approved DeepSeek route prepares Story, Claim, and exact Evidence Span drafts but cannot accept or publish them |
-| Editorial control | Operators inspect drafts, accept or reject Stories, preview ordered Digests, and publish explicitly with audit events |
-| Public knowledge | Home, Digest, Story, Browse, RSS, and accepted-only Research expose published knowledge without operator controls |
-| Safe Research | Bounded retrieval cites Story/Claim/Evidence Span identities and fails closed for unsupported questions or invalid Provider output |
-| Reproducible operation | Locked local and production runbooks define startup, migration, status, backup, restore, rollback, and acceptance boundaries |
+M1-M4 capabilities are deployed. Availability is tracked separately from source-tree integration.
+
+| Capability | Product boundary | Availability |
+| --- | --- | --- |
+| Versioned source portfolio | An eight-source core portfolio, policy-versioned supplemental profiles, isolated failures, article-body gates, cursors, and replay-safe operation keys | Deployed (M2) |
+| Traceable drafting | The approved DeepSeek route prepares Story, Claim, and exact Evidence Span drafts but cannot accept or publish them | Deployed |
+| Editorial approval | Operators may review directly or approve one immutable Agent-produced Digest Plan; the Agent never auto-publishes, and every approval is tied to the exact plan | Deployed (M3) |
+| Accepted-knowledge Hybrid | MiniLM vectors in pgvector combine with PostgreSQL FTS and exact-Entity candidates; deterministic Fusion feeds the sole mMARCO reranker, with an explicit model-free fallback | Deployed (M4) |
+| Advanced Research | Query Intent distinguishes simple lookup, comparison, timeline, and bounded multi-hop; bounded orchestration streams progress, clickable Story/Claim/Evidence citations, explicit refusals, and hard execution budgets | Integrated release candidate; public release is tracked by #74 and is not official Demo availability before exact-SHA acceptance |
+| Public projections | Home, Digest, Story, Browse, RSS, and the available Research surface expose only published knowledge without operator controls or hidden reasoning | Deployed; Advanced Research follows the availability above |
+| Reproducible operation | Locked local and production runbooks define startup, migration, status, backup, restore, rollback, and acceptance boundaries | Deployed |
 
 ## Roadmap
 
 | Milestone | Scope | Status |
 | --- | --- | --- |
-| [#70 M1](https://github.com/Ev3rGan/ai-ledger/issues/70) | Repository productization and design-decision archive | Implementation/review complete; Git/release/production acceptance pending |
-| [#71 M2](https://github.com/Ev3rGan/ai-ledger/issues/71) | Focused source portfolio | Planned |
-| [#72 M3](https://github.com/Ev3rGan/ai-ledger/issues/72) | Editorial Agent Digest Plan | Planned |
-| [#73 M4](https://github.com/Ev3rGan/ai-ledger/issues/73) | MiniLM Hybrid Retrieval and mMARCO | Planned |
-| [#74 M5](https://github.com/Ev3rGan/ai-ledger/issues/74) | Comparison, timeline, and multi-hop Research | Planned |
+| [#70 M1](https://github.com/Ev3rGan/ai-ledger/issues/70) | Repository productization and design-decision archive | Delivered |
+| [#71 M2](https://github.com/Ev3rGan/ai-ledger/issues/71) | Focused source portfolio | Delivered |
+| [#72 M3](https://github.com/Ev3rGan/ai-ledger/issues/72) | Editorial Agent Digest Plan | Delivered |
+| [#73 M4](https://github.com/Ev3rGan/ai-ledger/issues/73) | MiniLM Hybrid Retrieval and mMARCO | Delivered |
+| [#74 M5](https://github.com/Ev3rGan/ai-ledger/issues/74) | Comparison, timeline, and bounded multi-hop Research | Integrated release candidate; #74 owns exact-SHA production acceptance |
 
-A milestone is marked complete only after production acceptance of its exact merged SHA; implementation or review alone is not release completion.
+Delivered milestones have crossed their release gates. M5 is not production accepted until the exact merged SHA completes the acceptance owned by #74.
 
 ## Learn the Project
 
@@ -56,7 +59,7 @@ The Chinese-first [Learning Guide](docs/guide/README.md) connects the product lo
 | [02 · Domain and Data Model](docs/guide/02-domain-and-data-model.md) | Which records preserve provenance and publication state? |
 | [03 · Repository Tour](docs/guide/03-repository-tour.md) | Where does each responsibility live? |
 | [04 · Agent/Human Boundaries](docs/guide/04-agent-human-boundaries.md) | What may automation prepare, and what requires approval? |
-| [05 · Retrieval and Research](docs/guide/05-retrieval-and-research.md) | What is live today, and what changes in M4-M5? |
+| [05 · Retrieval and Research](docs/guide/05-retrieval-and-research.md) | How do current Hybrid retrieval and advanced Research stay cited and bounded? |
 
 ## Documentation Map
 

@@ -224,11 +224,15 @@ def _sse_events(response_text: str) -> list[tuple[str, dict[str, object]]]:
 def test_research_protocol_reuses_the_human_approved_m1_route() -> None:
     protocol = load_research_protocol()
 
-    assert protocol.version == "research-protocol-2026-08-15.v1"
-    assert protocol.prompt_version == "research-prompt-2026-08-15.v1"
+    assert protocol.version == "research-protocol-2026-08-22.v2"
+    assert protocol.prompt_version == "research-prompt-2026-08-22.v2"
+    assert protocol.output_schema_version == "research-output-2026-08-22.v2"
     assert protocol.sse_contract_version == "research-sse-2026-08-15.v1"
     assert protocol.route_identifier == "deepseek:v4-pro"
     assert protocol.routing_evaluation_version == "model-routing-evaluation-2026-08-12.v1"
+    assert protocol.maximum_iterations == 2
+    assert protocol.maximum_retrieval_calls == 4
+    assert protocol.maximum_elapsed_seconds == 45.0
     assert len(protocol.routing_evaluation_cases_sha256) == 64
 
 
@@ -328,25 +332,30 @@ def test_research_page_explains_curated_capabilities_and_offers_fill_only_exampl
     assert "仅检索已接受且已发布的知识" in response.text
     assert "证据不足时会明确拒答" in response.text
     assert "不会联网搜索" in response.text
-    assert response.text.count('class="research-example"') >= 3
+    assert "Hybrid" in response.text
+    assert "简单查找" in response.text
+    assert "比较" in response.text
+    assert "时间线" in response.text
+    assert "有界多跳" in response.text
+    assert "检索降级" in response.text
+    assert response.text.count('class="research-example"') >= 4
     assert "Anthropic 的年化营收运行率是多少？" in response.text
-    assert "约束感知 GPU 分配器将利用率提升到多少？" in response.text
-    assert "OpenAI 在俄亥俄州规划了多大规模的数据中心？" in response.text
+    assert "比较 OpenAI 和 Anthropic 在模型发布方面的进展" in response.text
+    assert "按时间线梳理 Gemini 模型的发布历程" in response.text
+    assert "模型发布后如何影响开发者部署" in response.text
     assert 'type="button"' in response.text
     assert "question.value = button.dataset.question" in response.text
     assert "question.focus()" in response.text
     assert "requestSubmit" not in response.text
     assert "form.submit" not in response.text
-    for unsupported_claim in (
-        "Hybrid",
-        "Reranker",
-        "多跳",
-        "比较分析",
-        "时间线",
-    ):
-        assert unsupported_claim not in response.text
     assert 'block.split("\\n")' in response.text
     assert 'buffer.indexOf("\\n\\n")' in response.text
+    assert "retrieval-degraded" in response.text
+    assert "evidence-assembled" in response.text
+    assert "verifying-citations" in response.text
+    assert "statement_support" in response.text
+    assert '"source-publication": "来源发布时间"' in response.text
+    assert '"digest-publication": "Digest 发布时间"' in response.text
     assert "会话历史" not in response.text
     assert "管理员" not in response.text
 

@@ -10,7 +10,7 @@
 
 **获批来源** → **采集 + 正文门禁** → **DeepSeek 草稿** → **人类/Agent 编辑边界** → **Digest + 公共知识** → **带引用的 Research**
 
-采集与草稿生成有明确边界并可追溯。当前由 operator 逐条接受或拒绝 Story，并显式发布 Digest。计划中的 Editorial Agent 只能准备一份完整 Digest Plan，管理员须一次批准这份精确计划；Agent 不会自行发布。
+采集与草稿生成有明确边界并可追溯。Operator 保留直接审核 Story 与发布 Digest 的控制权。采用辅助编排时，Editorial Agent 生成一份完整、版本化、不可变的 Digest Plan；operator 一次批准这份 exact plan，批准事务接受其中纳入的 Story 并发布未改动的 Digest。Agent 不会自行发布，也不能修改已批准计划。
 
 ## 公共页面
 
@@ -23,28 +23,31 @@
 | RSS | `/rss` 与 `/rss.xml` | 订阅说明页与机器可读 Feed |
 | Research | `/research` | 仅基于已接受知识、带可点击引用的回答，或明确拒答 |
 
-## 当前可用能力
+## 能力地图
 
-| 能力 | 当前 v2 行为 |
-| --- | --- |
-| 有边界的采集 | 版本化 Source Profile、来源故障隔离、canonical identity、文章正文质量门禁、cursor 与可重放 operation key |
-| 可追溯草稿 | 获批的 DeepSeek route 生成 Story、Claim 与精确 Evidence Span 草稿，但不能接受或发布 |
-| 编辑控制 | Operator 检查草稿、接受或拒绝 Story、预览有序 Digest，并通过 audit event 显式发布 |
-| 公共知识 | Home、Digest、Story、Browse、RSS 与仅用已接受知识的 Research 不暴露 operator 控件 |
-| 安全 Research | 有边界的检索引用 Story/Claim/Evidence Span 身份；不支持的问题或无效 Provider 输出会 fail closed |
-| 可复现运维 | 锁定的本地与生产 runbook 定义启动、迁移、状态、备份、恢复、回滚与验收边界 |
+M1-M4 能力已部署；可用状态与代码树集成状态分开记录。
+
+| 能力 | 产品边界 | 可用状态 |
+| --- | --- | --- |
+| 版本化来源组合 | 八个来源组成的核心 portfolio、策略版本化的补充 Profile、故障隔离、正文门禁、cursor 与可重放 operation key | 已部署（M2） |
+| 可追溯草稿 | 获批的 DeepSeek route 生成 Story、Claim 与精确 Evidence Span 草稿，但不能接受或发布 | 已部署 |
+| 编辑批准 | Operator 可直接审核，也可一次批准 Agent 生成的不可变 Digest Plan；Agent 不自动发布，每次批准都绑定 exact plan | 已部署（M3） |
+| 已接受知识 Hybrid | pgvector 中的 MiniLM 向量与 PostgreSQL FTS、exact Entity candidates 共同 Fusion，再交给唯一 mMARCO reranker；模型不可用时显式回退 | 已部署（M4） |
+| 高级 Research | Query Intent 区分 simple lookup、comparison、timeline 与 bounded multi-hop；有界编排通过 SSE 输出进度、可点击 Story/Claim/Evidence 引用、明确拒答与 hard execution budgets | Integrated release candidate；public release 由 #74 跟踪，exact-SHA acceptance 完成前不代表 official Demo 已上线 |
+| 公共投影 | Home、Digest、Story、Browse、RSS 与当前可用的 Research surface 只暴露已发布知识，不暴露 operator 控件或 hidden reasoning | 已部署；高级 Research 以上述可用状态为准 |
+| 可复现运维 | 锁定的本地与生产 runbook 定义启动、迁移、状态、备份、恢复、回滚与验收边界 | 已部署 |
 
 ## 路线图
 
 | 里程碑 | 范围 | 状态 |
 | --- | --- | --- |
-| [#70 M1](https://github.com/Ev3rGan/ai-ledger/issues/70) | Repository productization and design-decision archive | 实现与审查已完成；Git、发布与生产验收待完成 |
-| [#71 M2](https://github.com/Ev3rGan/ai-ledger/issues/71) | Focused source portfolio | 计划中 |
-| [#72 M3](https://github.com/Ev3rGan/ai-ledger/issues/72) | Editorial Agent Digest Plan | 计划中 |
-| [#73 M4](https://github.com/Ev3rGan/ai-ledger/issues/73) | MiniLM Hybrid Retrieval and mMARCO | 计划中 |
-| [#74 M5](https://github.com/Ev3rGan/ai-ledger/issues/74) | Comparison, timeline, and multi-hop Research | 计划中 |
+| [#70 M1](https://github.com/Ev3rGan/ai-ledger/issues/70) | Repository productization and design-decision archive | 已交付 |
+| [#71 M2](https://github.com/Ev3rGan/ai-ledger/issues/71) | Focused source portfolio | 已交付 |
+| [#72 M3](https://github.com/Ev3rGan/ai-ledger/issues/72) | Editorial Agent Digest Plan | 已交付 |
+| [#73 M4](https://github.com/Ev3rGan/ai-ledger/issues/73) | MiniLM Hybrid Retrieval and mMARCO | 已交付 |
+| [#74 M5](https://github.com/Ev3rGan/ai-ledger/issues/74) | Comparison、timeline 与 bounded multi-hop Research | Integrated release candidate；#74 负责 exact-SHA production acceptance |
 
-只有完成某里程碑 exact merged SHA 的生产验收后，才能把它标记为完成；仅实现或审查完成不等于发布完成。
+“已交付”表示对应里程碑已跨过其发布门禁。M5 在 #74 完成 exact merged SHA 验收前，不得表述为 production accepted。
 
 ## 学习本项目
 
@@ -56,7 +59,7 @@
 | [02 · 领域与数据模型](docs/guide/02-domain-and-data-model.md) | 哪些记录保存 provenance 与发布状态？ |
 | [03 · 仓库导览](docs/guide/03-repository-tour.md) | 每项职责位于哪里？ |
 | [04 · Agent/人类边界](docs/guide/04-agent-human-boundaries.md) | 自动化可以准备什么，什么必须审批？ |
-| [05 · 检索与 Research](docs/guide/05-retrieval-and-research.md) | 当前能力是什么，M4-M5 将改变什么？ |
+| [05 · 检索与 Research](docs/guide/05-retrieval-and-research.md) | 当前 Hybrid retrieval 与高级 Research 如何保持可引用和有边界？ |
 
 ## 文档地图
 

@@ -86,7 +86,7 @@ def create_app(
         embedding=retrieval_embedding,
         reranker=retrieval_reranker,
     )
-    research_repository = ResearchRepository(retrieval=retrieval)
+    research_repository = ResearchRepository(engine, retrieval=retrieval)
     research_allowance = (
         PersistentAnonymousResearchAllowance(
             engine,
@@ -568,22 +568,26 @@ def _render_research_page() -> str:
 <header class="page-header">
   <p class="eyebrow">Published knowledge, cited</p>
   <h1>Research</h1>
-  <p class="lede">从本期已发布 Story 中查找答案，并沿引用返回具体事实与原始来源。</p>
+  <p class="lede">在已发布 Hybrid 知识中完成简单查找、比较、时间线与有界多跳，并沿引用返回具体事实与原始来源。</p>
 </header>
 <section aria-labelledby="research-capabilities">
   <h2 id="research-capabilities">支持什么</h2>
   <div class="capability-grid">
     <article class="capability-card">
       <h3>已发布知识</h3>
-      <p>仅检索已接受且已发布的知识，草稿和已拒绝内容不会进入答案。</p>
+      <p>仅检索已接受且已发布的知识；Hybrid 降级时保留明确的检索降级状态，草稿和已拒绝内容不会进入答案。</p>
     </article>
     <article class="capability-card">
-      <h3>可追溯依据</h3>
-      <p>答案引用已发布 Story 中的关键事实，并链接到对应依据和原始来源。</p>
+      <h3>简单查找与比较</h3>
+      <p>简单查找回答一个受支持事实；比较会保留请求维度、Claim 限定和不同 Evidence Role。</p>
     </article>
     <article class="capability-card">
-      <h3>明确拒答</h3>
-      <p>证据不足时会明确拒答，不用缺失的材料补写结论。</p>
+      <h3>时间线与有界多跳</h3>
+      <p>时间线区分事件、来源发布、发现、编辑与 Digest 发布时间；有界多跳只执行有限检索调用。</p>
+    </article>
+    <article class="capability-card">
+      <h3>可追溯引用与明确拒答</h3>
+      <p>每个材料性陈述引用公开 Story、Claim 与 Evidence；证据不足时会明确拒答。</p>
     </article>
   </div>
 </section>
@@ -595,8 +599,9 @@ def _render_research_page() -> str:
   <h2 id="research-examples-heading">试试这些问题</h2>
   <div class="research-examples">
     <button class="research-example" type="button" data-question="Anthropic 的年化营收运行率是多少？">Anthropic 的年化营收运行率是多少？</button>
-    <button class="research-example" type="button" data-question="约束感知 GPU 分配器将利用率提升到多少？">约束感知 GPU 分配器将利用率提升到多少？</button>
-    <button class="research-example" type="button" data-question="OpenAI 在俄亥俄州规划了多大规模的数据中心？">OpenAI 在俄亥俄州规划了多大规模的数据中心？</button>
+    <button class="research-example" type="button" data-question="比较 OpenAI 和 Anthropic 在模型发布方面的进展">比较 OpenAI 和 Anthropic 在模型发布方面的进展</button>
+    <button class="research-example" type="button" data-question="按时间线梳理 Gemini 模型的发布历程">按时间线梳理 Gemini 模型的发布历程</button>
+    <button class="research-example" type="button" data-question="模型发布后如何影响开发者部署？">模型发布后如何影响开发者部署？</button>
   </div>
 </section>
 <section class="research-panel" aria-labelledby="research-question-heading">
@@ -641,14 +646,42 @@ def _render_research_page() -> str:
     if (!event || !data) return;
     const payload = JSON.parse(data);
     if (event === "status") {
-      status.textContent = payload.state === "retrieving" ? "正在检索…" : "正在生成…";
+      const progress = {
+        "retrieving": "正在解释问题并检索…",
+        "retrieval-degraded": "检索降级：正在使用已声明的 fallback…",
+        "evidence-assembled": "Evidence Set 已汇总…",
+        "generating": "正在生成有依据的答案…",
+        "verifying-citations": "正在校验引用…",
+      };
+      status.textContent = (
+        payload.state === "generating" && payload.retrieval_degraded
+          ? "检索已降级；正在生成有依据的答案…"
+          : progress[payload.state] || "Research 正在处理…"
+      );
     } else if (event === "answer.delta") {
       answer.textContent += payload.text;
     } else if (event === "citation") {
       const item = document.createElement("li");
       const link = document.createElement("a");
       link.href = payload.evidence_url;
-      link.textContent = `${payload.story_title} — ${payload.claim_text} — ${payload.evidence_text}`;
+      const roleLabels = {
+        "primary": "第一方证据",
+        "independent": "独立证据",
+        "secondary": "二手证据",
+      };
+      const timeSemanticLabels = {
+        "event": "事件时间",
+        "source-publication": "来源发布时间",
+        "discovery": "发现时间",
+        "editorial": "编辑时间",
+        "digest-publication": "Digest 发布时间",
+      };
+      const role = roleLabels[payload.evidence_role] || "公开证据";
+      const statements = (payload.statement_support || []).map((support) => {
+        const timeLabel = timeSemanticLabels[support.time_semantic];
+        return `陈述 ${support.statement_index}${timeLabel ? `（${timeLabel}）` : ""}`;
+      }).join("、");
+      link.textContent = `${statements} — ${payload.story_title} — ${payload.claim_text} — ${role} — ${payload.evidence_text}`;
       item.appendChild(link);
       citations.appendChild(item);
     } else if (event === "refusal" || event === "error") {

@@ -9,24 +9,24 @@
 | 对象/角色 | 权限边界 |
 | --- | --- |
 | Draft Provider | 从 body-valid Document Version 准备 Story/Claim/Evidence Span 草稿；不能 accept 或 publish |
-| Operator | 检查 Document Version 正文和 Evidence Span，接受或拒绝 Story，决定 Digest 顺序与 introduction，并显式发布 |
-| Audit Event | 记录 actor、action、subject、时间与状态变化 |
-| Editorial Agent（M3 计划） | 只能生成一份完整、版本化、不可变的 Digest Plan |
-| Administrator（M3 计划） | 一次批准 exact plan；计划改变必须重新批准 |
+| Editorial Agent | 为一个 publication date 生成一份完整、版本化、不可变的 Digest Plan；不能 accept 或 publish |
+| Digest Plan | 固定 included/excluded/held Stories、顺序、文案、Topics、排除理由与 anomaly flags 的审批对象 |
+| Administrative operator | 检查 exact plan 并执行一次显式批准；直接 Story review/publish 控件仍由 operator 掌握 |
+| Audit Event | 记录 actor、action、subject、时间与状态变化，包括绑定 exact plan 的批准 |
 
 ## 数据或控制流
 
-当前控制流是：`body-valid Document Version → Provider draft → unreviewed Story → operator inspect → accept/reject → Digest preview → explicit publish → public projection`。Provider 输出即使结构正确也只停在 `unreviewed`。
+草稿控制流是：`body-valid Document Version → Provider draft → unreviewed Story`。Provider 输出即使结构正确也只停在 `unreviewed`，operator 仍可逐条 inspect、accept/reject、preview 和显式 publish。
 
-M3 计划把它收敛为 `eligible unreviewed Stories → Editorial Agent → complete Digest Plan → one administrator approval → accept the exact plan and publish`。这一次批准同时接受计划中选定的 Story 内容并发布未改动的 Digest；Agent 不自动发布，不逐条申请零散批准，也不能在批准后暗改计划。该边界记录在 [ADR 0007](../adr/0007-editorial-approval-boundary.md)。
+当前辅助编排流是：`eligible unreviewed Stories → Editorial Agent → persisted immutable Digest Plan → operator inspects exact version → one explicit approval → accept included Stories + publish unchanged Digest`。批准事务只接受该计划固定的内容；blocking anomaly、过期版本或内容变化都要求新计划/新批准。Agent 不自动发布，不逐条申请零散批准，也不输出或持久化 hidden reasoning。该边界记录在 [ADR 0007](../adr/0007-editorial-approval-boundary.md)。
 
 ## 真实代码入口
 
 - [`multisource_collection.py`](../../src/ai_intel_agent/multisource_collection.py)：`DraftProvider` protocol 及草稿边界。
-- [`editorial.py`](../../src/ai_intel_agent/editorial.py)：review state、Digest preview/publication 与 Audit Event。
-- [`persistence.py`](../../src/ai_intel_agent/persistence.py)：持久化 review 与 publish transaction。
-- [`cli.py`](../../src/ai_intel_agent/cli.py)：`story list/show/accept/reject` 和 `digest preview/publish` operator surface。
-- [ADR 0007](../adr/0007-editorial-approval-boundary.md)：未来 Digest Plan 的完整决策记录。
+- [`editorial.py`](../../src/ai_intel_agent/editorial.py)：`DigestPlan`、`EditorialPlanProvider`、plan preparation、anomaly 与内容哈希契约。
+- [`persistence.py`](../../src/ai_intel_agent/persistence.py)：不可变 plan/approval records，以及绑定 exact plan 的原子 `approve_digest_plan` transaction。
+- [`cli.py`](../../src/ai_intel_agent/cli.py)：`story` 直接审核命令与 `digest plan prepare/show/approve` operator 子组。
+- [ADR 0007](../adr/0007-editorial-approval-boundary.md)：当前“一份计划、一次显式批准”的决策记录。
 
 ## 如何本地运行或观察
 
@@ -34,7 +34,9 @@ M3 计划把它收敛为 `eligible unreviewed Stories → Editorial Agent → co
 
 ```powershell
 uv run ai-intel-agent story accept --help
-uv run ai-intel-agent digest publish --help
+uv run ai-intel-agent digest plan prepare --help
+uv run ai-intel-agent digest plan show --help
+uv run ai-intel-agent digest plan approve --help
 uv run --extra dev pytest tests/test_m3_digest.py -q
 ```
 

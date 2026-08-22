@@ -1,6 +1,6 @@
 # ADR 0008: Focused source portfolio
 
-- Status: approved, staged across M1 and M2
+- Status: accepted and implemented
 - Scope: public daily Source Definitions and acquisition policy
 
 ## Context
@@ -17,7 +17,7 @@ The product needs a small bilingual mix with clear provenance, topic role, and a
 
 ## Decision
 
-The approved target contains eight active Source Definitions:
+The approved core portfolio contains eight active Source Definitions:
 
 1. Gemini API Release Notes
 2. THE DECODER
@@ -30,17 +30,21 @@ The approved target contains eight active Source Definitions:
 
 Machine Heart is a ninth conditional definition and remains disabled until a formally authorized
 data entry is available. AI Business is retired from active profiles, scheduling, status, and
-site-specific runtime handling; 36kr remains excluded. M1 performs that retirement only. M2 owns
-activation of missing approved entries and must not add sources outside this list.
+site-specific runtime handling; 36kr remains excluded.
+
+The core portfolio is implemented as versioned Source Profiles and a centralized portfolio
+policy. Policy-versioned supplemental profiles may add an explicit product role, access policy,
+and evidence eligibility without silently changing this eight-source core contract.
 
 Whitelisting permits a bounded acquisition attempt. It never permits login, paywall, CAPTCHA,
 robots, consent, or anti-bot bypass. Community Signals cannot independently establish a Claim.
 
 ## Accepted tradeoff
 
-The fixed portfolio sacrifices breadth and may leave a conditional Chinese source disabled. It
-gains an auditable policy, predictable operations, and clearer evidence roles. Retired activation
-evidence remains discoverable through the [historical index](../archive/README.md).
+The focused core portfolio sacrifices breadth and may leave a conditional Chinese source
+disabled. It gains an auditable policy, predictable operations, and clearer evidence roles.
+Retired activation evidence remains discoverable through the
+[historical index](../archive/README.md).
 
 ## Revisit trigger
 

@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
 from collections.abc import Iterator, Sequence
 from dataclasses import replace
 from datetime import UTC, date, datetime
 from hashlib import sha256
 from pathlib import Path
+from time import monotonic
 from uuid import NAMESPACE_URL, uuid5
 
 import pytest
@@ -19,6 +21,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 from typer.testing import CliRunner
 
+from ai_intel_agent import persistence
 from ai_intel_agent.accepted_knowledge import (
     APPROVED_EMBEDDING_MODEL_ID,
     APPROVED_EMBEDDING_REVISION,
@@ -29,6 +32,7 @@ from ai_intel_agent.accepted_knowledge import (
     APPROVED_RERANKER_REVISION,
     APPROVED_RERANKER_SHA256,
     AcceptedKnowledgeConfigurationError,
+    AcceptedKnowledgeDeadlineExceeded,
     AcceptedKnowledgeIndexer,
     AcceptedKnowledgeRetrieval,
     ApprovedRetrievalBackends,
@@ -70,7 +74,11 @@ from ai_intel_agent.persistence import (
     database_url_for_alembic_config,
     upgrade_database,
 )
-from ai_intel_agent.research import ResearchEvidenceSet
+from ai_intel_agent.research import (
+    PostgresResearchEvidenceMetadataLoader,
+    ResearchBudgetExceeded,
+    ResearchEvidenceSet,
+)
 from ai_intel_agent.web import create_app
 from alembic import command
 
@@ -110,7 +118,13 @@ class FakeEmbeddingBackend:
     def embed_documents(self, texts: Sequence[str]) -> tuple[tuple[float, ...], ...]:
         return tuple(self._vector(index + 1) for index, _ in enumerate(texts))
 
-    def embed_query(self, text: str) -> tuple[float, ...]:
+    def embed_query(
+        self,
+        text: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> tuple[float, ...]:
+        del timeout_seconds
         return self._vector(1)
 
     @staticmethod
@@ -125,7 +139,13 @@ class SemanticEmbeddingBackend:
             for index, text in enumerate(texts)
         )
 
-    def embed_query(self, text: str) -> tuple[float, ...]:
+    def embed_query(
+        self,
+        text: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> tuple[float, ...]:
+        del timeout_seconds
         return self._vector(0)
 
     @staticmethod
@@ -137,7 +157,14 @@ class RecordingReranker:
     def __init__(self) -> None:
         self.calls: list[tuple[str, tuple[str, ...]]] = []
 
-    def rerank(self, query: str, documents: Sequence[str]) -> tuple[float, ...]:
+    def rerank(
+        self,
+        query: str,
+        documents: Sequence[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> tuple[float, ...]:
+        del timeout_seconds
         copied = tuple(documents)
         self.calls.append((query, copied))
         return tuple(
@@ -149,13 +176,59 @@ class UnavailableEmbeddingBackend:
     def embed_documents(self, texts: Sequence[str]) -> tuple[tuple[float, ...], ...]:
         raise RuntimeError("forced embedding outage")
 
-    def embed_query(self, text: str) -> tuple[float, ...]:
+    def embed_query(
+        self,
+        text: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> tuple[float, ...]:
+        del timeout_seconds
         raise RuntimeError("forced embedding outage")
 
 
 class FailingReranker:
-    def rerank(self, query: str, documents: Sequence[str]) -> tuple[float, ...]:
+    def rerank(
+        self,
+        query: str,
+        documents: Sequence[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> tuple[float, ...]:
+        del timeout_seconds
         raise RuntimeError("forced reranker failure")
+
+
+class DeadlineRecordingEmbeddingBackend(FakeEmbeddingBackend):
+    def __init__(self, *, exceed_deadline: bool) -> None:
+        self.exceed_deadline = exceed_deadline
+        self.timeouts: list[float | None] = []
+
+    def embed_query(
+        self,
+        text: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> tuple[float, ...]:
+        self.timeouts.append(timeout_seconds)
+        if self.exceed_deadline:
+            raise AcceptedKnowledgeDeadlineExceeded("forced embedding deadline")
+        return super().embed_query(text)
+
+
+class DeadlineRecordingReranker:
+    def __init__(self) -> None:
+        self.timeouts: list[float | None] = []
+
+    def rerank(
+        self,
+        query: str,
+        documents: Sequence[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> tuple[float, ...]:
+        del query
+        self.timeouts.append(timeout_seconds)
+        raise AcceptedKnowledgeDeadlineExceeded("forced reranker deadline")
 
 
 class RecordingAcceptedKnowledgeOperation:
@@ -230,12 +303,111 @@ class _FakeFastEmbedRuntimeModel:
         self.tokenizer = _FakeTokenizer()
 
 
+def _protobuf_varint(value: int) -> bytes:
+    encoded = bytearray()
+    while value > 0x7F:
+        encoded.append((value & 0x7F) | 0x80)
+        value >>= 7
+    encoded.append(value)
+    return bytes(encoded)
+
+
+def _protobuf_field(number: int, wire_type: int, value: int | bytes) -> bytes:
+    tag = _protobuf_varint((number << 3) | wire_type)
+    if wire_type == 0:
+        assert isinstance(value, int)
+        return tag + _protobuf_varint(value)
+    assert isinstance(value, bytes)
+    return tag + _protobuf_varint(len(value)) + value
+
+
+def _protobuf_string(number: int, value: str) -> bytes:
+    return _protobuf_field(number, 2, value.encode())
+
+
+def _protobuf_message(number: int, value: bytes) -> bytes:
+    return _protobuf_field(number, 2, value)
+
+
+def _blocking_matmul_onnx_model() -> bytes:
+    dimension = _protobuf_message(1, _protobuf_field(1, 0, 512))
+    shape = _protobuf_message(
+        1,
+        _protobuf_field(1, 0, 1) + _protobuf_message(2, dimension + dimension),
+    )
+
+    def value_info(name: str) -> bytes:
+        return _protobuf_string(1, name) + _protobuf_message(2, shape)
+
+    nodes = bytearray()
+    input_name = "input"
+    for ordinal in range(1, 513):
+        output_name = f"matmul-{ordinal}"
+        node = (
+            _protobuf_string(1, input_name)
+            + _protobuf_string(1, "weight")
+            + _protobuf_string(2, output_name)
+            + _protobuf_string(4, "MatMul")
+        )
+        nodes.extend(_protobuf_message(1, node))
+        input_name = output_name
+    graph = (
+        bytes(nodes)
+        + _protobuf_string(2, "deadline-test")
+        + _protobuf_message(11, value_info("input"))
+        + _protobuf_message(11, value_info("weight"))
+        + _protobuf_message(12, value_info(input_name))
+    )
+    return (
+        _protobuf_field(1, 0, 8)
+        + _protobuf_string(2, "ai-ledger-deadline-test")
+        + _protobuf_message(7, graph)
+        + _protobuf_message(8, _protobuf_field(2, 0, 13))
+    )
+
+
+class _BlockingFastEmbedRuntimeModel:
+    def __init__(self, session: object) -> None:
+        self.tokenizer = _FakeTokenizer()
+        self.model = session
+
+
+class BlockingFastEmbedModel:
+    def __init__(self, session: object, matrix: object) -> None:
+        self.model = _BlockingFastEmbedRuntimeModel(session)
+        self._matrix = matrix
+        self.inference_thread_id: int | None = None
+
+    def _run_inference(self) -> None:
+        self.inference_thread_id = threading.get_ident()
+        self.model.model.run(
+            None,
+            {"input": self._matrix, "weight": self._matrix},
+        )
+
+    def query_embed(self, texts: Sequence[str], *, batch_size: int):
+        del texts, batch_size
+        self._run_inference()
+        return (tuple(1.0 if index == 0 else 0.0 for index in range(384)),)
+
+    def rerank(self, query: str, documents: Sequence[str], *, batch_size: int):
+        del query, batch_size
+        self._run_inference()
+        return tuple(float(index) for index, _ in enumerate(documents))
+
+
 class DuplicateDominatingEmbeddingBackend:
     def embed_documents(self, texts: Sequence[str]) -> tuple[tuple[float, ...], ...]:
         return tuple(self._vector(0 if "dominant" in text else 1) for text in texts)
 
-    def embed_query(self, text: str) -> tuple[float, ...]:
+    def embed_query(
+        self,
+        text: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> tuple[float, ...]:
         del text
+        del timeout_seconds
         return self._vector(0)
 
     @staticmethod
@@ -928,6 +1100,39 @@ def test_fastembed_adapters_enforce_normalization_token_limit_and_fixed_rerank_b
         embedding.embed_documents((long_query,))
 
 
+@pytest.mark.parametrize("backend_kind", ("embedding", "reranker"))
+def test_fastembed_query_inference_is_natively_terminated_at_its_deadline(
+    backend_kind: str,
+) -> None:
+    numpy = pytest.importorskip("numpy")
+    onnxruntime = pytest.importorskip("onnxruntime")
+    session = onnxruntime.InferenceSession(
+        _blocking_matmul_onnx_model(),
+        providers=["CPUExecutionProvider"],
+    )
+    matrix = numpy.ones((512, 512), dtype=numpy.float32) / 512
+    model = BlockingFastEmbedModel(session, matrix)
+    original_threads = frozenset(threading.enumerate())
+    started_at = monotonic()
+
+    with pytest.raises(AcceptedKnowledgeDeadlineExceeded, match="deadline"):
+        if backend_kind == "embedding":
+            FastEmbedEmbeddingBackend(model).embed_query(
+                "deadline query",
+                timeout_seconds=0.02,
+            )
+        else:
+            FastEmbedRerankerBackend(model).rerank(
+                "deadline query",
+                ("deadline document",),
+                timeout_seconds=0.02,
+            )
+
+    assert monotonic() - started_at < 1.0
+    assert model.inference_thread_id == threading.get_ident()
+    assert frozenset(threading.enumerate()) == original_threads
+
+
 def test_production_bundle_prepares_exact_sha_hybrid_acceptance_without_model_substitution() -> (
     None
 ):
@@ -1300,6 +1505,100 @@ def test_hybrid_retrieval_recovers_an_fts_miss_and_records_every_ranking_stage(
 
 
 @pytest.mark.postgres
+def test_retrieval_passes_its_remaining_deadline_to_query_inference_and_never_falls_back(
+    m4_database_url: str,
+) -> None:
+    _persist_knowledge_story(
+        m4_database_url,
+        identity="query-inference-deadline",
+        body="CUDA-12.8 query inference deadline Evidence.",
+    )
+    engine = create_database_engine(m4_database_url)
+    embedding_deadline = DeadlineRecordingEmbeddingBackend(exceed_deadline=True)
+    embedding_ready = DeadlineRecordingEmbeddingBackend(exceed_deadline=False)
+    reranker_deadline = DeadlineRecordingReranker()
+    try:
+        AcceptedKnowledgeIndexer(engine, embedding=FakeEmbeddingBackend()).rebuild()
+
+        with pytest.raises(AcceptedKnowledgeDeadlineExceeded, match="embedding deadline"):
+            AcceptedKnowledgeRetrieval(
+                engine,
+                embedding=embedding_deadline,
+            ).retrieve(
+                RetrievalQuery(
+                    text="CUDA-12.8 query inference deadline",
+                    timeout_seconds=10.0,
+                )
+            )
+
+        with pytest.raises(AcceptedKnowledgeDeadlineExceeded, match="reranker deadline"):
+            AcceptedKnowledgeRetrieval(
+                engine,
+                embedding=embedding_ready,
+                reranker=reranker_deadline,
+            ).retrieve(
+                RetrievalQuery(
+                    text="CUDA-12.8 query inference deadline",
+                    timeout_seconds=10.0,
+                )
+            )
+    finally:
+        engine.dispose()
+
+    assert len(embedding_deadline.timeouts) == 1
+    assert len(embedding_ready.timeouts) == 1
+    assert len(reranker_deadline.timeouts) == 1
+    assert all(
+        timeout is not None and 0 < timeout <= 10.0
+        for timeout in (
+            *embedding_deadline.timeouts,
+            *embedding_ready.timeouts,
+            *reranker_deadline.timeouts,
+        )
+    )
+
+
+@pytest.mark.parametrize("consumer", ("accepted-knowledge", "research-metadata"))
+def test_postgres_acquisition_is_bounded_and_refused_before_a_short_query_deadline(
+    consumer: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connect_attempts: list[object] = []
+
+    def unexpected_connect(*args: object, **kwargs: object) -> object:
+        connect_attempts.append((args, kwargs))
+        raise AssertionError("database acquisition crossed the remaining query deadline")
+
+    engine = create_database_engine(
+        "postgresql://fixture:fixture@127.0.0.1:1/never-connect"
+    )
+    monkeypatch.setattr("psycopg.connect", unexpected_connect)
+    try:
+        if consumer == "accepted-knowledge":
+            with pytest.raises(AcceptedKnowledgeDeadlineExceeded, match="deadline"):
+                AcceptedKnowledgeRetrieval(engine).retrieve(
+                    RetrievalQuery(text="bounded checkout", timeout_seconds=0.5)
+                )
+        else:
+            with pytest.raises(ResearchBudgetExceeded, match="elapsed-time"):
+                PostgresResearchEvidenceMetadataLoader(engine).load(
+                    (_id("bounded-checkout:evidence"),),
+                    timeout_seconds=0.5,
+                )
+
+        assert connect_attempts == []
+        assert engine.pool.timeout() == pytest.approx(
+            persistence.POSTGRES_POOL_CHECKOUT_TIMEOUT_SECONDS
+        )
+        assert engine.url.query["connect_timeout"] == str(
+            persistence.POSTGRES_CONNECT_TIMEOUT_SECONDS
+        )
+        assert persistence.POSTGRES_ACQUISITION_CEILING_SECONDS < 45.0
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.postgres
 def test_exact_technical_entity_and_all_supported_filters_share_one_boundary(
     m4_database_url: str,
 ) -> None:
@@ -1337,7 +1636,11 @@ def test_exact_technical_entity_and_all_supported_filters_share_one_boundary(
                     publication_date=date(2026, 8, 19),
                     occurred_from=datetime(2026, 8, 19, 8, tzinfo=UTC),
                     occurred_to=datetime(2026, 8, 20, 0, tzinfo=UTC),
+                    time_semantics=("source-publication",),
+                    time_from=datetime(2026, 8, 19, 0, tzinfo=UTC),
+                    time_to=datetime(2026, 8, 20, 0, tzinfo=UTC),
                 ),
+                timeout_seconds=10.0,
             )
         )
         mismatches = (
@@ -1354,6 +1657,11 @@ def test_exact_technical_entity_and_all_supported_filters_share_one_boundary(
             RetrievalFilters(
                 occurred_to=datetime(2026, 8, 19, 8, tzinfo=UTC),
                 publisher="NVIDIA Technical Blog",
+            ),
+            RetrievalFilters(
+                publisher="NVIDIA Technical Blog",
+                time_semantics=("source-publication",),
+                time_from=datetime(2026, 8, 20, tzinfo=UTC),
             ),
         )
         mismatch_results = tuple(
