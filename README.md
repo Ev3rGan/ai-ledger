@@ -35,7 +35,7 @@ M1-M4 capabilities are deployed. Availability is tracked separately from source-
 | Traceable drafting | The approved DeepSeek route prepares Story, Claim, and exact Evidence Span drafts but cannot accept or publish them | Deployed |
 | Editorial approval | Operators may review directly or approve one immutable Agent-produced Digest Plan; the Agent never auto-publishes, and every approval is tied to the exact plan | Deployed (M3) |
 | Accepted-knowledge Hybrid | MiniLM vectors in pgvector combine with PostgreSQL FTS and exact-Entity candidates; deterministic Fusion feeds the sole mMARCO reranker, with an explicit model-free fallback | Deployed (M4) |
-| Advanced Research | Query Intent distinguishes simple lookup, comparison, timeline, and bounded multi-hop; entity/dimension or semantic-subquestion Evidence Sets stay isolated, strict time semantics and citation validation fail closed, and bounded orchestration streams progress without hidden reasoning | Integrated release candidate; public release is tracked by #74 and is not official Demo availability before exact-SHA acceptance |
+| Advanced Research | Query Intent distinguishes simple lookup, comparison, timeline, and bounded multi-hop; entity/dimension or semantic-subquestion Evidence Sets stay isolated, strict time semantics and citation validation fail closed, and bounded orchestration streams progress without hidden reasoning | Deployed (M5) |
 | Public projections | Home, Digest, Story, Browse, RSS, and the available Research surface expose only published knowledge without operator controls or hidden reasoning | Deployed; Advanced Research follows the availability above |
 | Reproducible operation | Locked local and production runbooks define startup, migration, status, backup, restore, rollback, and acceptance boundaries | Deployed |
 
@@ -56,9 +56,9 @@ M1-M4 capabilities are deployed. Availability is tracked separately from source-
 | [#71 M2](https://github.com/Ev3rGan/ai-ledger/issues/71) | Focused source portfolio | Delivered |
 | [#72 M3](https://github.com/Ev3rGan/ai-ledger/issues/72) | Editorial Agent Digest Plan | Delivered |
 | [#73 M4](https://github.com/Ev3rGan/ai-ledger/issues/73) | MiniLM Hybrid Retrieval and mMARCO | Delivered |
-| [#74 M5](https://github.com/Ev3rGan/ai-ledger/issues/74) | Comparison, timeline, and multi-hop Research | Integrated release candidate; #74 owns exact-SHA production acceptance |
+| [#74 M5](https://github.com/Ev3rGan/ai-ledger/issues/74) | Comparison, timeline, and multi-hop Research | Delivered |
 
-Delivered milestones have crossed their release gates. M5 is not production accepted until the exact merged SHA completes the acceptance owned by #74.
+All five milestones have crossed their release gates and are available in the official Demo.
 
 ## Learn the Project
 

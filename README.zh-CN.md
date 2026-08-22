@@ -35,7 +35,7 @@ M1-M4 能力已部署；可用状态与代码树集成状态分开记录。
 | 可追溯草稿 | 获批的 DeepSeek route 生成 Story、Claim 与精确 Evidence Span 草稿，但不能接受或发布 | 已部署 |
 | 编辑批准 | Operator 可直接审核，也可一次批准 Agent 生成的不可变 Digest Plan；Agent 不自动发布，每次批准都绑定 exact plan | 已部署（M3） |
 | 已接受知识 Hybrid | pgvector 中的 MiniLM 向量与 PostgreSQL FTS、exact Entity candidates 共同 Fusion，再交给唯一 mMARCO reranker；模型不可用时显式回退 | 已部署（M4） |
-| 高级 Research | Query Intent 区分 simple lookup、comparison、timeline 与 bounded multi-hop；entity/dimension 或语义子问题 Evidence Set 相互隔离，严格时间语义与引用校验 fail closed，有界编排通过 SSE 输出进度且不暴露 hidden reasoning | Integrated release candidate；public release 由 #74 跟踪，exact-SHA acceptance 完成前不代表 official Demo 已上线 |
+| 高级 Research | Query Intent 区分 simple lookup、comparison、timeline 与 bounded multi-hop；entity/dimension 或语义子问题 Evidence Set 相互隔离，严格时间语义与引用校验 fail closed，有界编排通过 SSE 输出进度且不暴露 hidden reasoning | 已部署（M5） |
 | 公共投影 | Home、Digest、Story、Browse、RSS 与当前可用的 Research surface 只暴露已发布知识，不暴露 operator 控件或 hidden reasoning | 已部署；高级 Research 以上述可用状态为准 |
 | 可复现运维 | 锁定的本地与生产 runbook 定义启动、迁移、状态、备份、恢复、回滚与验收边界 | 已部署 |
 
@@ -56,9 +56,9 @@ M1-M4 能力已部署；可用状态与代码树集成状态分开记录。
 | [#71 M2](https://github.com/Ev3rGan/ai-ledger/issues/71) | Focused source portfolio | 已交付 |
 | [#72 M3](https://github.com/Ev3rGan/ai-ledger/issues/72) | Editorial Agent Digest Plan | 已交付 |
 | [#73 M4](https://github.com/Ev3rGan/ai-ledger/issues/73) | MiniLM Hybrid Retrieval and mMARCO | 已交付 |
-| [#74 M5](https://github.com/Ev3rGan/ai-ledger/issues/74) | Comparison, timeline, and multi-hop Research | Integrated release candidate；#74 负责 exact-SHA production acceptance |
+| [#74 M5](https://github.com/Ev3rGan/ai-ledger/issues/74) | Comparison, timeline, and multi-hop Research | 已交付 |
 
-“已交付”表示对应里程碑已跨过其发布门禁。M5 在 #74 完成 exact merged SHA 验收前，不得表述为 production accepted。
+五个里程碑均已跨过发布门禁，并在官方演示站点可用。
 
 ## 学习本项目
 
