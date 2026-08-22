@@ -40,6 +40,7 @@ from ai_intel_agent.editorial import (
     DigestPublicationContract,
     EditorialContext,
     EditorialPlanProposal,
+    EditorialStateError,
     EditorialStoryProposal,
     EvidenceSpanInspection,
     SchedulerHealthInspection,
@@ -51,6 +52,7 @@ from ai_intel_agent.editorial import (
     prepare_digest_plan,
 )
 from ai_intel_agent.persistence import (
+    CandidateRecord,
     ClaimRecord,
     CollectionRunRecord,
     DigestPlanApprovalRecord,
@@ -58,6 +60,7 @@ from ai_intel_agent.persistence import (
     DigestRecord,
     DigestStoryRecord,
     DigestWithdrawalRecord,
+    DocumentVersionRecord,
     EditorialRepository,
     EvidenceSpanRecord,
     SampleStoryRepository,
@@ -156,15 +159,15 @@ class _FakeEditorialProvider:
         )
 
 
-class _ExcludeFirstEditorialProvider(_FakeEditorialProvider):
+class _ExcludeUnsupportedEditorialProvider(_FakeEditorialProvider):
     identifier = "fake-editorial:v2"
 
     def prepare(self, context: EditorialContext) -> EditorialPlanProposal:
         original = super().prepare(context)
         proposals = []
         included_order = 0
-        for position, item in enumerate(original.stories):
-            included = position > 0
+        for item in original.stories:
+            included = not item.stable_key.endswith(":0")
             proposals.append(
                 EditorialStoryProposal(
                     stable_key=item.stable_key,
@@ -191,6 +194,15 @@ class _ExcludeFirstEditorialProvider(_FakeEditorialProvider):
         )
 
 
+class _RecordingExcludeUnsupportedEditorialProvider(_ExcludeUnsupportedEditorialProvider):
+    def __init__(self) -> None:
+        self.contexts: list[EditorialContext] = []
+
+    def prepare(self, context: EditorialContext) -> EditorialPlanProposal:
+        self.contexts.append(context)
+        return super().prepare(context)
+
+
 @pytest.fixture
 def editorial_database_url():
     server = Pg0(name=f"ai_intel_m3_editorial_{_id('database').hex}")
@@ -202,7 +214,12 @@ def editorial_database_url():
         server.drop()
 
 
-def _persist_pending_stories(database_url: str) -> None:
+def _persist_pending_stories(
+    database_url: str,
+    *,
+    story_count: int = 10,
+    tie_newest_discovery: bool = False,
+) -> None:
     engine = create_database_engine(database_url)
     publishers = ("Gemini", "TechCrunch", "Hugging Face", "QbitAI")
     source_ids = tuple(_id(f"database-source:{position}") for position in range(4))
@@ -211,7 +228,8 @@ def _persist_pending_stories(database_url: str) -> None:
     persisted: list[tuple[UUID, UUID, UUID]] = []
     try:
         repository = SampleStoryRepository(engine)
-        for position in range(10):
+        first_published_at = datetime(2026, 8, 20, 2, tzinfo=UTC)
+        for position in range(story_count):
             publisher = publishers[position % len(publishers)]
             candidate_id = _id(f"database-candidate:{position}")
             document_id = _id(f"database-document:{position}")
@@ -220,7 +238,12 @@ def _persist_pending_stories(database_url: str) -> None:
             evidence_id = _id(f"database-evidence:{position}")
             exact_text = f"{publisher} exact persisted Evidence {position}."
             body = f"{exact_text} Additional private source text."
-            published_at = datetime(2026, 8, 20, 2 + position, tzinfo=UTC)
+            published_at = first_published_at + timedelta(hours=position)
+            discovered_at = (
+                first_published_at + timedelta(hours=story_count - 1)
+                if tie_newest_discovery and position >= story_count - 2
+                else published_at
+            )
             repository.persist(
                 SampleStory(
                     candidate=Candidate(
@@ -228,7 +251,7 @@ def _persist_pending_stories(database_url: str) -> None:
                         title=f"{publisher} source {position}",
                         canonical_url=f"https://example.com/persisted/{position}",
                         publisher=publisher,
-                        discovered_at=published_at,
+                        discovered_at=discovered_at,
                     ),
                     document_version=DocumentVersion(
                         id=document_id,
@@ -604,7 +627,7 @@ def test_versioned_editorial_provider_protocol_is_strict_and_uses_no_live_networ
             publisher=publishers[position % 4],
             source_id=source_ids[position % 4],
         )
-        for position in range(10)
+        for position in range(12)
     )
     context = EditorialContext(
         publication_date=publication_date,
@@ -691,8 +714,11 @@ def test_versioned_editorial_provider_protocol_is_strict_and_uses_no_live_networ
     assert proposal.provider_identifier.startswith("deepseek:v4-pro@")
     assert proposal.protocol_version == protocol.version
     assert len(protocol.content_sha256) == 64
+    assert protocol.maximum_pending_stories == 12
+    assert protocol.maximum_output_tokens == 4096
     assert budget.calls == 1
     assert len(observed_requests) == 1
+    assert observed_requests[0]["max_tokens"] == 4096
 
     invalid_output = json.loads(json.dumps(provider_output))
     invalid_output["stories"][0]["evidence"] = "invented Evidence"
@@ -718,10 +744,127 @@ def test_versioned_editorial_provider_protocol_is_strict_and_uses_no_live_networ
         DeepSeekEditorialPlanProvider(client, api_key="fixture-key").prepare(context)
 
 
+def test_repository_prepares_and_approves_only_the_newest_twelve_story_batch(
+    editorial_database_url: str,
+) -> None:
+    _persist_pending_stories(
+        editorial_database_url,
+        story_count=14,
+        tie_newest_discovery=True,
+    )
+    engine = create_database_engine(editorial_database_url)
+    provider = _RecordingExcludeUnsupportedEditorialProvider()
+    observed_at = datetime(2026, 8, 20, 16, tzinfo=UTC)
+    expected_batch = (
+        "persisted-story:12",
+        "persisted-story:13",
+        *(f"persisted-story:{position}" for position in range(11, 1, -1)),
+    )
+    try:
+        repository = EditorialRepository(engine)
+        plan = repository.prepare_digest_plan(
+            date(2026, 8, 21),
+            provider=provider,
+            prepared_at=observed_at,
+        )
+
+        assert len(provider.contexts) == 1
+        assert tuple(story.stable_key for story in provider.contexts[0].stories) == expected_batch
+        assert tuple(story.stable_key for story in plan.stories) == expected_batch
+        assert len(plan.included_stories) == 12
+        assert repository.pending_review_count() == 14
+
+        digest = repository.approve_digest_plan(
+            plan.id,
+            expected_content_hash=plan.content_hash,
+            actor_identifier="m5-editorial-operator",
+            approved_at=observed_at + timedelta(minutes=1),
+        )
+
+        assert digest.story_ids == tuple(story.id for story in plan.included_stories)
+        assert repository.pending_review_count() == 2
+        assert {
+            story.stable_key
+            for story in repository.stories(review_state=StoryReviewState.UNREVIEWED)
+        } == {"persisted-story:0", "persisted-story:1"}
+        assert repository.story("persisted-story:12").review_state is StoryReviewState.ACCEPTED
+        assert repository.story("persisted-story:13").review_state is StoryReviewState.ACCEPTED
+    finally:
+        engine.dispose()
+
+
+def test_repository_refuses_approval_when_a_new_discovery_changes_the_selected_batch(
+    editorial_database_url: str,
+) -> None:
+    _persist_pending_stories(editorial_database_url, story_count=14)
+    engine = create_database_engine(editorial_database_url)
+    provider = _RecordingExcludeUnsupportedEditorialProvider()
+    observed_at = datetime(2026, 8, 20, 16, tzinfo=UTC)
+    try:
+        repository = EditorialRepository(engine)
+        plan = repository.prepare_digest_plan(
+            date(2026, 8, 21),
+            provider=provider,
+            prepared_at=observed_at,
+        )
+        assert "persisted-story:0" not in {
+            story.stable_key for story in provider.contexts[0].stories
+        }
+
+        candidate_id = _id("database-candidate:newest")
+        document_id = _id("database-document:newest")
+        with Session(engine) as session, session.begin():
+            session.add_all(
+                (
+                    CandidateRecord(
+                        id=candidate_id,
+                        title="Newest pending discovery",
+                        canonical_url="https://example.com/persisted/newest",
+                        publisher="Gemini",
+                        discovered_at=observed_at + timedelta(hours=1),
+                    ),
+                    DocumentVersionRecord(
+                        id=document_id,
+                        candidate_id=candidate_id,
+                        source_url="https://example.com/persisted/newest",
+                        title="Newest pending discovery",
+                        body="Newest immutable pending Story body.",
+                        content_hash=sha256(b"Newest immutable pending Story body.").hexdigest(),
+                        observed_at=observed_at + timedelta(hours=1),
+                        published_at=observed_at + timedelta(hours=1),
+                        published_at_raw=(observed_at + timedelta(hours=1)).isoformat(),
+                        updated_at=None,
+                        updated_at_raw=None,
+                    ),
+                    StoryRecord(
+                        id=_id("database-story:newest"),
+                        primary_document_version_id=document_id,
+                        stable_key="persisted-story:newest",
+                        headline="Newest pending discovery",
+                        occurred_at=observed_at + timedelta(hours=1),
+                        review_state=StoryReviewState.UNREVIEWED.value,
+                    ),
+                )
+            )
+
+        with pytest.raises(EditorialStateError, match="state changed"):
+            repository.approve_digest_plan(
+                plan.id,
+                expected_content_hash=plan.content_hash,
+                actor_identifier="m5-editorial-operator",
+                approved_at=observed_at + timedelta(minutes=1),
+            )
+
+        assert repository.pending_review_count() == 15
+        assert PublicPublicationRepository(engine).latest_digest() is None
+    finally:
+        engine.dispose()
+
+
 def test_blocking_anomaly_requires_a_new_plan_version_and_old_plan_cannot_approve(
     editorial_database_url: str,
 ) -> None:
-    _persist_pending_stories(editorial_database_url)
+    _persist_pending_stories(editorial_database_url, story_count=9)
     engine = create_database_engine(editorial_database_url)
     observed_at = datetime(2026, 8, 20, 13, tzinfo=UTC)
     try:
@@ -747,7 +890,7 @@ def test_blocking_anomaly_requires_a_new_plan_version_and_old_plan_cannot_approv
 
         second = repository.prepare_digest_plan(
             date(2026, 8, 21),
-            provider=_ExcludeFirstEditorialProvider(),
+            provider=_ExcludeUnsupportedEditorialProvider(),
             prepared_at=observed_at + timedelta(minutes=2),
         )
 
@@ -785,7 +928,7 @@ def test_one_exact_plan_approval_atomically_accepts_decisions_and_publishes_in_o
         public = PublicPublicationRepository(engine)
         plan = repository.prepare_digest_plan(
             date(2026, 8, 21),
-            provider=_ExcludeFirstEditorialProvider(),
+            provider=_ExcludeUnsupportedEditorialProvider(),
             prepared_at=observed_at,
         )
 
@@ -820,17 +963,20 @@ def test_one_exact_plan_approval_atomically_accepts_decisions_and_publishes_in_o
 
         excluded = repository.story("persisted-story:0")
         included = repository.story("persisted-story:1")
+        planned_included = next(
+            item for item in plan.included_stories if item.stable_key == "persisted-story:1"
+        )
         assert excluded is not None
         assert excluded.review_state is StoryReviewState.REJECTED
         assert included is not None
         assert included.review_state is StoryReviewState.ACCEPTED
-        assert included.summary == plan.included_stories[0].summary
-        assert included.why_it_matters == plan.included_stories[0].why_it_matters
+        assert included.summary == planned_included.summary
+        assert included.why_it_matters == planned_included.why_it_matters
         assert included.primary_topic is Topic.MODELS
         assert included.secondary_topics == (Topic.PRODUCTS_AND_TOOLS,)
         assert (
             included.claims[0].evidence_spans[0].exact_text
-            == plan.included_stories[0].claims[0].evidence_spans[0].exact_text
+            == planned_included.claims[0].evidence_spans[0].exact_text
         )
 
         history = repository.digest_history(date(2026, 8, 21))
@@ -875,7 +1021,7 @@ def test_database_cannot_publish_an_editorial_plan_contract_without_approval(
         repository = EditorialRepository(engine)
         plan = repository.prepare_digest_plan(
             date(2026, 8, 21),
-            provider=_ExcludeFirstEditorialProvider(),
+            provider=_ExcludeUnsupportedEditorialProvider(),
             prepared_at=observed_at,
         )
         draft = compose_digest(
@@ -938,7 +1084,7 @@ def test_database_requires_the_complete_approved_plan_projection(
         repository = EditorialRepository(engine)
         plan = repository.prepare_digest_plan(
             date(2026, 8, 21),
-            provider=_ExcludeFirstEditorialProvider(),
+            provider=_ExcludeUnsupportedEditorialProvider(),
             prepared_at=observed_at,
         )
         draft = compose_digest(
@@ -1141,7 +1287,7 @@ def test_changed_persisted_state_requires_a_new_immutable_plan_version(
         repository = EditorialRepository(engine)
         first = repository.prepare_digest_plan(
             date(2026, 8, 21),
-            provider=_ExcludeFirstEditorialProvider(),
+            provider=_ExcludeUnsupportedEditorialProvider(),
             prepared_at=observed_at,
         )
         SchedulerStatusRepository(engine).succeeded(completed_at=observed_at + timedelta(minutes=1))
@@ -1156,7 +1302,7 @@ def test_changed_persisted_state_requires_a_new_immutable_plan_version(
 
         second = repository.prepare_digest_plan(
             date(2026, 8, 21),
-            provider=_ExcludeFirstEditorialProvider(),
+            provider=_ExcludeUnsupportedEditorialProvider(),
             prepared_at=observed_at + timedelta(minutes=3),
         )
         assert second.version == first.version + 1
@@ -1199,7 +1345,7 @@ def test_cli_prepares_displays_and_approves_one_exact_plan(
     monkeypatch.setattr(
         cli_module,
         "_create_editorial_plan_provider",
-        lambda _engine, _client: _ExcludeFirstEditorialProvider(),
+        lambda _engine, _client: _ExcludeUnsupportedEditorialProvider(),
         raising=False,
     )
     runner = CliRunner()
@@ -1292,7 +1438,7 @@ def test_cli_withdrawal_hides_every_public_surface_but_preserves_history(
         repository = EditorialRepository(engine)
         plan = repository.prepare_digest_plan(
             date(2026, 8, 21),
-            provider=_ExcludeFirstEditorialProvider(),
+            provider=_ExcludeUnsupportedEditorialProvider(),
             prepared_at=observed_at,
         )
         digest = repository.approve_digest_plan(
@@ -1469,7 +1615,7 @@ def test_0009_to_0010_upgrade_preserves_predecessor_state_and_runs_cli_seam(
         monkeypatch.setattr(
             cli_module,
             "_create_editorial_plan_provider",
-            lambda _engine, _client: _ExcludeFirstEditorialProvider(),
+            lambda _engine, _client: _ExcludeUnsupportedEditorialProvider(),
         )
         result = CliRunner().invoke(
             app,

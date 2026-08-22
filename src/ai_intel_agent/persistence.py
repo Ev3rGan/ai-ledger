@@ -72,6 +72,7 @@ from ai_intel_agent.editorial import (
     StoryInspection,
     compose_digest,
     editorial_window_for,
+    load_editorial_agent_protocol,
     publish_digest,
     restore_digest_plan,
     review_story,
@@ -1500,6 +1501,36 @@ class EditorialRepository:
         with Session(self._engine) as session:
             return self._editorial_context_in_session(session, publication_date)
 
+    @staticmethod
+    def _pending_editorial_story_batch_ids(
+        session: Session,
+        *,
+        lock: bool = False,
+    ) -> tuple[UUID, ...]:
+        maximum_pending_stories = load_editorial_agent_protocol().maximum_pending_stories
+        statement = (
+            select(StoryRecord.id)
+            .join(
+                DocumentVersionRecord,
+                DocumentVersionRecord.id == StoryRecord.primary_document_version_id,
+            )
+            .join(
+                CandidateRecord,
+                CandidateRecord.id == DocumentVersionRecord.candidate_id,
+            )
+            .where(StoryRecord.review_state == StoryReviewState.UNREVIEWED.value)
+            .order_by(
+                CandidateRecord.discovered_at.desc(),
+                CandidateRecord.canonical_url,
+                StoryRecord.stable_key,
+                StoryRecord.id,
+            )
+            .limit(maximum_pending_stories)
+        )
+        if lock:
+            statement = statement.with_for_update()
+        return tuple(session.scalars(statement).all())
+
     def _editorial_context_in_session(
         self,
         session: Session,
@@ -1508,11 +1539,6 @@ class EditorialRepository:
         lock: bool = False,
     ) -> EditorialContext:
         window_start, window_end = editorial_window_for(publication_date)
-        story_statement = (
-            select(StoryRecord.id)
-            .where(StoryRecord.review_state == StoryReviewState.UNREVIEWED.value)
-            .order_by(StoryRecord.occurred_at, StoryRecord.stable_key)
-        )
         source_statement = (
             select(SourceProfileStateRecord, SourceDefinitionRecord)
             .join(
@@ -1525,10 +1551,9 @@ class EditorialRepository:
             SchedulerStatusRecord.scheduler_key == SchedulerStatusRepository._KEY
         )
         if lock:
-            story_statement = story_statement.with_for_update()
             source_statement = source_statement.with_for_update()
             scheduler_statement = scheduler_statement.with_for_update()
-        story_ids = session.scalars(story_statement).all()
+        story_ids = self._pending_editorial_story_batch_ids(session, lock=lock)
         if lock and story_ids:
             session.scalars(
                 select(StoryPresentationRecord.story_id)
