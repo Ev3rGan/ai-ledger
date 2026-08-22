@@ -1,13 +1,13 @@
 # ADR 0007: Editorial planning and one explicit approval
 
-- Status: approved Future Work
+- Status: accepted and implemented
 - Scope: the v2.1-v2.2 Editorial Agent boundary
 
 ## Context
 
-The current product prepares traceable Story drafts, then requires an operator to inspect and
-accept or reject each Story before previewing and publishing a Digest. The next iteration should
-reduce composition work without allowing a model to silently decide what becomes public.
+The product prepares traceable Story drafts and supports direct operator review. The Editorial
+Agent reduces composition work by preparing a complete proposal without allowing a model to
+silently decide what becomes public.
 
 ## Alternatives
 
@@ -18,10 +18,14 @@ reduce composition work without allowing a model to silently decide what becomes
 
 ## Decision
 
-The Editorial Agent may generate only one complete immutable Digest Plan: 8-12 selected Stories,
-ordering, summary, why-it-matters text, Topics, exclusions, and anomaly flags. One administrator
-approval accepts the exact plan and publishes the Digest. The Agent never publishes, and any
-changed plan requires a new approval. M1 records this boundary but does not implement the Agent.
+Each Editorial Agent proposal is one complete, versioned, immutable Digest Plan: 8-12 selected
+Stories, ordering, summary, why-it-matters text, Topics, exclusions, and anomaly flags. The
+persisted plan has a content identity that binds the approval to that exact proposal.
+
+One administrative operator approves the exact plan once. Approval accepts its included Stories
+and publishes the unchanged Digest as one controlled action. The Agent never approves or
+publishes, and any changed proposal is a new plan version that requires a new approval. Public or
+operator-facing output exposes the plan and its evidence, not hidden model reasoning.
 
 ## Accepted tradeoff
 

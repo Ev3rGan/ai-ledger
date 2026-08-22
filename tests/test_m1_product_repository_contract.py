@@ -102,12 +102,24 @@ def test_bilingual_roadmaps_link_the_same_issues_and_tell_status_truth() -> None
 
     english_roadmap, chinese_roadmap = roadmap_sections
     assert (
-        "Implementation/review complete; Git/release/production acceptance pending"
+        "Integrated release candidate; #74 owns exact-SHA production acceptance"
         in english_roadmap
     )
-    assert "实现与审查已完成；Git、发布与生产验收待完成" in chinese_roadmap
-    assert english_roadmap.count("Planned") == 4
-    assert chinese_roadmap.count("计划中") == 4
+    assert (
+        "Integrated release candidate；#74 负责 exact-SHA production acceptance"
+        in chinese_roadmap
+    )
+    assert english_roadmap.count("| Delivered |") == 4
+    assert chinese_roadmap.count("| 已交付 |") == 4
+    assert (
+        "M5 is not production accepted until the exact merged SHA completes the acceptance "
+        "owned by #74."
+        in english_roadmap
+    )
+    assert (
+        "M5 在 #74 完成 exact merged SHA 验收前，不得表述为 production accepted。"
+        in chinese_roadmap
+    )
     for roadmap in roadmap_sections:
         assert "[x]" not in roadmap.casefold()
         assert "~~" not in roadmap

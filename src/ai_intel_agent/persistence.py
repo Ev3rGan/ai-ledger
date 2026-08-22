@@ -30,7 +30,7 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.dialects.postgresql import TSVECTOR, insert
-from sqlalchemy.engine import Engine, create_engine
+from sqlalchemy.engine import Engine, create_engine, make_url
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 from ai_intel_agent.domain import (
@@ -758,11 +758,57 @@ def database_url_for_alembic_config(database_url: str) -> str:
     return normalize_database_url(database_url).replace("%", "%%")
 
 
+POSTGRES_POOL_CHECKOUT_TIMEOUT_SECONDS = 2.0
+POSTGRES_CONNECT_TIMEOUT_SECONDS = 2
+POSTGRES_ACQUISITION_CEILING_SECONDS = (
+    POSTGRES_POOL_CHECKOUT_TIMEOUT_SECONDS + POSTGRES_CONNECT_TIMEOUT_SECONDS
+)
+_POSTGRES_ACQUISITION_CEILING_OPTION = "ai_intel_postgres_acquisition_ceiling_seconds"
+
+
+class DatabaseAcquisitionDeadlineExceeded(TimeoutError):
+    pass
+
+
 def create_database_engine(database_url: str) -> Engine:
     normalized_url = normalize_database_url(database_url)
     if not normalized_url.startswith("postgresql+psycopg://"):
         raise ValueError("AI_INTEL_DATABASE_URL must point to PostgreSQL")
-    return create_engine(normalized_url)
+    bounded_url = make_url(normalized_url).update_query_dict(
+        {"connect_timeout": str(POSTGRES_CONNECT_TIMEOUT_SECONDS)}
+    )
+    engine = create_engine(
+        bounded_url,
+        pool_timeout=POSTGRES_POOL_CHECKOUT_TIMEOUT_SECONDS,
+    )
+    engine.update_execution_options(
+        **{
+            _POSTGRES_ACQUISITION_CEILING_OPTION: POSTGRES_ACQUISITION_CEILING_SECONDS,
+        }
+    )
+    return engine
+
+
+def reserve_database_acquisition_budget(
+    engine: Engine,
+    remaining_seconds: float | None,
+) -> float | None:
+    """Reserve the engine's checkout/connect ceiling before the first SQL call."""
+    if remaining_seconds is None:
+        return None
+    raw_ceiling = engine.get_execution_options().get(
+        _POSTGRES_ACQUISITION_CEILING_OPTION
+    )
+    if not isinstance(raw_ceiling, int | float) or raw_ceiling <= 0:
+        raise DatabaseAcquisitionDeadlineExceeded(
+            "PostgreSQL engine does not expose a finite acquisition ceiling"
+        )
+    statement_seconds = remaining_seconds - float(raw_ceiling)
+    if statement_seconds <= 0:
+        raise DatabaseAcquisitionDeadlineExceeded(
+            "Remaining query budget cannot cover PostgreSQL acquisition"
+        )
+    return statement_seconds
 
 
 class AnonymousResearchAllowanceRepository:

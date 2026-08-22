@@ -13,18 +13,32 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 from importlib.resources import files
 from pathlib import Path
+from threading import Timer, local
+from time import monotonic
 from typing import Any, Protocol
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from sqlalchemy import func, literal, select
+from sqlalchemy import and_, func, literal, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, aliased
 
-from ai_intel_agent.domain import EvidenceRelation, EvidenceRole, StoryReviewState, Topic
+from ai_intel_agent.domain import (
+    AuditAction,
+    AuditSubjectType,
+    DigestState,
+    EvidenceRelation,
+    EvidenceRole,
+    StoryReviewState,
+    Topic,
+)
 from ai_intel_agent.persistence import (
+    AuditEventRecord,
     CandidateRecord,
     ClaimRecord,
+    DatabaseAcquisitionDeadlineExceeded,
+    DigestRecord,
+    DigestStoryRecord,
     DocumentVersionRecord,
     EvidenceSpanRecord,
     RetrievalChunkEntityRecord,
@@ -34,6 +48,7 @@ from ai_intel_agent.persistence import (
     SourceSpecificRecordRecord,
     StoryPresentationRecord,
     StoryRecord,
+    reserve_database_acquisition_budget,
 )
 from ai_intel_agent.publication import (
     PublicPublicationRepository,
@@ -88,10 +103,119 @@ GENERIC_QUESTION_TERMS = frozenset(
 )
 QUESTION_PREFIXES = ("请问", "关于", "的")
 QUESTION_SUFFIXES = ("是多少", "是什么", "怎么样", "如何", "多少", "了吗", "吗", "呢")
+RETRIEVAL_TIME_SEMANTICS = frozenset(
+    {
+        "event",
+        "source-publication",
+        "discovery",
+        "editorial",
+        "digest-publication",
+    }
+)
 
 
 class AcceptedKnowledgeConfigurationError(ValueError):
     pass
+
+
+class AcceptedKnowledgeDeadlineExceeded(TimeoutError):
+    pass
+
+
+class _DeadlineAwareOnnxSession:
+    """Inject one caller-owned RunOptions into FastEmbed's synchronous session call."""
+
+    def __init__(self, session: Any) -> None:
+        self._session = session
+        self._context = local()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._session, name)
+
+    def run(
+        self,
+        output_names: Any,
+        input_feed: Any,
+        run_options: Any = None,
+    ) -> Any:
+        active_run_options = getattr(self._context, "run_options", None)
+        return self._session.run(
+            output_names,
+            input_feed,
+            active_run_options if active_run_options is not None else run_options,
+        )
+
+    def invoke(self, run_options: Any, operation: Callable[[], Any]) -> Any:
+        missing = object()
+        previous = getattr(self._context, "run_options", missing)
+        self._context.run_options = run_options
+        try:
+            return operation()
+        finally:
+            if previous is missing:
+                del self._context.run_options
+            else:
+                self._context.run_options = previous
+
+
+def _deadline_aware_fastembed_session(model: Any) -> _DeadlineAwareOnnxSession | None:
+    runtime_model = getattr(model, "model", None)
+    session = getattr(runtime_model, "model", None)
+    if isinstance(session, _DeadlineAwareOnnxSession):
+        return session
+    if runtime_model is None or not callable(getattr(session, "run", None)):
+        return None
+    wrapped = _DeadlineAwareOnnxSession(session)
+    runtime_model.model = wrapped
+    return wrapped
+
+
+def _run_fastembed_query_with_deadline(
+    operation: Callable[[], Any],
+    *,
+    session: _DeadlineAwareOnnxSession | None,
+    timeout_seconds: float | None,
+) -> Any:
+    if timeout_seconds is None:
+        return operation()
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError("FastEmbed query timeout_seconds must be positive and finite")
+    if session is None:
+        raise AcceptedKnowledgeConfigurationError(
+            "FastEmbed ONNX session is unavailable for deadline-aware query inference"
+        )
+    try:
+        from onnxruntime import RunOptions
+    except ImportError as error:
+        raise AcceptedKnowledgeConfigurationError(
+            "ONNX Runtime is unavailable for deadline-aware query inference"
+        ) from error
+
+    run_options = RunOptions()
+    watchdog = Timer(
+        timeout_seconds,
+        setattr,
+        args=(run_options, "terminate", True),
+    )
+    watchdog.name = f"accepted-knowledge-onnx-deadline-{id(run_options):x}"
+    watchdog.daemon = True
+    result: Any = None
+    failure: Exception | None = None
+    watchdog.start()
+    try:
+        result = session.invoke(run_options, operation)
+    except Exception as error:  # noqa: BLE001 - map only watchdog termination below.
+        failure = error
+    finally:
+        watchdog.cancel()
+        watchdog.join()
+    if run_options.terminate:
+        raise AcceptedKnowledgeDeadlineExceeded(
+            "Accepted-knowledge query inference exceeded its deadline"
+        ) from failure
+    if failure is not None:
+        raise failure
+    return result
 
 
 @dataclass(frozen=True)
@@ -318,11 +442,22 @@ class KnowledgeChunk:
 class EmbeddingBackend(Protocol):
     def embed_documents(self, texts: Sequence[str]) -> tuple[tuple[float, ...], ...]: ...
 
-    def embed_query(self, text: str) -> tuple[float, ...]: ...
+    def embed_query(
+        self,
+        text: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> tuple[float, ...]: ...
 
 
 class RerankerBackend(Protocol):
-    def rerank(self, query: str, documents: Sequence[str]) -> tuple[float, ...]: ...
+    def rerank(
+        self,
+        query: str,
+        documents: Sequence[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> tuple[float, ...]: ...
 
 
 class FastEmbedEmbeddingBackend:
@@ -337,6 +472,7 @@ class FastEmbedEmbeddingBackend:
         self._model = model
         self._profile = profile or load_accepted_knowledge_profile()
         _validate_approved_profile(self._profile)
+        self._deadline_session = _deadline_aware_fastembed_session(model)
 
     def embed_documents(
         self,
@@ -348,9 +484,18 @@ class FastEmbedEmbeddingBackend:
             for vector in self._model.passage_embed(prepared, batch_size=32)
         )
 
-    def embed_query(self, text: str) -> tuple[float, ...]:
+    def embed_query(
+        self,
+        text: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> tuple[float, ...]:
         prepared = self._prepare_query(text)
-        vectors = tuple(self._model.query_embed((prepared,), batch_size=1))
+        vectors = _run_fastembed_query_with_deadline(
+            lambda: tuple(self._model.query_embed((prepared,), batch_size=1)),
+            session=self._deadline_session,
+            timeout_seconds=timeout_seconds,
+        )
         if len(vectors) != 1:
             raise ValueError("FastEmbed query Embedding returned an invalid count")
         return _normalized_embedding(vectors[0], self._profile.embedding.dimensions)
@@ -399,12 +544,24 @@ class FastEmbedRerankerBackend:
         self._model = model
         self._profile = profile or load_accepted_knowledge_profile()
         _validate_approved_profile(self._profile)
+        self._deadline_session = _deadline_aware_fastembed_session(model)
 
-    def rerank(self, query: str, documents: Sequence[str]) -> tuple[float, ...]:
+    def rerank(
+        self,
+        query: str,
+        documents: Sequence[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> tuple[float, ...]:
         if len(documents) > self._profile.retrieval.rerank_depth:
             raise ValueError("Reranker input exceeds the approved fused top eight")
-        scores = tuple(
-            float(value) for value in self._model.rerank(query, tuple(documents), batch_size=8)
+        scores = _run_fastembed_query_with_deadline(
+            lambda: tuple(
+                float(value)
+                for value in self._model.rerank(query, tuple(documents), batch_size=8)
+            ),
+            session=self._deadline_session,
+            timeout_seconds=timeout_seconds,
         )
         if len(scores) != len(documents) or any(not math.isfinite(score) for score in scores):
             raise ValueError("FastEmbed Reranker returned invalid scores")
@@ -428,11 +585,16 @@ class RetrievalFilters:
     publication_date: date | None = None
     occurred_from: datetime | None = None
     occurred_to: datetime | None = None
+    time_semantics: tuple[str, ...] = ()
+    time_from: datetime | None = None
+    time_to: datetime | None = None
 
     def __post_init__(self) -> None:
         for label, value in (
             ("occurred_from", self.occurred_from),
             ("occurred_to", self.occurred_to),
+            ("time_from", self.time_from),
+            ("time_to", self.time_to),
         ):
             if value is not None and value.utcoffset() is None:
                 raise ValueError(f"{label} must include a timezone")
@@ -442,12 +604,34 @@ class RetrievalFilters:
             and self.occurred_from >= self.occurred_to
         ):
             raise ValueError("occurred_from must be earlier than occurred_to")
+        if (
+            self.time_from is not None
+            and self.time_to is not None
+            and self.time_from >= self.time_to
+        ):
+            raise ValueError("time_from must be earlier than time_to")
+        if (
+            len(set(self.time_semantics)) != len(self.time_semantics)
+            or any(value not in RETRIEVAL_TIME_SEMANTICS for value in self.time_semantics)
+        ):
+            raise ValueError("time_semantics contains an unsupported or duplicate value")
+        if (self.time_from is not None or self.time_to is not None) and not (
+            self.time_semantics
+        ):
+            raise ValueError("time_semantics is required for a semantic time range")
 
 
 @dataclass(frozen=True)
 class RetrievalQuery:
     text: str
     filters: RetrievalFilters = field(default_factory=RetrievalFilters)
+    timeout_seconds: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.timeout_seconds is not None and (
+            not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0
+        ):
+            raise ValueError("Retrieval timeout_seconds must be positive and finite")
 
 
 @dataclass(frozen=True)
@@ -828,6 +1012,7 @@ class AcceptedKnowledgeRetrieval:
         reranker: RerankerBackend | None = None,
         profile: AcceptedKnowledgeProfile | None = None,
         clock: Callable[[], datetime] | None = None,
+        timer: Callable[[], float] = monotonic,
     ) -> None:
         self._engine = engine
         self._embedding = embedding
@@ -835,14 +1020,42 @@ class AcceptedKnowledgeRetrieval:
         self._profile = profile or load_accepted_knowledge_profile()
         _validate_approved_profile(self._profile)
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._timer = timer
 
     def retrieve(self, query: RetrievalQuery) -> AcceptedKnowledgeResult:
+        deadline = (
+            self._timer() + query.timeout_seconds
+            if query.timeout_seconds is not None
+            else None
+        )
+        try:
+            return self._retrieve(query, deadline=deadline)
+        except AcceptedKnowledgeDeadlineExceeded:
+            raise
+        except Exception as error:
+            if deadline is not None and self._timer() >= deadline:
+                raise AcceptedKnowledgeDeadlineExceeded(
+                    "Accepted-knowledge retrieval exceeded its deadline"
+                ) from error
+            raise
+
+    def _retrieve(
+        self,
+        query: RetrievalQuery,
+        *,
+        deadline: float | None,
+    ) -> AcceptedKnowledgeResult:
+        self._check_deadline(deadline)
         query_text = _fts_query_text(query.text)
         faults: list[RetrievalFault] = []
         embedding_state: tuple[str, str | None, str | None] | None = None
         with Session(self._engine) as session:
-            active_index = session.scalar(
-                select(RetrievalIndexRecord).where(RetrievalIndexRecord.state == "active")
+            active_index = self._scalar_with_deadline(
+                session,
+                select(RetrievalIndexRecord).where(
+                    RetrievalIndexRecord.state == "active"
+                ),
+                deadline,
             )
             active_index_id = (
                 active_index.id
@@ -858,11 +1071,13 @@ class AcceptedKnowledgeRetrieval:
                 active_index_id,
                 query_text,
                 query.filters,
+                deadline,
             )
             lexical_story_ids = self._matching_lexical_story_ids(
                 session,
                 query_text,
                 query.filters,
+                deadline,
             )
             semantic: tuple[_RetrievalCandidate, ...] = ()
             semantic_index_ready = (
@@ -874,17 +1089,25 @@ class AcceptedKnowledgeRetrieval:
             )
             if semantic_index_ready and self._embedding is not None and query.text.strip():
                 try:
+                    self._check_deadline(deadline)
                     query_vector = _normalized_embedding(
-                        self._embedding.embed_query(query.text),
+                        self._embedding.embed_query(
+                            query.text,
+                            timeout_seconds=self._remaining_seconds(deadline),
+                        ),
                         self._profile.embedding.dimensions,
                     )
+                    self._check_deadline(deadline)
                     semantic = self._semantic_candidates(
                         session,
                         active_index_id,
                         query_vector,
                         query.filters,
+                        deadline,
                     )
                     embedding_state = ("ready", None, None)
+                except AcceptedKnowledgeDeadlineExceeded:
+                    raise
                 except Exception:  # noqa: BLE001 - fallback remains an available product path.
                     faults.append(RetrievalFault("embedding", "embedding-unavailable"))
                     embedding_state = (
@@ -917,13 +1140,18 @@ class AcceptedKnowledgeRetrieval:
                     active_index_id,
                     query.text,
                     query.filters,
+                    deadline,
                 )
                 if active_index_id is not None and query.text.strip()
                 else ()
             )
             if not query.text.strip():
-                lexical = self._catalog_candidates(session, query.filters)
-                lexical_story_ids = self._catalog_story_ids(session, query.filters)
+                lexical = self._catalog_candidates(session, query.filters, deadline)
+                lexical_story_ids = self._catalog_story_ids(
+                    session,
+                    query.filters,
+                    deadline,
+                )
 
         rankings = {
             "lexical": lexical,
@@ -944,10 +1172,13 @@ class AcceptedKnowledgeRetrieval:
         reranker_state: tuple[str, str | None, str | None] | None = None
         if rerank_candidates and self._reranker is not None and query.text.strip():
             try:
+                self._check_deadline(deadline)
                 scores = self._reranker.rerank(
                     query.text,
                     tuple(candidate.reranker_text for candidate in rerank_candidates),
+                    timeout_seconds=self._remaining_seconds(deadline),
                 )
+                self._check_deadline(deadline)
                 if len(scores) != len(rerank_candidates) or any(
                     not math.isfinite(score) for score in scores
                 ):
@@ -972,6 +1203,8 @@ class AcceptedKnowledgeRetrieval:
                 )
                 final_scores = scores_by_id
                 reranker_state = ("ready", None, None)
+            except AcceptedKnowledgeDeadlineExceeded:
+                raise
             except Exception:  # noqa: BLE001 - deterministic Fusion order is the contract.
                 faults.append(RetrievalFault("reranker", "reranker-failed"))
                 reranker_state = (
@@ -998,6 +1231,7 @@ class AcceptedKnowledgeRetrieval:
                 artifact_sha256=self._profile.embedding.artifact_sha256,
                 fault_code=fault_code,
                 fault_detail=fault_detail,
+                deadline=deadline,
             )
         if reranker_state is not None:
             state, fault_code, fault_detail = reranker_state
@@ -1010,8 +1244,10 @@ class AcceptedKnowledgeRetrieval:
                 artifact_sha256=self._profile.reranker.artifact_sha256,
                 fault_code=fault_code,
                 fault_detail=fault_detail,
+                deadline=deadline,
             )
 
+        self._check_deadline(deadline)
         trace = RetrievalTrace(
             lexical=_stage_candidates("lexical", lexical),
             semantic=_stage_candidates("semantic", semantic),
@@ -1039,6 +1275,69 @@ class AcceptedKnowledgeRetrieval:
             trace=trace,
         )
 
+    def _check_deadline(self, deadline: float | None) -> None:
+        self._remaining_seconds(deadline)
+
+    def _remaining_seconds(self, deadline: float | None) -> float | None:
+        if deadline is None:
+            return None
+        remaining_seconds = deadline - self._timer()
+        if remaining_seconds <= 0:
+            raise AcceptedKnowledgeDeadlineExceeded(
+                "Accepted-knowledge retrieval exceeded its deadline"
+            )
+        return remaining_seconds
+
+    def _set_statement_deadline(
+        self,
+        session: Session,
+        deadline: float | None,
+    ) -> None:
+        if deadline is None:
+            return
+        try:
+            statement_seconds = reserve_database_acquisition_budget(
+                self._engine,
+                self._remaining_seconds(deadline),
+            )
+        except DatabaseAcquisitionDeadlineExceeded as error:
+            raise AcceptedKnowledgeDeadlineExceeded(
+                "Accepted-knowledge retrieval exceeded its deadline"
+            ) from error
+        assert statement_seconds is not None
+        timeout_milliseconds = max(1, math.ceil(statement_seconds * 1000))
+        session.execute(
+            select(
+                func.set_config(
+                    "statement_timeout",
+                    f"{timeout_milliseconds}ms",
+                    True,
+                )
+            )
+        )
+
+    def _execute_with_deadline(
+        self,
+        session: Session,
+        statement: Any,
+        deadline: float | None,
+    ) -> Any:
+        self._set_statement_deadline(session, deadline)
+        rows = session.execute(statement)
+        self._check_deadline(deadline)
+        return rows
+
+    def _scalar_with_deadline(
+        self,
+        session: Session,
+        statement: Any,
+        deadline: float | None,
+    ) -> Any:
+        self._set_statement_deadline(session, deadline)
+        value = session.scalar(statement)
+        self._check_deadline(deadline)
+        return value
+
     def _record_runtime_state(
         self,
         *,
@@ -1050,6 +1349,7 @@ class AcceptedKnowledgeRetrieval:
         artifact_sha256: str,
         fault_code: str | None,
         fault_detail: str | None,
+        deadline: float | None,
     ) -> None:
         values = {
             "stage": stage,
@@ -1064,13 +1364,15 @@ class AcceptedKnowledgeRetrieval:
         }
         try:
             with Session(self._engine) as session, session.begin():
-                session.execute(
+                self._execute_with_deadline(
+                    session,
                     insert(RetrievalRuntimeStateRecord)
                     .values(**values)
                     .on_conflict_do_update(
                         index_elements=[RetrievalRuntimeStateRecord.stage],
                         set_={key: value for key, value in values.items() if key != "stage"},
-                    )
+                    ),
+                    deadline,
                 )
         except Exception:  # noqa: BLE001 - telemetry cannot take Retrieval offline.
             return
@@ -1081,6 +1383,7 @@ class AcceptedKnowledgeRetrieval:
         index_id: UUID | None,
         query_text: str,
         filters: RetrievalFilters,
+        deadline: float | None,
     ) -> tuple[_RetrievalCandidate, ...]:
         if not query_text:
             return ()
@@ -1090,6 +1393,7 @@ class AcceptedKnowledgeRetrieval:
                 index_id,
                 query_text,
                 filters,
+                deadline,
             )
             if index_id is not None
             else ()
@@ -1144,7 +1448,9 @@ class AcceptedKnowledgeRetrieval:
             primary_document=primary_document,
             primary_candidate=primary_candidate,
         )
-        accepted_projection = _unique_candidates(session.execute(statement))
+        accepted_projection = _unique_candidates(
+            self._execute_with_deadline(session, statement, deadline)
+        )
         return _merge_lexical_candidates(
             indexed,
             accepted_projection,
@@ -1157,6 +1463,7 @@ class AcceptedKnowledgeRetrieval:
         index_id: UUID,
         query_text: str,
         filters: RetrievalFilters,
+        deadline: float | None,
     ) -> tuple[_RetrievalCandidate, ...]:
         primary_document = aliased(DocumentVersionRecord)
         primary_candidate = aliased(CandidateRecord)
@@ -1204,13 +1511,16 @@ class AcceptedKnowledgeRetrieval:
             evidence_order=(score.desc(), RetrievalChunkRecord.id),
             limit=self._profile.retrieval.lexical_candidates,
         )
-        return _unique_candidates(session.execute(statement))
+        return _unique_candidates(
+            self._execute_with_deadline(session, statement, deadline)
+        )
 
     def _matching_lexical_story_ids(
         self,
         session: Session,
         query_text: str,
         filters: RetrievalFilters,
+        deadline: float | None,
     ) -> tuple[UUID, ...]:
         if not query_text:
             return ()
@@ -1254,7 +1564,10 @@ class AcceptedKnowledgeRetrieval:
             primary_document=primary_document,
             primary_candidate=primary_candidate,
         )
-        return tuple(row.story_id for row in session.execute(statement))
+        return tuple(
+            row.story_id
+            for row in self._execute_with_deadline(session, statement, deadline)
+        )
 
     def _semantic_candidates(
         self,
@@ -1262,6 +1575,7 @@ class AcceptedKnowledgeRetrieval:
         index_id: UUID,
         query_vector: tuple[float, ...],
         filters: RetrievalFilters,
+        deadline: float | None,
     ) -> tuple[_RetrievalCandidate, ...]:
         primary_document = aliased(DocumentVersionRecord)
         primary_candidate = aliased(CandidateRecord)
@@ -1309,7 +1623,9 @@ class AcceptedKnowledgeRetrieval:
             evidence_order=(distance, RetrievalChunkRecord.id),
             limit=self._profile.retrieval.semantic_candidates,
         )
-        return _unique_candidates(session.execute(statement))
+        return _unique_candidates(
+            self._execute_with_deadline(session, statement, deadline)
+        )
 
     def _entity_candidates(
         self,
@@ -1317,6 +1633,7 @@ class AcceptedKnowledgeRetrieval:
         index_id: UUID,
         query_text: str,
         filters: RetrievalFilters,
+        deadline: float | None,
     ) -> tuple[_RetrievalCandidate, ...]:
         query_entities = tuple(
             normalized_name for _, normalized_name in _technical_entities(query_text)
@@ -1376,12 +1693,15 @@ class AcceptedKnowledgeRetrieval:
             ),
             limit=self._profile.retrieval.entity_candidates,
         )
-        return _unique_candidates(session.execute(statement))
+        return _unique_candidates(
+            self._execute_with_deadline(session, statement, deadline)
+        )
 
     def _catalog_candidates(
         self,
         session: Session,
         filters: RetrievalFilters,
+        deadline: float | None,
     ) -> tuple[_RetrievalCandidate, ...]:
         primary_document = aliased(DocumentVersionRecord)
         primary_candidate = aliased(CandidateRecord)
@@ -1418,12 +1738,15 @@ class AcceptedKnowledgeRetrieval:
             primary_document=primary_document,
             primary_candidate=primary_candidate,
         )
-        return _unique_candidates(session.execute(statement))
+        return _unique_candidates(
+            self._execute_with_deadline(session, statement, deadline)
+        )
 
     def _catalog_story_ids(
         self,
         session: Session,
         filters: RetrievalFilters,
+        deadline: float | None,
     ) -> tuple[UUID, ...]:
         primary_document = aliased(DocumentVersionRecord)
         primary_candidate = aliased(CandidateRecord)
@@ -1453,7 +1776,10 @@ class AcceptedKnowledgeRetrieval:
             primary_document=primary_document,
             primary_candidate=primary_candidate,
         )
-        return tuple(row.story_id for row in session.execute(statement))
+        return tuple(
+            row.story_id
+            for row in self._execute_with_deadline(session, statement, deadline)
+        )
 
 
 def retrieval_health_snapshot(engine: Engine) -> RetrievalHealthSnapshot:
@@ -1628,6 +1954,62 @@ def _apply_filters(
         statement = statement.where(StoryRecord.occurred_at >= filters.occurred_from)
     if filters.occurred_to is not None:
         statement = statement.where(StoryRecord.occurred_at < filters.occurred_to)
+    if filters.time_semantics:
+        source_publication_at = (
+            select(DocumentVersionRecord.published_at)
+            .where(DocumentVersionRecord.id == EvidenceSpanRecord.document_version_id)
+            .correlate(EvidenceSpanRecord)
+            .scalar_subquery()
+        )
+        discovery_at = (
+            select(CandidateRecord.discovered_at)
+            .select_from(DocumentVersionRecord)
+            .join(CandidateRecord, CandidateRecord.id == DocumentVersionRecord.candidate_id)
+            .where(DocumentVersionRecord.id == EvidenceSpanRecord.document_version_id)
+            .correlate(EvidenceSpanRecord)
+            .scalar_subquery()
+        )
+        editorial_at = (
+            select(func.max(AuditEventRecord.occurred_at))
+            .where(
+                AuditEventRecord.subject_type == AuditSubjectType.STORY.value,
+                AuditEventRecord.subject_id == StoryRecord.id,
+                AuditEventRecord.action == AuditAction.STORY_ACCEPTED.value,
+            )
+            .correlate(StoryRecord)
+            .scalar_subquery()
+        )
+        digest_publication_at = (
+            select(func.max(DigestRecord.published_at))
+            .select_from(DigestStoryRecord)
+            .join(DigestRecord, DigestRecord.id == DigestStoryRecord.digest_id)
+            .where(
+                DigestStoryRecord.story_id == StoryRecord.id,
+                DigestRecord.state == DigestState.PUBLISHED.value,
+                DigestRecord.published_at.is_not(None),
+            )
+            .correlate(StoryRecord)
+            .scalar_subquery()
+        )
+        timestamps = {
+            "event": StoryRecord.occurred_at,
+            "source-publication": source_publication_at,
+            "discovery": discovery_at,
+            "editorial": editorial_at,
+            "digest-publication": digest_publication_at,
+        }
+        time_conditions = []
+        for semantic in filters.time_semantics:
+            timestamp = timestamps[semantic]
+            bounds = []
+            if filters.time_from is not None:
+                bounds.append(timestamp >= filters.time_from)
+            if filters.time_to is not None:
+                bounds.append(timestamp < filters.time_to)
+            if bounds:
+                time_conditions.append(and_(*bounds))
+        if time_conditions:
+            statement = statement.where(or_(*time_conditions))
     return statement
 
 
