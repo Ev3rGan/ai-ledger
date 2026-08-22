@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
 import re
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
@@ -74,6 +75,8 @@ FORBIDDEN_REASONING = re.compile(
 ANSWER_DELTA_CHARACTERS = 12
 APPROVED_RESEARCH_ROUTE = "deepseek:v4-pro"
 ACCEPTED_PUBLISHED_SCOPE = "accepted-published-knowledge"
+_DIAGNOSTIC_CAPTURE_TAG = "[DEBUG-M5-G-CAPTURE]"
+_LOGGER = logging.getLogger(__name__)
 YEAR_RANGE = re.compile(
     r"(?<!\d)(20\d{2})\s*(?:年)?\s*(?:-|–|—|至|到)\s*(20\d{2})\s*年?"
 )
@@ -116,6 +119,18 @@ class ResearchTaskType(StrEnum):
     COMPARISON = "comparison"
     TIMELINE = "timeline"
     MULTI_HOP = "multi-hop"
+
+
+class _TimelineDiagnosticFailureCode(StrEnum):
+    INVALID_JSON = "invalid-json"
+    OUTPUT_SCHEMA_SHAPE = "output-schema-shape"
+    ANSWER_SUPPORT_MISMATCH = "answer-support-mismatch"
+    REQUIREMENT_UNCOVERED = "requirement-uncovered"
+    REQUIREMENT_OMITTED = "requirement-omitted"
+    CITATION_INVALID = "citation-invalid"
+    CITATION_OUTSIDE_SET = "citation-outside-set"
+    DIMENSION_TIME_MISMATCH = "dimension-time-mismatch"
+    OTHER_VALIDATION = "other-validation"
 
 
 class ResearchTimeSemantic(StrEnum):
@@ -309,6 +324,153 @@ class ResearchAnswer:
     text: str
     citations: tuple[ResearchEvidence, ...]
     statements: tuple[ResearchSupportedStatement, ...]
+
+
+class _ProviderOutputValidationError(ResearchError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure_code: _TimelineDiagnosticFailureCode,
+        validation_stage: str,
+    ) -> None:
+        super().__init__(message)
+        self.failure_code = failure_code
+        self.validation_stage = validation_stage
+
+
+_DIAGNOSTIC_FAILURE_BY_MESSAGE = {
+    "Provider output is not valid JSON": _TimelineDiagnosticFailureCode.INVALID_JSON,
+    "Provider output keys do not match the Research contract": (
+        _TimelineDiagnosticFailureCode.OUTPUT_SCHEMA_SHAPE
+    ),
+    "Provider abstention shape is invalid": (
+        _TimelineDiagnosticFailureCode.OUTPUT_SCHEMA_SHAPE
+    ),
+    "Provider support item shape is invalid": (
+        _TimelineDiagnosticFailureCode.OUTPUT_SCHEMA_SHAPE
+    ),
+    "Provider answer content is invalid": (
+        _TimelineDiagnosticFailureCode.ANSWER_SUPPORT_MISMATCH
+    ),
+    "Provider answer must map every statement to Evidence": (
+        _TimelineDiagnosticFailureCode.ANSWER_SUPPORT_MISMATCH
+    ),
+    "Provider answer does not match its supported statements": (
+        _TimelineDiagnosticFailureCode.ANSWER_SUPPORT_MISMATCH
+    ),
+    "Provider support requirement identities are invalid": (
+        _TimelineDiagnosticFailureCode.REQUIREMENT_UNCOVERED
+    ),
+    "Provider support does not cover its retrieval requirement": (
+        _TimelineDiagnosticFailureCode.REQUIREMENT_UNCOVERED
+    ),
+    "Provider answer omitted a required evidence step": (
+        _TimelineDiagnosticFailureCode.REQUIREMENT_OMITTED
+    ),
+    "Provider answer must cite retrieved Evidence": (
+        _TimelineDiagnosticFailureCode.CITATION_INVALID
+    ),
+    "Every material statement must cite Evidence": (
+        _TimelineDiagnosticFailureCode.CITATION_INVALID
+    ),
+    "Provider citations must be a list": _TimelineDiagnosticFailureCode.CITATION_INVALID,
+    "Provider citation shape is invalid": _TimelineDiagnosticFailureCode.CITATION_INVALID,
+    "Provider citation identity is invalid": _TimelineDiagnosticFailureCode.CITATION_INVALID,
+    "Provider citation is outside the retrieved Evidence Set": (
+        _TimelineDiagnosticFailureCode.CITATION_OUTSIDE_SET
+    ),
+    "Comparison support crossed an entity-dimension requirement": (
+        _TimelineDiagnosticFailureCode.DIMENSION_TIME_MISMATCH
+    ),
+    "Comparison support cited Evidence from another entity-dimension requirement": (
+        _TimelineDiagnosticFailureCode.DIMENSION_TIME_MISMATCH
+    ),
+    "Comparison output lost a requested dimension": (
+        _TimelineDiagnosticFailureCode.DIMENSION_TIME_MISMATCH
+    ),
+    "Comparison output mixed in a timeline semantic": (
+        _TimelineDiagnosticFailureCode.DIMENSION_TIME_MISMATCH
+    ),
+    "Non-comparison output returned a comparison dimension": (
+        _TimelineDiagnosticFailureCode.DIMENSION_TIME_MISMATCH
+    ),
+    "Timeline output conflated or invented a time semantic": (
+        _TimelineDiagnosticFailureCode.DIMENSION_TIME_MISMATCH
+    ),
+    "Timeline output ignored the requested time semantic": (
+        _TimelineDiagnosticFailureCode.DIMENSION_TIME_MISMATCH
+    ),
+    "Non-timeline output returned a timeline semantic": (
+        _TimelineDiagnosticFailureCode.DIMENSION_TIME_MISMATCH
+    ),
+    "Comparison output omitted a requested dimension": (
+        _TimelineDiagnosticFailureCode.DIMENSION_TIME_MISMATCH
+    ),
+}
+
+_DIAGNOSTIC_STAGE_BY_FAILURE_CODE = {
+    _TimelineDiagnosticFailureCode.INVALID_JSON: "json-parse",
+    _TimelineDiagnosticFailureCode.OUTPUT_SCHEMA_SHAPE: "output-schema",
+    _TimelineDiagnosticFailureCode.ANSWER_SUPPORT_MISMATCH: "answer-support-validation",
+    _TimelineDiagnosticFailureCode.REQUIREMENT_UNCOVERED: "requirement-validation",
+    _TimelineDiagnosticFailureCode.REQUIREMENT_OMITTED: "requirement-validation",
+    _TimelineDiagnosticFailureCode.CITATION_INVALID: "citation-validation",
+    _TimelineDiagnosticFailureCode.CITATION_OUTSIDE_SET: "citation-validation",
+    _TimelineDiagnosticFailureCode.DIMENSION_TIME_MISMATCH: "dimension-time-validation",
+    _TimelineDiagnosticFailureCode.OTHER_VALIDATION: "other-validation",
+}
+
+
+def _provider_output_validation_error(error: ResearchError) -> _ProviderOutputValidationError:
+    failure_code = _DIAGNOSTIC_FAILURE_BY_MESSAGE.get(
+        str(error),
+        _TimelineDiagnosticFailureCode.OTHER_VALIDATION,
+    )
+    return _ProviderOutputValidationError(
+        str(error),
+        failure_code=failure_code,
+        validation_stage=_DIAGNOSTIC_STAGE_BY_FAILURE_CODE[failure_code],
+    )
+
+
+def _emit_timeline_validation_diagnostic(
+    error: _ProviderOutputValidationError,
+    *,
+    evidence_set: ResearchEvidenceSet,
+) -> None:
+    story_by_evidence_key = {
+        item.citation_key: item.story_id for item in evidence_set.evidence
+    }
+    requirement_story_sets = tuple(
+        {
+            story_by_evidence_key[key]
+            for key in requirement.evidence_keys
+            if key in story_by_evidence_key
+        }
+        for requirement in evidence_set.requirements
+    )
+    intersection = set(requirement_story_sets[0]) if requirement_story_sets else set()
+    for story_ids in requirement_story_sets[1:]:
+        intersection.intersection_update(story_ids)
+    payload = {
+        "evidence_count": len(evidence_set.evidence),
+        "failure_code": error.failure_code.value,
+        "per_requirement_story_counts": [
+            len(story_ids) for story_ids in requirement_story_sets
+        ],
+        "requirement_count": len(evidence_set.requirements),
+        "requirement_story_intersection_count": len(intersection),
+        "retrieved_distinct_story_count": len(
+            {item.story_id for item in evidence_set.evidence}
+        ),
+        "validation_stage": error.validation_stage,
+    }
+    _LOGGER.warning(
+        "%s %s",
+        _DIAGNOSTIC_CAPTURE_TAG,
+        json.dumps(payload, separators=(",", ":"), sort_keys=True),
+    )
 
 
 def interpret_query_intent(question: str) -> QueryIntent:
@@ -1261,7 +1423,12 @@ def stream_research_events(
         )
         yield "done", {"version": version, "status": "failed"}
         return
-    except Exception:  # noqa: BLE001 - external Provider failures must fail closed.
+    except Exception as error:  # noqa: BLE001 - external Provider failures must fail closed.
+        if (
+            intent.task_type is ResearchTaskType.TIMELINE
+            and isinstance(error, _ProviderOutputValidationError)
+        ):
+            _emit_timeline_validation_diagnostic(error, evidence_set=evidence_set)
         yield (
             "error",
             {
@@ -1493,21 +1660,28 @@ def _validated_provider_answer(
             raise ResearchError("Provider output exceeded its bounded size")
         parts.append(part)
     try:
-        payload = json.loads("".join(parts))
-    except (json.JSONDecodeError, TypeError) as error:
-        raise ResearchError("Provider output is not valid JSON") from error
-    if not isinstance(payload, dict):
-        raise ResearchError("Provider output keys do not match the Research contract")
+        try:
+            payload = json.loads("".join(parts))
+        except (json.JSONDecodeError, TypeError) as error:
+            raise ResearchError("Provider output is not valid JSON") from error
+        if not isinstance(payload, dict):
+            raise ResearchError("Provider output keys do not match the Research contract")
 
-    keys = set(payload)
-    if keys == set(protocol.output_contract["v2_required_keys"]):
-        return _validated_v2_provider_answer(payload, evidence_set, intent, protocol)
-    if (
-        intent.task_type is ResearchTaskType.SIMPLE_LOOKUP
-        and keys == set(protocol.output_contract["legacy_simple_required_keys"])
-    ):
-        return _validated_legacy_simple_answer(payload, evidence_set, protocol)
-    raise ResearchError("Provider output keys do not match the Research contract")
+        keys = set(payload)
+        if keys == set(protocol.output_contract["v2_required_keys"]):
+            return _validated_v2_provider_answer(payload, evidence_set, intent, protocol)
+        if (
+            intent.task_type is ResearchTaskType.SIMPLE_LOOKUP
+            and keys == set(protocol.output_contract["legacy_simple_required_keys"])
+        ):
+            return _validated_legacy_simple_answer(payload, evidence_set, protocol)
+        raise ResearchError("Provider output keys do not match the Research contract")
+    except ResearchBudgetExceeded:
+        raise
+    except ResearchError as error:
+        if intent.task_type is not ResearchTaskType.TIMELINE:
+            raise
+        raise _provider_output_validation_error(error) from error
 
 
 def _validated_legacy_simple_answer(

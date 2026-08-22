@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, datetime
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -430,6 +431,194 @@ class FullySupportedTimelineProvider:
             },
             ensure_ascii=False,
         )
+
+
+class TimelineDiagnosticProvider:
+    def __init__(self, failure: str) -> None:
+        self.failure = failure
+        self.output = ""
+
+    def stream(self, evidence_set: object):
+        if self.failure == "stream-failure":
+            raise RuntimeError("SENSITIVE-PROVIDER-TRANSPORT-FAILURE")
+        if self.failure == "invalid-json":
+            self.output = "SENSITIVE-PROVIDER-RAW{"
+            yield self.output
+            return
+
+        evidence = evidence_set.evidence[0]
+        citation = {
+            "story_id": str(evidence.story_id),
+            "claim_id": str(evidence.claim_id),
+            "evidence_span_id": str(evidence.evidence_span_id),
+        }
+        support = [
+            {
+                "statement": "敏感时间线结论。",
+                "citations": [citation],
+                "requirement_ids": [evidence_set.requirements[0].identifier],
+                "dimension": None,
+                "time_semantic": "fabricated-time",
+            }
+        ]
+        self.output = json.dumps(
+            {
+                "answer": support[0]["statement"],
+                "support": support,
+            },
+            ensure_ascii=False,
+        )
+        yield self.output
+
+
+def _timeline_diagnostic_fixture() -> tuple[
+    str,
+    AcceptedKnowledgeHit,
+    ResearchRepository,
+]:
+    question = "按时间线梳理 Gemini 3.6 Flash 的敏感发布历程"
+    hit = AcceptedKnowledgeHit(
+        story_id=_id("sensitive-timeline:story"),
+        story_stable_key="https://sensitive.invalid/timeline-story",
+        story_headline="敏感 Timeline Story 标题",
+        claim_id=_id("sensitive-timeline:claim"),
+        claim_text="敏感 Timeline Claim 文本",
+        evidence_span_id=_id("sensitive-timeline:evidence"),
+        exact_text="敏感 Timeline Evidence 文本",
+        chunk_id=None,
+    )
+    repository = ResearchRepository(
+        retrieval=FixtureAcceptedKnowledge({"Gemini 3.6 Flash": hit}),
+        metadata_loader=FixtureEvidenceMetadata(
+            {
+                hit.evidence_span_id: ResearchEvidenceMetadata(
+                    evidence_role=EvidenceRole.PRIMARY,
+                    evidence_relation=EvidenceRelation.SUPPORTS,
+                    evidence_publisher="Sensitive Publisher",
+                    times=ResearchEvidenceTimes(
+                        event=datetime(2025, 1, 10, 8, tzinfo=UTC),
+                    ),
+                )
+            }
+        ),
+    )
+    return question, hit, repository
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code", "expected_stage"),
+    (
+        ("invalid-json", "invalid-json", "json-parse"),
+        (
+            "time-mismatch",
+            "dimension-time-mismatch",
+            "dimension-time-validation",
+        ),
+    ),
+)
+def test_timeline_provider_validation_diagnostic_is_sanitized_and_publicly_unchanged(
+    caplog: pytest.LogCaptureFixture,
+    failure: str,
+    expected_code: str,
+    expected_stage: str,
+) -> None:
+    question, hit, repository = _timeline_diagnostic_fixture()
+    provider = TimelineDiagnosticProvider(failure)
+
+    with caplog.at_level(logging.WARNING, logger="ai_intel_agent.research"):
+        events = list(
+            stream_research_events(
+                question,
+                repository=repository,
+                provider=provider,
+            )
+        )
+
+    assert [event for event, _ in events] == [
+        "status",
+        "status",
+        "status",
+        "error",
+        "done",
+    ]
+    assert events[-2:] == [
+        (
+            "error",
+            {
+                "version": "research-sse-2026-08-15.v1",
+                "code": "provider-failed",
+                "message": "Research Provider 输出未通过验证。",
+            },
+        ),
+        (
+            "done",
+            {
+                "version": "research-sse-2026-08-15.v1",
+                "status": "failed",
+            },
+        ),
+    ]
+    public_events = json.dumps(events, ensure_ascii=False)
+    assert "[DEBUG-M5-G-CAPTURE]" not in public_events
+    assert "failure_code" not in public_events
+    assert "validation_stage" not in public_events
+
+    records = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("[DEBUG-M5-G-CAPTURE] ")
+    ]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    diagnostic = json.loads(
+        records[0].getMessage().removeprefix("[DEBUG-M5-G-CAPTURE] ")
+    )
+    assert diagnostic == {
+        "evidence_count": 1,
+        "failure_code": expected_code,
+        "per_requirement_story_counts": [1],
+        "requirement_count": 1,
+        "requirement_story_intersection_count": 1,
+        "retrieved_distinct_story_count": 1,
+        "validation_stage": expected_stage,
+    }
+    captured = records[0].getMessage()
+    sensitive_values = (
+        question,
+        provider.output,
+        hit.story_stable_key,
+        hit.story_headline,
+        hit.claim_text,
+        hit.exact_text,
+        str(hit.story_id),
+        str(hit.claim_id),
+        str(hit.evidence_span_id),
+        "敏感时间线结论。",
+    )
+    assert all(value not in captured for value in sensitive_values)
+
+
+def test_timeline_diagnostic_does_not_log_provider_stream_failures(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    question, _, repository = _timeline_diagnostic_fixture()
+
+    with caplog.at_level(logging.WARNING, logger="ai_intel_agent.research"):
+        events = list(
+            stream_research_events(
+                question,
+                repository=repository,
+                provider=TimelineDiagnosticProvider("stream-failure"),
+            )
+        )
+
+    assert events[-2][1]["code"] == "provider-failed"
+    assert events[-1][1]["status"] == "failed"
+    assert not [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("[DEBUG-M5-G-CAPTURE] ")
+    ]
 
 
 def test_timeline_output_labels_each_time_semantic_without_conflation() -> None:
