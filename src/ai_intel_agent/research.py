@@ -104,6 +104,15 @@ MULTI_HOP_MARKER = re.compile(
     re.IGNORECASE,
 )
 ENTITY_STOPWORDS = frozenset({"AI", "Research", "Timeline"})
+ENTITY_SCOPED_COMPARISON_DIMENSIONS = frozenset(
+    {
+        "主要差异",
+        "产品形态",
+        "开发工具产品形态",
+        "公开进展",
+        "具体进展",
+    }
+)
 
 
 class ResearchError(ValueError):
@@ -1839,7 +1848,7 @@ def _hit_matches_retrieval_requirement(
         return True
     if spec.entity is None or spec.entity.casefold() not in searchable:
         return False
-    if spec.dimension in {None, "主要差异"}:
+    if spec.dimension is None or spec.dimension in ENTITY_SCOPED_COMPARISON_DIMENSIONS:
         return True
     terms = _semantic_match_terms(spec.dimension)
     minimum_matches = max(1, ceil(len(terms) / 2))

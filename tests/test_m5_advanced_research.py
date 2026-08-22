@@ -418,6 +418,56 @@ def test_comparison_isolates_each_entity_dimension_requirement_before_provider()
     assert events[-1][1]["status"] == "answered"
 
 
+def test_comparison_accepts_entity_specific_evidence_for_generic_product_dimension() -> None:
+    cursor_origin = _hit(
+        "cursor-origin-platform",
+        claim_text="Cursor 推出 Origin 代码托管平台。",
+    )
+    claude_design = _hit(
+        "claude-code-design-command",
+        claim_text="Claude Code 推出 /design 命令。",
+    )
+    unrelated = _hit(
+        "robotics-world-model",
+        claim_text="机器人世界模型发布了新版本。",
+    )
+
+    class BroadAcceptedKnowledge:
+        def retrieve(self, query: RetrievalQuery) -> AcceptedKnowledgeResult:
+            return _result(query, cursor_origin, claude_design, unrelated)
+
+    evidence_set = ResearchRepository(
+        retrieval=BroadAcceptedKnowledge(),
+        metadata_loader=FixtureEvidenceMetadata({}),
+    ).retrieve_intent(
+        interpret_query_intent(
+            "比较 Cursor 和 Claude Code 在开发工具产品形态方面已公开的具体进展。"
+        )
+    )
+
+    assert evidence_set.missing_requirement_ids == ()
+    assert [requirement.evidence_keys for requirement in evidence_set.requirements] == [
+        (
+            (
+                cursor_origin.story_id,
+                cursor_origin.claim_id,
+                cursor_origin.evidence_span_id,
+            ),
+        ),
+        (
+            (
+                claude_design.story_id,
+                claude_design.claim_id,
+                claude_design.evidence_span_id,
+            ),
+        ),
+    ]
+    assert {item.story_id for item in evidence_set.evidence} == {
+        cursor_origin.story_id,
+        claude_design.story_id,
+    }
+
+
 def test_timeline_evidence_set_keeps_five_distinct_time_semantics() -> None:
     gemini = _hit("gemini", claim_text="Gemini 3.6 Flash 已正式发布。")
     times = ResearchEvidenceTimes(
