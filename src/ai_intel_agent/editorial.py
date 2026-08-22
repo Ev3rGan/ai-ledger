@@ -474,12 +474,7 @@ class DigestPlan:
 
     @property
     def included_stories(self) -> tuple[DigestPlanStory, ...]:
-        return tuple(
-            sorted(
-                (item for item in self.stories if item.inclusion is DigestPlanInclusion.INCLUDED),
-                key=lambda item: item.order if item.order is not None else -1,
-            )
-        )
+        return _included_stories_in_plan_order(self.stories)
 
     @property
     def excluded_stories(self) -> tuple[DigestPlanStory, ...]:
@@ -557,6 +552,40 @@ def _normalize_editorial_window_proposals(
     return normalized
 
 
+def _included_stories_in_plan_order(
+    stories: tuple[DigestPlanStory, ...],
+) -> tuple[DigestPlanStory, ...]:
+    return tuple(
+        sorted(
+            (story for story in stories if story.inclusion is DigestPlanInclusion.INCLUDED),
+            key=lambda story: story.order if story.order is not None else -1,
+        )
+    )
+
+
+_DIGEST_SUMMARY_HEADLINE_LIMIT = 120
+
+
+def _digest_summary_from_included_stories(
+    included: tuple[DigestPlanStory, ...],
+) -> str:
+    if not included:
+        return "本期 Digest 未收录符合当前 Editorial Window 与审核条件的 Story。"
+    headlines = "；".join(
+        (
+            headline
+            if len(headline) <= _DIGEST_SUMMARY_HEADLINE_LIMIT
+            else f"{headline[: _DIGEST_SUMMARY_HEADLINE_LIMIT - 1].rstrip()}…"
+        )
+        for story in included
+        if (headline := story.headline.strip())
+    )
+    return (
+        f"本期 Digest 收录 {len(included)} 条 AI 进展，按计划顺序包括："
+        f"{headlines}。"
+    )
+
+
 def prepare_digest_plan(
     context: EditorialContext,
     provider: EditorialPlanProvider,
@@ -612,20 +641,14 @@ def prepare_digest_plan(
             )
         )
     planned_stories = tuple(planned_story_list)
-    digest_summary = proposal.digest_summary.strip()
+    included_stories = _included_stories_in_plan_order(planned_stories)
+    digest_summary = _digest_summary_from_included_stories(included_stories)
     source_coverage = _ordered_unique(
-        item.publisher
-        for item in sorted(
-            (story for story in planned_stories if story.inclusion is DigestPlanInclusion.INCLUDED),
-            key=lambda story: story.order if story.order is not None else -1,
-        )
+        item.publisher for item in included_stories
     )
     topic_coverage = _ordered_unique(
         topic
-        for item in sorted(
-            (story for story in planned_stories if story.inclusion is DigestPlanInclusion.INCLUDED),
-            key=lambda story: story.order if story.order is not None else -1,
-        )
+        for item in included_stories
         for topic in (item.primary_topic, *item.secondary_topics)
     )
     anomalies = _digest_plan_anomalies(

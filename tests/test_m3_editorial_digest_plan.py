@@ -752,6 +752,14 @@ def test_editorial_window_normalization_holds_future_without_upgrading_provider_
     )
     assert tuple(story.stable_key for story in plan.included_stories) == expected_included_order
     assert tuple(story.order for story in plan.included_stories) == tuple(range(8))
+    assert plan.digest_summary == (
+        "本期 Digest 收录 8 条 AI 进展，按计划顺序包括："
+        "QbitAI AI development 7；QbitAI AI development 3；"
+        "Hugging Face AI development 10；Gemini AI development 4；"
+        "TechCrunch AI development 9；TechCrunch AI development 5；"
+        "Gemini AI development 8；Hugging Face AI development 6。"
+    )
+    assert stories_by_key["story:0"].headline not in plan.digest_summary
     future_anomalies = tuple(
         anomaly for anomaly in plan.anomalies if anomaly.code == "future-material"
     )
@@ -762,6 +770,47 @@ def test_editorial_window_normalization_holds_future_without_upgrading_provider_
         anomaly.code == "stale-material" and anomaly.story_stable_key == "story:0"
         for anomaly in plan.anomalies
     )
+    assert not any(anomaly.blocking for anomaly in plan.anomalies)
+
+
+def test_digest_summary_stays_approvable_with_long_included_headlines() -> None:
+    source_ids = tuple(_id(f"summary-bound-source:{position}") for position in range(4))
+    publishers = ("Gemini", "TechCrunch", "Hugging Face", "QbitAI")
+    stories = tuple(
+        replace(
+            _story(
+                position,
+                publisher=publishers[position % len(publishers)],
+                source_id=source_ids[position % len(source_ids)],
+            ),
+            headline=f"story-{position}-" + ("x" * 490),
+        )
+        for position in range(8)
+    )
+    context = _editorial_context_for(stories)
+    provider = _StaticEditorialProvider(
+        tuple(
+            _editorial_story_proposal(
+                story,
+                inclusion=DigestPlanInclusion.INCLUDED,
+                order=position,
+                exclusion_reason=None,
+            )
+            for position, story in enumerate(stories)
+        )
+    )
+
+    plan = prepare_digest_plan(
+        context,
+        provider,
+        version=1,
+        prepared_at=datetime(2026, 8, 20, 16, tzinfo=UTC),
+    )
+
+    assert len(plan.digest_summary) <= 2000
+    assert "story-0-" + ("x" * 110) in plan.digest_summary
+    assert "story-7-" + ("x" * 110) in plan.digest_summary
+    assert stories[0].headline not in plan.digest_summary
     assert not any(anomaly.blocking for anomaly in plan.anomalies)
 
 
@@ -1827,7 +1876,7 @@ def test_0009_to_0010_upgrade_preserves_predecessor_state_and_runs_cli_seam(
                     )
                     == "succeeded"
                 )
-                assert session.scalar(text("SELECT version_num FROM alembic_version")) == "0011"
+                assert session.scalar(text("SELECT version_num FROM alembic_version")) == "0012"
                 assert (
                     session.scalar(
                         text(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
 import re
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
@@ -57,6 +58,8 @@ from ai_intel_agent.persistence import (
     StoryRecord,
     reserve_database_acquisition_budget,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 CHINESE_CHARACTER = re.compile(r"[\u3400-\u9fff]")
 FORBIDDEN_ANSWER_URL = re.compile(
@@ -1282,7 +1285,14 @@ def stream_research_events(
         )
         yield "done", {"version": version, "status": "failed"}
         return
-    except Exception:  # noqa: BLE001 - external Provider failures must fail closed.
+    except Exception as error:  # noqa: BLE001 - external failures must fail closed.
+        if isinstance(error, ResearchError):
+            LOGGER.warning("Research Provider rejected: %s", error)
+        else:
+            LOGGER.warning(
+                "Research Provider failed with unexpected error type: %s",
+                type(error).__name__,
+            )
         yield (
             "error",
             {
@@ -1808,7 +1818,14 @@ def _query_intent_payload(intent: QueryIntent) -> dict[str, object]:
                 else None
             ),
         },
-        "time_semantic": intent.time_semantic.value,
+        "retrieval_time_semantics": list(
+            _retrieval_time_semantics(intent.time_semantic)
+        ),
+        "answer_time_semantic": (
+            intent.time_semantic.value
+            if intent.task_type is ResearchTaskType.TIMELINE
+            else None
+        ),
         "scope": intent.scope,
         "dimensions": list(intent.dimensions),
         "budget": {
