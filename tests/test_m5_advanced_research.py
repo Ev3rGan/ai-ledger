@@ -7,6 +7,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 import httpx
 import pytest
 
+import ai_intel_agent.research as research_module
 from ai_intel_agent.accepted_knowledge import (
     AcceptedKnowledgeHit,
     AcceptedKnowledgeResult,
@@ -18,6 +19,7 @@ from ai_intel_agent.domain import EvidenceRelation, EvidenceRole
 from ai_intel_agent.research import (
     DeepSeekResearchProvider,
     ResearchBudgetExceeded,
+    ResearchError,
     ResearchEvidence,
     ResearchEvidenceMetadata,
     ResearchEvidenceSet,
@@ -787,6 +789,86 @@ class FullySupportedComparisonProvider:
             },
             ensure_ascii=False,
         )
+
+
+class RecordingAllowance:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def reserve(self, anonymous_client_id: str) -> bool:
+        self.calls.append(anonymous_client_id)
+        return True
+
+
+def test_comparison_refuses_single_story_evidence_before_allowance_and_provider() -> None:
+    shared_story_id = _id("cursor-github-comparison:story")
+    cursor = AcceptedKnowledgeHit(
+        story_id=shared_story_id,
+        story_stable_key="m5:cursor-github-comparison",
+        story_headline="Cursor 与 GitHub 的代码托管定位",
+        claim_id=_id("cursor-positioning:claim"),
+        claim_text="Cursor 的代码托管定位有公开支持。",
+        evidence_span_id=_id("cursor-positioning:evidence"),
+        exact_text="Evidence for Cursor positioning.",
+        chunk_id=None,
+    )
+    github = AcceptedKnowledgeHit(
+        story_id=shared_story_id,
+        story_stable_key="m5:cursor-github-comparison",
+        story_headline="Cursor 与 GitHub 的代码托管定位",
+        claim_id=_id("github-positioning:claim"),
+        claim_text="GitHub 的代码托管定位有公开支持。",
+        evidence_span_id=_id("github-positioning:evidence"),
+        exact_text="Evidence for GitHub positioning.",
+        chunk_id=None,
+    )
+    hits = {
+        "Cursor 代码托管定位": cursor,
+        "GitHub 代码托管定位": github,
+    }
+    question = "比较 Cursor 和 GitHub 在代码托管定位方面的差异。"
+    intent = interpret_query_intent(question)
+    repository = ResearchRepository(
+        retrieval=ExactQueryAcceptedKnowledge(hits),
+        metadata_loader=FixtureEvidenceMetadata({}),
+    )
+    evidence_set = repository.retrieve_intent(intent)
+    assert len(evidence_set.evidence) == 2
+    assert {item.story_id for item in evidence_set.evidence} == {shared_story_id}
+
+    with pytest.raises(ResearchError, match="collapsed distinct Stories"):
+        research_module._validated_provider_answer(
+            FullySupportedComparisonProvider(),
+            evidence_set,
+            load_research_protocol(),
+        )
+
+    provider = FullySupportedComparisonProvider()
+    allowance = RecordingAllowance()
+    events = list(
+        stream_research_events(
+            question,
+            repository=repository,
+            provider=provider,
+            allowance=allowance,
+            anonymous_client_id="bounded-client",
+        )
+    )
+
+    assert provider.calls == []
+    assert allowance.calls == []
+    assert events[-2][0] == "refusal"
+    assert events[-2][1]["reason"] == "insufficient-evidence"
+    assert events[-1] == (
+        "done",
+        {"version": "research-sse-2026-08-15.v1", "status": "refused"},
+    )
+    assert {event for event, _ in events}.isdisjoint(
+        {"answer.delta", "citation", "error"}
+    )
+    assert "generating" not in {
+        payload["state"] for event, payload in events if event == "status"
+    }
 
 
 def test_retrieval_fallback_is_explicit_and_keeps_supported_public_citations() -> None:
