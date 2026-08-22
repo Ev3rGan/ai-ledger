@@ -21,6 +21,12 @@ from sqlalchemy.orm import Session
 from typer.testing import CliRunner
 
 import ai_intel_agent.cli as cli_module
+from ai_intel_agent.accepted_knowledge import (
+    AcceptedKnowledgeHit,
+    AcceptedKnowledgeResult,
+    RetrievalQuery,
+    RetrievalTrace,
+)
 from ai_intel_agent.cli import app
 from ai_intel_agent.domain import DigestState, StoryReviewState
 from ai_intel_agent.editorial import DigestPublicationContract
@@ -40,7 +46,9 @@ from ai_intel_agent.research import (
     DeepSeekResearchProvider,
     ResearchEvidence,
     ResearchEvidenceSet,
+    ResearchRepository,
     load_research_protocol,
+    stream_research_events,
 )
 from ai_intel_agent.web import create_app
 
@@ -209,6 +217,233 @@ class FailingResearchProvider:
     def stream(self, evidence_set: object) -> Iterator[str]:
         self.calls += 1
         raise RuntimeError("fixture Provider failure")
+
+
+class StaticAcceptedKnowledge:
+    def __init__(self, hit: AcceptedKnowledgeHit) -> None:
+        self.hit = hit
+
+    def retrieve(self, query: RetrievalQuery) -> AcceptedKnowledgeResult:
+        return AcceptedKnowledgeResult(
+            query=query,
+            hits=(self.hit,),
+            matching_story_ids=(self.hit.story_id,),
+            trace=RetrievalTrace(
+                lexical=(),
+                semantic=(),
+                entity=(),
+                fusion=(),
+                final=(),
+                faults=(),
+            ),
+        )
+
+
+class RecordingResearchAllowance:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def reserve(self, anonymous_client_id: str) -> bool:
+        self.calls.append(anonymous_client_id)
+        return True
+
+
+def _stream_simple_lookup(
+    question: str,
+    *,
+    claim_text: str,
+    exact_text: str,
+    answer: str,
+) -> tuple[
+    list[tuple[str, dict[str, object]]],
+    FakeResearchProvider,
+    RecordingResearchAllowance,
+]:
+    story_id = _id("simple-lookup:story")
+    claim_id = _id("simple-lookup:claim")
+    evidence_id = _id("simple-lookup:evidence")
+    hit = AcceptedKnowledgeHit(
+        story_id=story_id,
+        story_stable_key="gemini-3-7-flash-release",
+        story_headline="Gemini 3.7 Flash 正式发布",
+        claim_id=claim_id,
+        claim_text=claim_text,
+        evidence_span_id=evidence_id,
+        exact_text=exact_text,
+        chunk_id=None,
+    )
+    provider = FakeResearchProvider(
+        {
+            "answer": answer,
+            "citations": [
+                {
+                    "story_id": str(story_id),
+                    "claim_id": str(claim_id),
+                    "evidence_span_id": str(evidence_id),
+                }
+            ],
+        }
+    )
+    allowance = RecordingResearchAllowance()
+    events = list(
+        stream_research_events(
+            question,
+            repository=ResearchRepository(retrieval=StaticAcceptedKnowledge(hit)),
+            provider=provider,
+            allowance=allowance,
+            anonymous_client_id="fixture-client",
+        )
+    )
+    return events, provider, allowance
+
+
+@pytest.mark.parametrize(
+    ("question", "exact_text"),
+    (
+        ("Gemini 3.7 Flash 的价格是多少？", "Gemini 3.7 Flash is available."),
+        ("Gemini 3.7 Flash 售价多少？", "Gemini 3.7 Flash is available."),
+        ("What does Gemini 3.7 Flash cost?", "Gemini 3.7 Flash is available."),
+        ("How much is Gemini 3.7 Flash?", "Gemini 3.7 Flash is available."),
+        ("Gemini 3.7 Flash 的价格是多少？", "Pricing has not been announced."),
+        ("What does Gemini 3.7 Flash cost?", "The outage cost users time."),
+        (
+            "Gemini 3.7 Flash 的价格是多少？",
+            "Google invested $1 billion while announcing Gemini 3.7 Flash.",
+        ),
+        (
+            "Gemini 3.7 Flash 的价格是多少？",
+            "Gemini pricing was not announced in 2026. Google invested $1 billion.",
+        ),
+        (
+            "How much is Gemini 3.7 Flash?",
+            "This article explains how Claude pricing costs $1.",
+        ),
+        (
+            "Does the Gemini API cost anything?",
+            "Claude does cost $1.",
+        ),
+        ("Gemini 3.7 Flash 是否免费？", "Gemini 3.7 Flash is not free."),
+        ("Gemini 3.7 Flash 是否免费？", "Gemini 3.7 Flash was never free."),
+        ("Gemini 3.7 Flash 是否免费？", "There is no free tier for Gemini 3.7 Flash."),
+        (
+            "Gemini 3.7 Flash 是否免费？",
+            "The Gemini 3.7 Flash free tier is unavailable.",
+        ),
+        (
+            "Gemini 3.7 Flash 是否免费？",
+            "The Gemini 3.7 Flash free plan was discontinued.",
+        ),
+        ("Gemini 3.7 Flash 是否免费？", "Gemini 3.7 Flash 并不免费。"),
+        ("Gemini 3.7 Flash 是否免费？", "Gemini 3.7 Flash 免费版本已取消。"),
+    ),
+)
+def test_simple_lookup_refuses_without_requested_price_value(
+    question: str,
+    exact_text: str,
+) -> None:
+    events, provider, allowance = _stream_simple_lookup(
+        question,
+        claim_text="Google 正式发布了 Gemini 3.7 Flash。",
+        exact_text=exact_text,
+        answer="Gemini 3.7 Flash 的价格是 1 美元。",
+    )
+
+    assert provider.calls == []
+    assert allowance.calls == []
+    assert [event for event, _ in events] == ["status", "refusal", "done"]
+    assert events[1][1]["reason"] == "insufficient-evidence"
+    assert events[-1][1]["status"] == "refused"
+
+
+@pytest.mark.parametrize(
+    ("question", "exact_text", "answer"),
+    (
+        (
+            "Gemini 3.7 Flash 的价格是多少？",
+            "Gemini 3.7 Flash costs $1 per request.",
+            "Gemini 3.7 Flash 每次请求收费 1 美元。",
+        ),
+        (
+            "Gemini 3.7 Flash 是否免费？",
+            "Gemini 3.7 Flash is free.",
+            "Gemini 3.7 Flash 免费提供。",
+        ),
+        (
+            "Gemini 3.7 Flash 售价多少？",
+            "Gemini 3.7 Flash 的售价为 1 美元。",
+            "Gemini 3.7 Flash 的售价为 1 美元。",
+        ),
+        (
+            "Gemini 3.7 Flash 的价钱是多少？",
+            "Gemini 3.7 Flash 的价钱为 1 美元。",
+            "Gemini 3.7 Flash 的价钱为 1 美元。",
+        ),
+        (
+            "Gemini 3.7 Flash 是否免费？",
+            "Gemini 3.7 Flash 免费。",
+            "Gemini 3.7 Flash 免费。",
+        ),
+    ),
+)
+def test_simple_lookup_accepts_supported_price_value(
+    question: str,
+    exact_text: str,
+    answer: str,
+) -> None:
+    events, provider, allowance = _stream_simple_lookup(
+        question,
+        claim_text=exact_text,
+        exact_text=exact_text,
+        answer=answer,
+    )
+
+    assert len(provider.calls) == 1
+    assert allowance.calls == ["fixture-client"]
+    assert events[-1][0] == "done"
+    assert events[-1][1]["status"] == "answered"
+
+
+@pytest.mark.parametrize(
+    ("question", "evidence", "answer"),
+    (
+        (
+            "Gemini 3.7 Flash 有什么更新？",
+            "Google 正式发布了 Gemini 3.7 Flash。",
+            "Google 正式发布了 Gemini 3.7 Flash。",
+        ),
+        (
+            "How does Gemini free developers from repetitive work?",
+            "Gemini frees developers from repetitive work.",
+            "Gemini 可帮助开发者摆脱重复工作。",
+        ),
+        (
+            "How is Gemini able to free developers from repetitive work?",
+            "Gemini frees developers from repetitive work.",
+            "Gemini 可帮助开发者摆脱重复工作。",
+        ),
+        (
+            "Is Gemini free from vendor lock-in?",
+            "Gemini avoids vendor lock-in.",
+            "Gemini 可避免供应商锁定。",
+        ),
+    ),
+)
+def test_simple_lookup_keeps_non_price_questions_supported(
+    question: str,
+    evidence: str,
+    answer: str,
+) -> None:
+    events, provider, allowance = _stream_simple_lookup(
+        question,
+        claim_text=evidence,
+        exact_text=evidence,
+        answer=answer,
+    )
+
+    assert len(provider.calls) == 1
+    assert allowance.calls == ["fixture-client"]
+    assert events[-1][0] == "done"
+    assert events[-1][1]["status"] == "answered"
 
 
 def _sse_events(response_text: str) -> list[tuple[str, dict[str, object]]]:
