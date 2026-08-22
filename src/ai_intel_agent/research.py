@@ -1057,6 +1057,17 @@ class PersistentAnonymousResearchAllowance:
         )
 
 
+def _advanced_answer_lacks_required_story_coverage(
+    intent: QueryIntent,
+    story_ids: set[UUID],
+) -> bool:
+    return (
+        intent.task_type in {ResearchTaskType.COMPARISON, ResearchTaskType.MULTI_HOP}
+        and len(intent.entities) >= 2
+        and len(story_ids) < 2
+    )
+
+
 def stream_research_events(
     question: str,
     *,
@@ -1149,6 +1160,12 @@ def stream_research_events(
         yield "done", {"version": version, "status": "refused"}
         return
     if not evidence_set.evidence:
+        yield from _insufficient_evidence_events(version)
+        return
+    if _advanced_answer_lacks_required_story_coverage(
+        intent,
+        {item.story_id for item in evidence_set.evidence},
+    ):
         yield from _insufficient_evidence_events(version)
         return
     fault_payloads = [
@@ -1639,11 +1656,7 @@ def _validated_v2_provider_answer(
         and set(intent.dimensions) != covered_dimensions
     ):
         raise ResearchError("Comparison output omitted a requested dimension")
-    if (
-        intent.task_type in {ResearchTaskType.COMPARISON, ResearchTaskType.MULTI_HOP}
-        and len(intent.entities) >= 2
-        and len(cited_stories) < 2
-    ):
+    if _advanced_answer_lacks_required_story_coverage(intent, cited_stories):
         raise ResearchError("Advanced Research collapsed distinct Stories")
     return ResearchAnswer(
         text=answer_text,
