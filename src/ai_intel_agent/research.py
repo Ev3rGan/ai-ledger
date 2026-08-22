@@ -83,6 +83,11 @@ LATIN_ENTITY = re.compile(
     r"([A-Z][0-9A-Za-z]*(?:[._/+:-][0-9A-Za-z]+)*"
     r"(?:\s+(?:[A-Z][0-9A-Za-z]*|[0-9]+(?:\.[0-9]+)*)(?:[._/+:-][0-9A-Za-z]+)*){0,3})"
 )
+INTRODUCED_PRODUCT_ENTITY = re.compile(
+    r"(?:推出|发布|上线|公布)(?:了)?\s*"
+    r"([A-Z][0-9A-Za-z]*(?:[._/+:-][0-9A-Za-z]+)*"
+    r"(?:\s+(?:[A-Z][0-9A-Za-z]*|[0-9]+(?:\.[0-9]+)*)(?:[._/+:-][0-9A-Za-z]+)*){0,3})"
+)
 QUOTED_ENTITY = re.compile(r"[「『《\"`]([^」』》\"`]{1,80})[」』》\"`]")
 COMPARISON_MARKER = re.compile(r"比较|对比|相比|差异|区别|\bversus\b|\bvs\.?\b", re.IGNORECASE)
 EXPLICIT_COMPARISON_ENTITIES = re.compile(
@@ -327,7 +332,7 @@ def interpret_query_intent(question: str) -> QueryIntent:
     return QueryIntent(
         question=normalized,
         task_type=task_type,
-        entities=_query_entities(normalized),
+        entities=_query_entities(normalized, task_type=task_type),
         time_range=_query_time_range(normalized),
         time_semantic=_query_time_semantic(normalized, task_type),
         scope=ACCEPTED_PUBLISHED_SCOPE,
@@ -865,7 +870,11 @@ class ResearchRepository:
                     break
                 identifier = f"requirement-{ordinal}"
                 requirement_keys: list[tuple[UUID, UUID, UUID]] = []
-                for hit in result.hits:
+                for hit in _isolated_retrieval_requirement_hits(
+                    result.hits,
+                    spec,
+                    intent,
+                ):
                     key = (hit.story_id, hit.claim_id, hit.evidence_span_id)
                     if key not in hits_by_key and len(selected_hits) < limit:
                         hits_by_key[key] = hit
@@ -1061,11 +1070,14 @@ def _advanced_answer_lacks_required_story_coverage(
     intent: QueryIntent,
     story_ids: set[UUID],
 ) -> bool:
-    return (
-        intent.task_type in {ResearchTaskType.COMPARISON, ResearchTaskType.MULTI_HOP}
-        and len(intent.entities) >= 2
-        and len(story_ids) < 2
+    requires_multiple_stories = (
+        intent.task_type is ResearchTaskType.MULTI_HOP
+        or (
+            intent.task_type is ResearchTaskType.COMPARISON
+            and len(intent.entities) >= 2
+        )
     )
+    return requires_multiple_stories and len(story_ids) < 2
 
 
 def stream_research_events(
@@ -1809,6 +1821,161 @@ class _RetrievalRequirementSpec:
     query: str
     entity: str | None = None
     dimension: str | None = None
+    match_terms: tuple[str, ...] = ()
+    exclude_terms: tuple[str, ...] = ()
+
+
+def _hit_matches_retrieval_requirement(
+    hit: AcceptedKnowledgeHit,
+    spec: _RetrievalRequirementSpec,
+    intent: QueryIntent,
+) -> bool:
+    searchable = _retrieval_hit_searchable(hit)
+    if intent.task_type is ResearchTaskType.MULTI_HOP:
+        return bool(spec.match_terms) and any(
+            term in searchable for term in spec.match_terms
+        )
+    if intent.task_type is not ResearchTaskType.COMPARISON:
+        return True
+    if spec.entity is None or spec.entity.casefold() not in searchable:
+        return False
+    if spec.dimension in {None, "主要差异"}:
+        return True
+    terms = _semantic_match_terms(spec.dimension)
+    minimum_matches = max(1, ceil(len(terms) / 2))
+    return sum(term in searchable for term in terms) >= minimum_matches
+
+
+def _isolated_retrieval_requirement_hits(
+    hits: tuple[AcceptedKnowledgeHit, ...],
+    spec: _RetrievalRequirementSpec,
+    intent: QueryIntent,
+) -> tuple[AcceptedKnowledgeHit, ...]:
+    matched = tuple(
+        hit for hit in hits if _hit_matches_retrieval_requirement(hit, spec, intent)
+    )
+    if not matched:
+        return ()
+    if intent.task_type is ResearchTaskType.COMPARISON and spec.entity is not None:
+        other_entities = tuple(
+            entity.casefold()
+            for entity in intent.entities
+            if entity.casefold() != spec.entity.casefold()
+        )
+        entity_exclusive = tuple(
+            hit
+            for hit in matched
+            if not any(
+                entity in _retrieval_hit_searchable(hit) for entity in other_entities
+            )
+        )
+        if entity_exclusive:
+            return entity_exclusive
+    if intent.task_type is ResearchTaskType.MULTI_HOP and spec.match_terms:
+        clause_exclusive = tuple(
+            hit
+            for hit in matched
+            if not any(
+                term in _retrieval_hit_searchable(hit) for term in spec.exclude_terms
+            )
+        )
+        if clause_exclusive:
+            matched = clause_exclusive
+        scores = tuple(
+            sum(term in _retrieval_hit_searchable(hit) for term in spec.match_terms)
+            for hit in matched
+        )
+        strongest_score = max(scores)
+        return tuple(
+            hit
+            for hit, score in zip(matched, scores, strict=True)
+            if score == strongest_score
+        )
+    return matched
+
+
+def _retrieval_hit_searchable(hit: AcceptedKnowledgeHit) -> str:
+    return (
+        f"{hit.story_stable_key} {hit.story_headline} "
+        f"{hit.claim_text} {hit.exact_text}"
+    ).casefold()
+
+
+def _semantic_match_terms(value: str) -> tuple[str, ...]:
+    latin_terms = tuple(
+        match.casefold()
+        for match in re.findall(r"[0-9A-Za-z][0-9A-Za-z._/+:-]*", value)
+    )
+    chinese_terms = tuple(
+        chunk if len(chunk) == 2 else chunk[index : index + 2]
+        for chunk in re.findall(r"[\u3400-\u9fff]{2,}", value)
+        for index in range(max(1, len(chunk) - 1))
+    )
+    return tuple(dict.fromkeys((*latin_terms, *chinese_terms)))
+
+
+def _multi_hop_match_terms(value: str) -> tuple[str, ...]:
+    latin_terms = tuple(
+        match.casefold()
+        for match in re.findall(r"[A-Za-z][0-9A-Za-z._/+:-]*", value)
+    )
+    chinese_source = re.sub(
+        r"如何|怎样|影响|导致|促成|之后|然后|随后|并且|以及|什么|为何|的|了|会|后",
+        " ",
+        value,
+    )
+    chinese_terms = tuple(
+        term
+        for chunk in re.findall(r"[\u3400-\u9fff]{2,}", chinese_source)
+        for term in (
+            chunk,
+            *(chunk[index : index + 2] for index in range(len(chunk) - 1)),
+        )
+    )
+    return tuple(dict.fromkeys((*latin_terms, *chinese_terms)))
+
+
+def _multi_hop_requirement_specs(
+    queries: tuple[str, ...],
+) -> tuple[_RetrievalRequirementSpec, ...]:
+    terms_by_query = tuple(_multi_hop_match_terms(query) for query in queries)
+    specs: list[_RetrievalRequirementSpec] = []
+    for index, query in enumerate(queries):
+        own_terms = terms_by_query[index]
+        other_terms = tuple(
+            dict.fromkeys(
+                term
+                for other_index, terms in enumerate(terms_by_query)
+                if other_index != index
+                for term in terms
+            )
+        )
+        own_unique_terms = tuple(term for term in own_terms if term not in other_terms)
+        foreign_unique_terms = tuple(term for term in other_terms if term not in own_terms)
+        specs.append(
+            _RetrievalRequirementSpec(
+                label=query if len(query) <= 48 else f"{query[:47].rstrip()}…",
+                query=query,
+                match_terms=own_unique_terms or own_terms,
+                exclude_terms=foreign_unique_terms,
+            )
+        )
+    return tuple(specs)
+
+
+def _normalized_multi_hop_clause(value: str) -> str:
+    normalized = value.strip(" ，,。！？?：:")
+    normalized = re.sub(
+        r"^(?:请\s*)?多跳(?:检索|研究)\s*",
+        "",
+        normalized,
+    )
+    normalized = re.sub(
+        r"(?:分别)?(?:体现|说明|反映)(?:了)?(?:哪些|什么|怎样的).+$",
+        "",
+        normalized,
+    )
+    return normalized.strip(" ，,。！？?：:")
 
 
 def _retrieval_requirement_specs(
@@ -1832,41 +1999,36 @@ def _retrieval_requirement_specs(
         )
     if intent.task_type is ResearchTaskType.MULTI_HOP:
         clauses = tuple(
-            clause.strip(" ，,。！？?：:")
+            normalized
             for clause in re.split(
                 r"[；;。！？!?]+|(?:，|,)?(?:然后|随后|并且|以及)(?:，|,)?",
                 intent.question,
             )
-            if clause.strip(" ，,。！？?：:")
+            for normalized in (_normalized_multi_hop_clause(clause),)
+            if normalized
         )
         if len(clauses) >= 2:
-            return tuple(
-                _RetrievalRequirementSpec(label=f"hop-{index}", query=clause)
-                for index, clause in enumerate(clauses, start=1)
-            )
+            return _multi_hop_requirement_specs(clauses)
         causal = re.fullmatch(
             r"(.+?)(?:后|之后)(?:会)?(?:如何|怎样)(?:影响|导致|促成)(.+)",
             intent.question.strip(" ，,。！？?：:"),
         )
         if causal is not None:
-            return tuple(
-                _RetrievalRequirementSpec(
-                    label=f"hop-{index}",
-                    query=value.strip(" ，,。！？?：:"),
+            return _multi_hop_requirement_specs(
+                tuple(
+                    value.strip(" ，,。！？?：:") for value in causal.groups()
                 )
-                for index, value in enumerate(causal.groups(), start=1)
             )
         generic_causal = re.fullmatch(
             r"(.+?)(?:会)?(?:如何|怎样)(?:影响|导致|促成)(.+)",
             intent.question.strip(" ，,。！？?：:"),
         )
         if generic_causal is not None:
-            return tuple(
-                _RetrievalRequirementSpec(
-                    label=f"hop-{index}",
-                    query=value.strip(" ，,。！？?：:"),
+            return _multi_hop_requirement_specs(
+                tuple(
+                    value.strip(" ，,。！？?：:")
+                    for value in generic_causal.groups()
                 )
-                for index, value in enumerate(generic_causal.groups(), start=1)
             )
         return ()
     return (
@@ -1877,8 +2039,20 @@ def _retrieval_requirement_specs(
     )
 
 
-def _query_entities(question: str) -> tuple[str, ...]:
+def _query_entities(
+    question: str,
+    *,
+    task_type: ResearchTaskType,
+) -> tuple[str, ...]:
     entities: list[str] = []
+    introduced_products = (
+        {
+            match.group(1).strip().casefold()
+            for match in INTRODUCED_PRODUCT_ENTITY.finditer(question)
+        }
+        if task_type is ResearchTaskType.MULTI_HOP
+        else set()
+    )
     for value in (
         *(
             value
@@ -1892,6 +2066,7 @@ def _query_entities(question: str) -> tuple[str, ...]:
         if (
             normalized
             and normalized not in ENTITY_STOPWORDS
+            and normalized.casefold() not in introduced_products
             and normalized.casefold() not in {item.casefold() for item in entities}
         ):
             entities.append(normalized)

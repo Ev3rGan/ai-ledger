@@ -346,6 +346,78 @@ def test_comparison_evidence_set_preserves_dimensions_claim_qualifiers_and_roles
     )
 
 
+def test_comparison_isolates_each_entity_dimension_requirement_before_provider() -> None:
+    cursor_positioning = _hit(
+        "cursor-code-hosting-positioning",
+        claim_text="Cursor 的代码托管定位面向 AI 编程工作流。",
+    )
+    claude_positioning = _hit(
+        "claude-code-hosting-positioning",
+        claim_text="Claude Code 的代码托管定位依托现有仓库工作流。",
+    )
+    unrelated_cursor_story = _hit(
+        "cursor-origin-launch",
+        claim_text="Cursor 推出了 Origin 产品。",
+    )
+    cross_entity_story = _hit(
+        "cursor-claude-code-hosting-roundup",
+        claim_text="Cursor 和 Claude Code 的代码托管定位均在演进。",
+    )
+    broad_hits = (
+        cursor_positioning,
+        claude_positioning,
+        unrelated_cursor_story,
+        cross_entity_story,
+    )
+
+    class BroadAcceptedKnowledge:
+        def __init__(self) -> None:
+            self.queries: list[RetrievalQuery] = []
+
+        def retrieve(self, query: RetrievalQuery) -> AcceptedKnowledgeResult:
+            self.queries.append(query)
+            return _result(query, *broad_hits)
+
+    retrieval = BroadAcceptedKnowledge()
+    provider = FullySupportedComparisonProvider()
+    events = list(
+        stream_research_events(
+            "比较 Cursor 和 Claude Code 在代码托管定位方面的差异。",
+            repository=ResearchRepository(
+                retrieval=retrieval,
+                metadata_loader=FixtureEvidenceMetadata({}),
+            ),
+            provider=provider,
+        )
+    )
+
+    evidence_set = provider.calls[0]
+    requirements = {
+        requirement.entity: requirement for requirement in evidence_set.requirements
+    }
+    assert requirements["Cursor"].evidence_keys == (
+        (
+            cursor_positioning.story_id,
+            cursor_positioning.claim_id,
+            cursor_positioning.evidence_span_id,
+        ),
+    )
+    assert requirements["Claude Code"].evidence_keys == (
+        (
+            claude_positioning.story_id,
+            claude_positioning.claim_id,
+            claude_positioning.evidence_span_id,
+        ),
+    )
+    assert {item.story_id for item in evidence_set.evidence} == {
+        cursor_positioning.story_id,
+        claude_positioning.story_id,
+    }
+    assert len([event for event, _ in events if event == "citation"]) == 2
+    assert events[-1][0] == "done"
+    assert events[-1][1]["status"] == "answered"
+
+
 def test_timeline_evidence_set_keeps_five_distinct_time_semantics() -> None:
     gemini = _hit("gemini", claim_text="Gemini 3.6 Flash 已正式发布。")
     times = ResearchEvidenceTimes(
@@ -554,6 +626,130 @@ def test_multi_hop_refuses_before_provider_when_intermediate_support_is_missing(
     assert provider.calls == []
 
 
+def test_multi_hop_isolates_original_clauses_and_ignores_introduced_product_entity() -> None:
+    origin_launch = _hit(
+        "cursor-origin-launch",
+        claim_text="Cursor 推出 Origin，形成新的产品入口。",
+    )
+    developer_migration = _hit(
+        "origin-developer-migration",
+        claim_text="Origin 的代码托管定位改变了开发者迁移路径。",
+    )
+    unrelated_claude_story = _hit(
+        "claude-code-terminal",
+        claim_text="Claude Code 更新了终端交互。",
+    )
+    broad_hits = (origin_launch, developer_migration, unrelated_claude_story)
+
+    class BroadAcceptedKnowledge:
+        def __init__(self) -> None:
+            self.queries: list[RetrievalQuery] = []
+
+        def retrieve(self, query: RetrievalQuery) -> AcceptedKnowledgeResult:
+            self.queries.append(query)
+            return _result(query, *broad_hits)
+
+    retrieval = BroadAcceptedKnowledge()
+    intent = interpret_query_intent(
+        "Cursor 推出 Origin；Origin 的代码托管定位如何影响开发者迁移？"
+    )
+    evidence_set = ResearchRepository(
+        retrieval=retrieval,
+        metadata_loader=FixtureEvidenceMetadata({}),
+    ).retrieve_intent(intent)
+
+    assert intent.entities == ("Cursor",)
+    assert [requirement.label for requirement in evidence_set.requirements] == [
+        "Cursor 推出 Origin",
+        "Origin 的代码托管定位如何影响开发者迁移",
+    ]
+    assert [requirement.evidence_keys for requirement in evidence_set.requirements] == [
+        (
+            (
+                origin_launch.story_id,
+                origin_launch.claim_id,
+                origin_launch.evidence_span_id,
+            ),
+        ),
+        (
+            (
+                developer_migration.story_id,
+                developer_migration.claim_id,
+                developer_migration.evidence_span_id,
+            ),
+        ),
+    ]
+    assert {item.story_id for item in evidence_set.evidence} == {
+        origin_launch.story_id,
+        developer_migration.story_id,
+    }
+
+
+def test_multi_hop_normalizes_live_subquestions_and_drops_cross_clause_roundup() -> None:
+    cursor_origin = _hit(
+        "cursor-origin-platform",
+        claim_text="Cursor 推出 Origin 代码托管平台。",
+    )
+    claude_design = _hit(
+        "claude-code-design-command",
+        claim_text="Claude Code 推出 /design 命令。",
+    )
+    cross_clause_roundup = _hit(
+        "cursor-claude-code-roundup",
+        claim_text=(
+            "Cursor 推出 Origin 代码托管平台，Claude Code 同时推出 /design 命令。"
+        ),
+    )
+
+    class BroadAcceptedKnowledge:
+        def __init__(self) -> None:
+            self.queries: list[RetrievalQuery] = []
+
+        def retrieve(self, query: RetrievalQuery) -> AcceptedKnowledgeResult:
+            self.queries.append(query)
+            return _result(query, cursor_origin, claude_design, cross_clause_roundup)
+
+    retrieval = BroadAcceptedKnowledge()
+    intent = interpret_query_intent(
+        "多跳检索 Cursor 推出 Origin 代码托管平台；"
+        "Claude Code 推出 /design 命令分别体现了哪些开发工具产品形态进展？"
+    )
+    evidence_set = ResearchRepository(
+        retrieval=retrieval,
+        metadata_loader=FixtureEvidenceMetadata({}),
+    ).retrieve_intent(intent)
+
+    assert intent.entities == ("Cursor", "Claude Code")
+    assert [query.text for query in retrieval.queries] == [
+        "Cursor 推出 Origin 代码托管平台",
+        "Claude Code 推出 /design 命令",
+    ]
+    assert [requirement.label for requirement in evidence_set.requirements] == [
+        "Cursor 推出 Origin 代码托管平台",
+        "Claude Code 推出 /design 命令",
+    ]
+    assert [requirement.evidence_keys for requirement in evidence_set.requirements] == [
+        (
+            (
+                cursor_origin.story_id,
+                cursor_origin.claim_id,
+                cursor_origin.evidence_span_id,
+            ),
+        ),
+        (
+            (
+                claude_design.story_id,
+                claude_design.claim_id,
+                claude_design.evidence_span_id,
+            ),
+        ),
+    ]
+    assert {item.story_id for item in evidence_set.evidence} == {
+        cursor_origin.story_id,
+        claude_design.story_id,
+    }
+
+
 def test_causal_multi_hop_question_decomposes_into_two_bounded_requirements() -> None:
     cause = _hit("model-release", claim_text="模型已经发布。")
     effect = _hit("developer-deployment", claim_text="开发者部署方式发生变化。")
@@ -569,8 +765,8 @@ def test_causal_multi_hop_question_decomposes_into_two_bounded_requirements() ->
 
     assert [query.text for query in retrieval.queries] == ["模型发布", "开发者部署"]
     assert [requirement.label for requirement in evidence_set.requirements] == [
-        "hop-1",
-        "hop-2",
+        "模型发布",
+        "开发者部署",
     ]
     assert evidence_set.missing_requirement_ids == ()
 
