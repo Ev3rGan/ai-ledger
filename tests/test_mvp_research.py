@@ -224,8 +224,8 @@ def _sse_events(response_text: str) -> list[tuple[str, dict[str, object]]]:
 def test_research_protocol_reuses_the_human_approved_m1_route() -> None:
     protocol = load_research_protocol()
 
-    assert protocol.version == "research-protocol-2026-08-22.v2"
-    assert protocol.prompt_version == "research-prompt-2026-08-22.v2"
+    assert protocol.version == "research-protocol-2026-08-22.v3"
+    assert protocol.prompt_version == "research-prompt-2026-08-22.v3"
     assert protocol.output_schema_version == "research-output-2026-08-22.v2"
     assert protocol.sse_contract_version == "research-sse-2026-08-15.v1"
     assert protocol.route_identifier == "deepseek:v4-pro"

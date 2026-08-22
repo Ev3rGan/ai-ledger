@@ -25,6 +25,7 @@ from ai_intel_agent.research import (
     ResearchEvidenceSet,
     ResearchEvidenceTimes,
     ResearchRepository,
+    ResearchRequirement,
     ResearchTaskType,
     ResearchTimeSemantic,
     interpret_query_intent,
@@ -220,7 +221,9 @@ class CrossDimensionComparisonProvider:
         )
 
 
-def test_comparison_evidence_set_preserves_dimensions_claim_qualifiers_and_roles() -> None:
+def test_comparison_evidence_set_preserves_dimensions_claim_qualifiers_and_roles(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     openai_model = _hit(
         "openai-model",
         claim_text="OpenAI 发布了限定为预览版的模型。",
@@ -331,19 +334,32 @@ def test_comparison_evidence_set_preserves_dimensions_claim_qualifiers_and_roles
     )
     assert evidence_set.intent is intent
 
-    events = list(
-        stream_research_events(
-            intent.question,
-            repository=ResearchRepository(
-                retrieval=ExactQueryAcceptedKnowledge(hits),
-                metadata_loader=metadata,
-            ),
-            provider=CrossDimensionComparisonProvider(),
+    caplog.set_level("WARNING", logger=research_module.__name__)
+    logger_was_disabled = research_module.LOGGER.disabled
+    research_module.LOGGER.disabled = False
+    research_module.LOGGER.addHandler(caplog.handler)
+    try:
+        events = list(
+            stream_research_events(
+                intent.question,
+                repository=ResearchRepository(
+                    retrieval=ExactQueryAcceptedKnowledge(hits),
+                    metadata_loader=metadata,
+                ),
+                provider=CrossDimensionComparisonProvider(),
+            )
         )
-    )
+    finally:
+        research_module.LOGGER.removeHandler(caplog.handler)
+        research_module.LOGGER.disabled = logger_was_disabled
     assert next(payload for event, payload in events if event == "error")["code"] == (
         "provider-failed"
     )
+    assert (
+        "Comparison support cited Evidence from another entity-dimension requirement"
+        in caplog.text
+    )
+    assert "Evidence for openai-model." not in caplog.text
 
 
 def test_comparison_isolates_each_entity_dimension_requirement_before_provider() -> None:
@@ -1145,7 +1161,7 @@ def test_retrieval_fallback_is_explicit_and_keeps_supported_public_citations() -
 
     events = list(
         stream_research_events(
-            "比较 OpenAI 和 Anthropic 在模型发布、融资方面的进展",
+            "比较 OpenAI 和 Anthropic 在模型发布方面的进展",
             repository=ResearchRepository(
                 retrieval=retrieval,
                 metadata_loader=metadata,
@@ -1323,6 +1339,88 @@ def test_deepseek_retries_share_one_remaining_elapsed_time_budget() -> None:
             tuple(provider.stream(evidence_set))
 
     assert len(requests) == 1
+
+
+def test_deepseek_comparison_payload_separates_retrieval_and_answer_time_semantics() -> None:
+    intent = interpret_query_intent(
+        "比较 Cursor 和 Claude Code 在开发工具产品形态方面的已公开进展。"
+    )
+    first = ResearchEvidence(
+        story_id=_id("comparison-payload:first-story"),
+        story_stable_key="comparison-payload:first-story",
+        story_headline="Cursor 推出 Origin",
+        claim_id=_id("comparison-payload:first-claim"),
+        claim_text="Cursor 推出了 Origin。",
+        evidence_span_id=_id("comparison-payload:first-evidence"),
+        exact_text="Cursor launched Origin.",
+    )
+    second = ResearchEvidence(
+        story_id=_id("comparison-payload:second-story"),
+        story_stable_key="comparison-payload:second-story",
+        story_headline="Claude Code 推出设计命令",
+        claim_id=_id("comparison-payload:second-claim"),
+        claim_text="Claude Code 推出了设计命令。",
+        evidence_span_id=_id("comparison-payload:second-evidence"),
+        exact_text="Claude Code launched a design command.",
+    )
+    evidence_set = ResearchEvidenceSet(
+        question=intent.question,
+        evidence=(first, second),
+        intent=intent,
+        requirements=(
+            ResearchRequirement(
+                identifier="requirement-1",
+                label="Cursor x 开发工具产品形态",
+                entity="Cursor",
+                dimension="开发工具产品形态",
+                evidence_keys=(first.citation_key,),
+            ),
+            ResearchRequirement(
+                identifier="requirement-2",
+                label="Claude Code x 开发工具产品形态",
+                entity="Claude Code",
+                dimension="开发工具产品形态",
+                evidence_keys=(second.citation_key,),
+            ),
+        ),
+    )
+    captured_payloads: list[dict[str, object]] = []
+
+    def response(request: httpx.Request) -> httpx.Response:
+        captured_payloads.append(json.loads(request.content))
+        chunk = json.dumps(
+            {
+                "model": "deepseek-v4-pro",
+                "choices": [
+                    {"delta": {"content": "{}"}, "finish_reason": "stop"}
+                ],
+            }
+        )
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "text/event-stream"},
+            content=f"data: {chunk}\n\ndata: [DONE]\n\n".encode(),
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(response)) as client:
+        provider = DeepSeekResearchProvider(client, api_key="fixture-provider-key")
+        assert "".join(provider.stream(evidence_set)) == "{}"
+
+    system_prompt = captured_payloads[0]["messages"][0]["content"]
+    assert "retrieval_time_semantics" in system_prompt
+    assert "must never be copied" in system_prompt
+    assert "answer_time_semantic" in system_prompt
+    assert "Comparison JSON example" in system_prompt
+
+    user_prompt = captured_payloads[0]["messages"][1]["content"]
+    intent_json = user_prompt.split("<query_intent>\n", 1)[1].split(
+        "\n</query_intent>", 1
+    )[0]
+    provider_intent = json.loads(intent_json)
+    assert provider_intent["retrieval_time_semantics"] == ["event"]
+    assert provider_intent["answer_time_semantic"] is None
+    assert "time_semantic" not in provider_intent
 
 
 class FailingAcceptedKnowledge:

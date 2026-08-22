@@ -12,6 +12,8 @@
 
 采集与草稿生成有明确边界并可追溯。Operator 保留直接审核 Story 与发布 Digest 的控制权。采用辅助编排时，Editorial Agent 生成一份完整、版本化、不可变的 Digest Plan；operator 一次批准这份 exact plan，批准事务接受其中纳入的 Story 并发布未改动的 Digest。Agent 不会自行发布，也不能修改已批准计划。
 
+生产 Scheduler 在 **Asia/Shanghai 每日 06:00 与 18:00** 运行。它自动采集符合条件的新材料并准备可追溯草稿，但不自动发布；只有 operator 审阅并批准一份 exact Digest Plan 后，新的公开日报才会出现。
+
 ## 公共页面
 
 | 页面 | 路由 | 读者看到什么 |
@@ -29,13 +31,22 @@ M1-M4 能力已部署；可用状态与代码树集成状态分开记录。
 
 | 能力 | 产品边界 | 可用状态 |
 | --- | --- | --- |
-| 版本化来源组合 | 八个来源组成的核心 portfolio、策略版本化的补充 Profile、故障隔离、正文门禁、cursor 与可重放 operation key | 已部署（M2） |
+| 版本化来源组合 | 八个核心 Profile 加十个有边界的补充 Profile，逐来源记录角色、故障隔离、正文或结构化数据门禁、cursor 与可重放 operation key；机器之心在取得正式授权前保持停用 | 已部署（M2） |
 | 可追溯草稿 | 获批的 DeepSeek route 生成 Story、Claim 与精确 Evidence Span 草稿，但不能接受或发布 | 已部署 |
 | 编辑批准 | Operator 可直接审核，也可一次批准 Agent 生成的不可变 Digest Plan；Agent 不自动发布，每次批准都绑定 exact plan | 已部署（M3） |
 | 已接受知识 Hybrid | pgvector 中的 MiniLM 向量与 PostgreSQL FTS、exact Entity candidates 共同 Fusion，再交给唯一 mMARCO reranker；模型不可用时显式回退 | 已部署（M4） |
-| 高级 Research | Query Intent 区分 simple lookup、comparison、timeline 与 bounded multi-hop；有界编排通过 SSE 输出进度、可点击 Story/Claim/Evidence 引用、明确拒答与 hard execution budgets | Integrated release candidate；public release 由 #74 跟踪，exact-SHA acceptance 完成前不代表 official Demo 已上线 |
+| 高级 Research | Query Intent 区分 simple lookup、comparison、timeline 与 bounded multi-hop；entity/dimension 或语义子问题 Evidence Set 相互隔离，严格时间语义与引用校验 fail closed，有界编排通过 SSE 输出进度且不暴露 hidden reasoning | Integrated release candidate；public release 由 #74 跟踪，exact-SHA acceptance 完成前不代表 official Demo 已上线 |
 | 公共投影 | Home、Digest、Story、Browse、RSS 与当前可用的 Research surface 只暴露已发布知识，不暴露 operator 控件或 hidden reasoning | 已部署；高级 Research 以上述可用状态为准 |
 | 可复现运维 | 锁定的本地与生产 runbook 定义启动、迁移、状态、备份、恢复、回滚与验收边界 | 已部署 |
+
+## 运行模型
+
+| 职责 | 自动化部分 | 人类边界 |
+| --- | --- | --- |
+| 采集与起草 | Scheduler 每日采集两次；Adapter 执行来源策略，DeepSeek 准备可追溯草稿 | Operator 调查降级来源，并决定是否需要一次有边界的重试 |
+| 编排与发布 | Editorial Agent 提出一份包含排序、摘要、Topic、排除项和异常标记的完整计划 | 一次明确批准只发布该不可变计划；存在 blocking anomaly 时禁止发布 |
+| 回答 | Research Agent 只检索已接受知识，执行有界编排，验证每个实质性引用，并拒绝证据不足的问题 | 读者决定问题；Agent 不能实时浏览公网，也不能静默扩大范围 |
+| 运维 | status、health、backup、restore-isolated、restart、upgrade 与 rollback 均有已提交的命令边界 | 发布锁定 exact merge SHA 与 immutable image digest；秘密和破坏性恢复仍由 operator 控制 |
 
 ## 路线图
 
