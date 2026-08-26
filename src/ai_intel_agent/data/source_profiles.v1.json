@@ -260,7 +260,7 @@
       "cursor_policy": "Repository, numeric release ID, tag, and timestamp.",
       "health_policy": "Fail closed on allowlist, licence, access, or schema drift.",
       "pause_policy": "Pause on allowlist, licence, access, or schema drift.",
-      "settings": {"maximum_items_per_repository": 5, "repositories": [{"name": "vllm-project/vllm", "licence_spdx": "Apache-2.0", "release_body_eligible": true}, {"name": "sgl-project/sglang", "licence_spdx": "Apache-2.0", "release_body_eligible": true}, {"name": "huggingface/transformers", "licence_spdx": "Apache-2.0", "release_body_eligible": true}, {"name": "pytorch/pytorch", "licence_spdx": "BSD-3-Clause", "release_body_eligible": true}]}
+      "settings": {"maximum_items_per_repository": 5, "repositories": [{"name": "vllm-project/vllm", "licence_spdx": "Apache-2.0", "release_body_eligible": true, "exclude_tag_patterns": ["nightly", "snapshot", "daily"]}, {"name": "sgl-project/sglang", "licence_spdx": "Apache-2.0", "release_body_eligible": true, "exclude_tag_patterns": ["nightly", "snapshot", "daily"]}, {"name": "huggingface/transformers", "licence_spdx": "Apache-2.0", "release_body_eligible": true, "exclude_tag_patterns": ["nightly", "snapshot", "daily"]}, {"name": "pytorch/pytorch", "licence_spdx": "BSD-3-Clause", "release_body_eligible": true, "exclude_tag_patterns": ["nightly", "snapshot", "daily"]}]}
     },
     {
       "key": "qwen-hub",

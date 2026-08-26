@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from ipaddress import IPv4Address
 from pathlib import Path
+from types import MappingProxyType
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import httpx
@@ -382,6 +384,21 @@ def test_versioned_source_universe_has_exact_approved_groups_and_domain_policies
         profile for profile in profiles if profile.key == "curated-github-releases"
     )
     assert isinstance(releases.settings["repositories"], tuple)
+    assert all(
+        isinstance(policy, Mapping)
+        and set(policy) == {
+            "name",
+            "licence_spdx",
+            "release_body_eligible",
+            "exclude_tag_patterns",
+        }
+        and isinstance(policy["exclude_tag_patterns"], tuple)
+        and all(
+            isinstance(pattern, str) and pattern.strip()
+            for pattern in policy["exclude_tag_patterns"]
+        )
+        for policy in releases.settings["repositories"]
+    )
     with pytest.raises(TypeError):
         releases.settings["repositories"][0]["release_body_eligible"] = False
 
@@ -476,6 +493,18 @@ def test_curated_releases_use_fixed_repositories_and_exclude_assets_and_previews
                 },
                 {"id": 702, "draft": True, "prerelease": False},
                 {"id": 703, "draft": False, "prerelease": True},
+                {
+                    "id": 704,
+                    "html_url": (
+                        "https://github.com/vllm-project/vllm/releases/tag/"
+                        "nightly-20260819"
+                    ),
+                    "tag_name": "nightly-20260819",
+                    "name": "Nightly build",
+                    "draft": False,
+                    "prerelease": False,
+                    "published_at": "2026-08-19T00:30:00Z",
+                },
             ]
         return httpx.Response(
             200,
@@ -507,8 +536,183 @@ def test_curated_releases_use_fixed_repositories_and_exclude_assets_and_previews
     assert item.source_record.policy_metadata["licence_spdx"] == "Apache-2.0"
     assert item.source_record.policy_metadata["assets_fetched"] is False
     assert "assets" not in item.source_record.structured_metadata
+    assert item.source_record.structured_metadata["repository"] == "vllm-project/vllm"
+    assert item.source_record.provenance["repository"] == "vllm-project/vllm"
+    assert item.candidate.canonical_url.startswith(
+        "https://github.com/vllm-project/vllm/releases/"
+    )
+    assert item.source_record.canonical_url.startswith(
+        "https://github.com/vllm-project/vllm/releases/"
+    )
     assert item.document_version is not None
     assert "Licensed release notes." in item.document_version.body
+
+
+def test_curated_releases_apply_per_repository_tag_exclusion() -> None:
+    release_profile = next(
+        profile
+        for profile in load_source_universe()
+        if profile.key == "curated-github-releases"
+    )
+    profile = replace(
+        release_profile,
+        settings=MappingProxyType(
+            {
+                "maximum_items_per_repository": 5,
+                "repositories": (
+                    {
+                        "name": "vllm-project/vllm",
+                        "licence_spdx": "Apache-2.0",
+                        "release_body_eligible": True,
+                        "exclude_tag_patterns": ("ci-release",),
+                    },
+                    {
+                        "name": "sgl-project/sglang",
+                        "licence_spdx": "Apache-2.0",
+                        "release_body_eligible": True,
+                        "exclude_tag_patterns": ("nightly",),
+                    },
+                    {
+                        "name": "huggingface/transformers",
+                        "licence_spdx": "Apache-2.0",
+                        "release_body_eligible": True,
+                        "exclude_tag_patterns": (),
+                    },
+                    {
+                        "name": "pytorch/pytorch",
+                        "licence_spdx": "BSD-3-Clause",
+                        "release_body_eligible": True,
+                        "exclude_tag_patterns": (),
+                    },
+                ),
+            }
+        ),
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        repository = "/".join(request.url.path.split("/")[2:4])
+        releases = {
+            "vllm-project/vllm": [
+                {
+                    "id": 801,
+                    "html_url": (
+                        "https://github.com/vllm-project/vllm/releases/tag/v1.3.0"
+                    ),
+                    "tag_name": "v1.3.0",
+                    "name": "vLLM 1.3.0",
+                    "draft": False,
+                    "prerelease": False,
+                    "published_at": "2026-08-19T01:00:00Z",
+                },
+                {
+                    "id": 802,
+                    "html_url": (
+                        "https://github.com/vllm-project/vllm/releases/tag/"
+                        "v1.3.0-ci-release"
+                    ),
+                    "tag_name": "v1.3.0-ci-release",
+                    "name": "CI build",
+                    "draft": False,
+                    "prerelease": False,
+                    "published_at": "2026-08-19T00:30:00Z",
+                },
+            ],
+            "sgl-project/sglang": [
+                {
+                    "id": 901,
+                    "html_url": (
+                        "https://github.com/sgl-project/sglang/releases/tag/v1.0.0"
+                    ),
+                    "tag_name": "v1.0.0",
+                    "name": "SGLang 1.0.0",
+                    "draft": False,
+                    "prerelease": False,
+                    "published_at": "2026-08-19T01:00:00Z",
+                },
+                {
+                    "id": 902,
+                    "html_url": (
+                        "https://github.com/sgl-project/sglang/releases/tag/"
+                        "v1.0.0-nightly"
+                    ),
+                    "tag_name": "v1.0.0-nightly",
+                    "name": "Nightly build",
+                    "draft": False,
+                    "prerelease": False,
+                    "published_at": "2026-08-19T00:30:00Z",
+                },
+            ],
+        }.get(repository, [])
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            content=json.dumps(releases).encode(),
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond), trust_env=False) as client:
+        result = HttpSourcePortfolioAdapter(client, resolver=StaticResolver()).acquire(
+            profile,
+            observed_at=datetime(2026, 8, 19, 4, 0, tzinfo=UTC),
+            backfill_limit=5,
+            known_paper_identities=frozenset(),
+            known_signal_targets=frozenset(),
+        )
+
+    included = {
+        (item.source_record.external_id, item.source_record.external_version)
+        for item in result.items
+    }
+    assert included == {("801", "v1.3.0"), ("901", "v1.0.0")}
+    assert all(
+        item.source_record.structured_metadata["repository"]
+        == item.source_record.provenance["repository"]
+        for item in result.items
+    )
+
+
+def test_curated_releases_reject_invalid_tag_patterns() -> None:
+    release_profile = next(
+        profile
+        for profile in load_source_universe()
+        if profile.key == "curated-github-releases"
+    )
+    repositories = release_profile.settings["repositories"]
+    policy = repositories[0]
+    profile = replace(
+        release_profile,
+        settings=MappingProxyType(
+            {
+                "maximum_items_per_repository": 5,
+                "repositories": (
+                    {
+                        "name": policy["name"],
+                        "licence_spdx": policy["licence_spdx"],
+                        "release_body_eligible": policy["release_body_eligible"],
+                        "exclude_tag_patterns": ("(unclosed",),
+                    },
+                    *repositories[1:],
+                ),
+            }
+        ),
+    )
+
+    with (
+        httpx.Client(
+            transport=httpx.MockTransport(lambda _: httpx.Response(200)),
+            trust_env=False,
+        ) as client,
+        pytest.raises(
+            SourcePortfolioInvalidFormatError,
+            match="tag exclusion pattern is invalid",
+        ),
+    ):
+        HttpSourcePortfolioAdapter(client, resolver=StaticResolver()).acquire(
+                profile,
+                observed_at=datetime(2026, 8, 19, 4, 0, tzinfo=UTC),
+                backfill_limit=5,
+                known_paper_identities=frozenset(),
+                known_signal_targets=frozenset(),
+            )
 
 
 def test_qwen_requires_verified_owner_policy_metadata_and_no_model_files() -> None:

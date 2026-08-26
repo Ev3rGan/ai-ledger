@@ -860,6 +860,11 @@ class HttpSourcePortfolioAdapter:
                     or not isinstance(html_url, str)
                 ):
                     raise SourcePortfolioInvalidFormatError("Release identity is invalid")
+                if any(
+                    pattern.search(tag) is not None
+                    for pattern in policy["exclude_tag_patterns"]
+                ):
+                    continue
                 canonical_url = _canonical_https_url(html_url)
                 _validate_profile_url(profile, canonical_url)
                 if not urlparse(canonical_url).path.startswith(
@@ -1311,14 +1316,44 @@ def _release_policies(profile: SourceProfile) -> tuple[dict[str, Any], ...]:
     for item in raw:
         if (
             not isinstance(item, Mapping)
-            or set(item) != {"name", "licence_spdx", "release_body_eligible"}
+            or set(item)
+            != {"name", "licence_spdx", "release_body_eligible", "exclude_tag_patterns"}
             or not isinstance(item["name"], str)
             or not isinstance(item["licence_spdx"], str)
             or not isinstance(item["release_body_eligible"], bool)
         ):
             raise SourcePortfolioInvalidFormatError("Release policy is invalid")
-        policies.append(dict(item))
+        policies.append(
+            {
+                "name": item["name"],
+                "licence_spdx": item["licence_spdx"],
+                "release_body_eligible": item["release_body_eligible"],
+                "exclude_tag_patterns": _compiled_tag_patterns(
+                    item["exclude_tag_patterns"]
+                ),
+            }
+        )
     return tuple(policies)
+
+
+def _compiled_tag_patterns(value: Any) -> tuple[re.Pattern[str], ...]:
+    """Compile the configured automated-build tag exclusion patterns."""
+    if (
+        not isinstance(value, (list, tuple))
+        or not all(isinstance(pattern, str) and pattern.strip() for pattern in value)
+    ):
+        raise SourcePortfolioInvalidFormatError(
+            "Release tag exclusion patterns are invalid"
+        )
+    compiled: list[re.Pattern[str]] = []
+    for pattern in value:
+        try:
+            compiled.append(re.compile(pattern))
+        except re.error as error:
+            raise SourcePortfolioInvalidFormatError(
+                "Release tag exclusion pattern is invalid"
+            ) from error
+    return tuple(compiled)
 
 
 def _parse_optional_datetime(value: Any) -> datetime | None:
