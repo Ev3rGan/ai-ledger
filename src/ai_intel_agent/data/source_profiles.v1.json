@@ -1,6 +1,6 @@
 {
-  "version": "mvp-v2-1-m2-source-universe-2026-08-19.v2",
-  "active_set_version": "mvp-v2-1-m2-active-source-universe-2026-08-19.v2",
+  "version": "mvp-v2-1-m2-source-universe-2026-08-19.v3",
+  "active_set_version": "mvp-v2-1-m2-active-source-universe-2026-08-19.v3",
   "profiles": [
     {
       "key": "gemini-api-release-notes",

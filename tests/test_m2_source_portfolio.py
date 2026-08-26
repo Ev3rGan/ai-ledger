@@ -641,6 +641,32 @@ def test_curated_releases_apply_per_repository_tag_exclusion() -> None:
                     "prerelease": False,
                     "published_at": "2026-08-19T00:30:00Z",
                 },
+                {
+                    "id": 903,
+                    "html_url": (
+                        "https://github.com/sgl-project/sglang/releases/tag/"
+                        "v1.0.1-Nightly"
+                    ),
+                    "tag_name": "v1.0.1-Nightly",
+                    "name": "Capitalized build",
+                    "draft": False,
+                    "prerelease": False,
+                    "published_at": "2026-08-19T00:30:00Z",
+                },
+            ],
+            "huggingface/transformers": [
+                {
+                    "id": 1001,
+                    "html_url": (
+                        "https://github.com/huggingface/transformers/releases/tag/"
+                        "v0.2.0-nightly"
+                    ),
+                    "tag_name": "v0.2.0-nightly",
+                    "name": "Transformers snapshot",
+                    "draft": False,
+                    "prerelease": False,
+                    "published_at": "2026-08-19T01:00:00Z",
+                },
             ],
         }.get(repository, [])
         return httpx.Response(
@@ -662,7 +688,10 @@ def test_curated_releases_apply_per_repository_tag_exclusion() -> None:
         (item.source_record.external_id, item.source_record.external_version)
         for item in result.items
     }
-    assert included == {("801", "v1.3.0"), ("901", "v1.0.0")}
+    assert included == {("801", "v1.3.0"), ("901", "v1.0.0"), ("1001", "v0.2.0-nightly")}
+    assert ("802", "v1.3.0-ci-release") not in included
+    assert ("902", "v1.0.0-nightly") not in included
+    assert ("903", "v1.0.1-Nightly") not in included
     assert all(
         item.source_record.structured_metadata["repository"]
         == item.source_record.provenance["repository"]
@@ -707,12 +736,99 @@ def test_curated_releases_reject_invalid_tag_patterns() -> None:
         ),
     ):
         HttpSourcePortfolioAdapter(client, resolver=StaticResolver()).acquire(
-                profile,
-                observed_at=datetime(2026, 8, 19, 4, 0, tzinfo=UTC),
-                backfill_limit=5,
-                known_paper_identities=frozenset(),
-                known_signal_targets=frozenset(),
+            profile,
+            observed_at=datetime(2026, 8, 19, 4, 0, tzinfo=UTC),
+            backfill_limit=5,
+            known_paper_identities=frozenset(),
+            known_signal_targets=frozenset(),
+        )
+
+
+@pytest.mark.postgres
+def test_curated_releases_persist_only_eligible_releases_through_collection(
+    m2_portfolio_database_url,
+) -> None:
+    stable_url = "https://github.com/vllm-project/vllm/releases/tag/v1.2.3"
+    automated_url = "https://github.com/vllm-project/vllm/releases/tag/nightly-20260819"
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        repository = "/".join(request.url.path.split("/")[2:4])
+        if repository == "vllm-project/vllm":
+            releases = [
+                {
+                    "id": 701,
+                    "html_url": stable_url,
+                    "tag_name": "v1.2.3",
+                    "name": "vLLM 1.2.3",
+                    "body": "Licensed release notes.",
+                    "draft": False,
+                    "prerelease": False,
+                    "published_at": "2026-08-19T01:00:00Z",
+                },
+                {"id": 702, "draft": True, "prerelease": False},
+                {"id": 703, "draft": False, "prerelease": True},
+                {
+                    "id": 704,
+                    "html_url": automated_url,
+                    "tag_name": "nightly-20260819",
+                    "name": "Nightly build",
+                    "draft": False,
+                    "prerelease": False,
+                    "published_at": "2026-08-19T00:30:00Z",
+                },
+            ]
+        else:
+            releases = []
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            content=json.dumps(releases).encode(),
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond), trust_env=False) as client:
+        adapter = HttpSourcePortfolioAdapter(client, resolver=StaticResolver())
+        profiles = load_source_universe()
+        first = collect_source_profiles(
+            m2_portfolio_database_url,
+            profiles=profiles,
+            feed_adapter=EmptyFeedAdapter(),
+            article_adapter=NeverArticleAdapter(),
+            portfolio_adapter=adapter,
+            provider=SkipDraftProvider(),
+            clock=FixedClock(),
+            operation_key="t11:release-persist:first",
+            backfill_limit=5,
+        )
+        second = collect_source_profiles(
+            m2_portfolio_database_url,
+            profiles=profiles,
+            feed_adapter=EmptyFeedAdapter(),
+            article_adapter=NeverArticleAdapter(),
+            portfolio_adapter=adapter,
+            provider=SkipDraftProvider(),
+            clock=FixedClock(),
+            operation_key="t11:release-persist:second",
+            backfill_limit=5,
+        )
+
+    assert first.source_results["curated-github-releases"] == "success"
+    assert first.document_versions_created == 1
+    assert second.document_versions_created == 0
+    assert second.candidates_processed == 0
+
+    engine = create_database_engine(m2_portfolio_database_url)
+    try:
+        with engine.connect() as connection:
+            persisted = set(
+                connection.execute(text("SELECT canonical_url FROM candidates")).scalars()
             )
+    finally:
+        engine.dispose()
+    assert stable_url in persisted
+    assert automated_url not in persisted
+    assert all(
+        url.startswith("https://github.com/vllm-project/vllm/releases/") for url in persisted
+    )
 
 
 def test_qwen_requires_verified_owner_policy_metadata_and_no_model_files() -> None:

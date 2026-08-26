@@ -11,8 +11,8 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from ai_intel_agent.domain import ApprovedFeedSourceDefinition, Topic
 
-SOURCE_UNIVERSE_VERSION = "mvp-v2-1-m2-source-universe-2026-08-19.v2"
-SOURCE_UNIVERSE_SET_VERSION = "mvp-v2-1-m2-active-source-universe-2026-08-19.v2"
+SOURCE_UNIVERSE_VERSION = "mvp-v2-1-m2-source-universe-2026-08-19.v3"
+SOURCE_UNIVERSE_SET_VERSION = "mvp-v2-1-m2-active-source-universe-2026-08-19.v3"
 CORE_PROFILE_KEYS = (
     "gemini-api-release-notes",
     "the-decoder.com",

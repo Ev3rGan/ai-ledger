@@ -823,7 +823,7 @@ class HttpSourcePortfolioAdapter:
         backfill_limit: int,
     ) -> SourceAcquisition:
         policies = _release_policies(profile)
-        if tuple(policy["name"] for policy in policies) != APPROVED_RELEASE_REPOSITORIES:
+        if tuple(policy.name for policy in policies) != APPROVED_RELEASE_REPOSITORIES:
             raise SourcePortfolioInvalidFormatError("Release allowlist is invalid")
         maximum = min(
             backfill_limit,
@@ -831,7 +831,7 @@ class HttpSourcePortfolioAdapter:
         )
         items: list[SourcePortfolioItemResult] = []
         for policy in policies:
-            repository = policy["name"]
+            repository = policy.name
             location = profile.entry_point.format(repository=repository)
             payload = self._fetch_json(
                 location,
@@ -862,7 +862,7 @@ class HttpSourcePortfolioAdapter:
                     raise SourcePortfolioInvalidFormatError("Release identity is invalid")
                 if any(
                     pattern.search(tag) is not None
-                    for pattern in policy["exclude_tag_patterns"]
+                    for pattern in policy.exclude_tag_patterns
                 ):
                     continue
                 canonical_url = _canonical_https_url(html_url)
@@ -885,7 +885,7 @@ class HttpSourcePortfolioAdapter:
                     for line in (raw_body if isinstance(raw_body, str) else "").splitlines()
                     if line.strip()
                 )
-                body_eligible = policy["release_body_eligible"]
+                body_eligible = policy.release_body_eligible
                 published = _parse_optional_datetime(raw.get("published_at"))
                 document_lines = [title, "", f"Repository: {repository}", f"Tag: {tag}"]
                 if body_eligible and notes:
@@ -909,7 +909,7 @@ class HttpSourcePortfolioAdapter:
                         provenance={"entry_point": location, "repository": repository},
                         policy_metadata={
                             "assets_fetched": False,
-                            "licence_spdx": policy["licence_spdx"],
+                            "licence_spdx": policy.licence_spdx,
                             "release_body_eligible": body_eligible,
                             "release_notes_sha256": (
                                 sha256(notes.encode()).hexdigest()
@@ -1308,11 +1308,21 @@ def _positive_integer_setting(profile: SourceProfile, key: str) -> int:
     return value
 
 
-def _release_policies(profile: SourceProfile) -> tuple[dict[str, Any], ...]:
+@dataclass(frozen=True)
+class ReleasePolicy:
+    """One configurable repository policy for curated GitHub Releases."""
+
+    name: str
+    licence_spdx: str
+    release_body_eligible: bool
+    exclude_tag_patterns: tuple[re.Pattern[str], ...]
+
+
+def _release_policies(profile: SourceProfile) -> tuple[ReleasePolicy, ...]:
     raw = profile.settings.get("repositories")
     if not isinstance(raw, (list, tuple)) or not raw:
         raise SourcePortfolioInvalidFormatError("Release policies are invalid")
-    policies: list[dict[str, Any]] = []
+    policies: list[ReleasePolicy] = []
     for item in raw:
         if (
             not isinstance(item, Mapping)
@@ -1324,14 +1334,14 @@ def _release_policies(profile: SourceProfile) -> tuple[dict[str, Any], ...]:
         ):
             raise SourcePortfolioInvalidFormatError("Release policy is invalid")
         policies.append(
-            {
-                "name": item["name"],
-                "licence_spdx": item["licence_spdx"],
-                "release_body_eligible": item["release_body_eligible"],
-                "exclude_tag_patterns": _compiled_tag_patterns(
+            ReleasePolicy(
+                name=item["name"],
+                licence_spdx=item["licence_spdx"],
+                release_body_eligible=item["release_body_eligible"],
+                exclude_tag_patterns=_compiled_tag_patterns(
                     item["exclude_tag_patterns"]
                 ),
-            }
+            )
         )
     return tuple(policies)
 
@@ -1348,7 +1358,7 @@ def _compiled_tag_patterns(value: Any) -> tuple[re.Pattern[str], ...]:
     compiled: list[re.Pattern[str]] = []
     for pattern in value:
         try:
-            compiled.append(re.compile(pattern))
+            compiled.append(re.compile(pattern, re.IGNORECASE))
         except re.error as error:
             raise SourcePortfolioInvalidFormatError(
                 "Release tag exclusion pattern is invalid"
