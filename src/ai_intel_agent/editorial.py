@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
@@ -32,6 +33,8 @@ from ai_intel_agent.model_routing_evaluation import (
     load_candidate_configuration,
     load_protocol_configuration,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -155,7 +158,6 @@ class EditorialStoryProposal:
 
 @dataclass(frozen=True)
 class EditorialPlanProposal:
-    digest_summary: str
     stories: tuple[EditorialStoryProposal, ...]
     provider_identifier: str
     protocol_version: str
@@ -218,25 +220,34 @@ class DeepSeekEditorialPlanProvider:
             raise EditorialStateError(
                 "Editorial Window pending Story count is outside the Agent protocol"
             )
+        expected_stable_keys = tuple(story.stable_key for story in context.stories)
         context_json = json.dumps(
             _editorial_context_payload(context),
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
         )
-        request_payload = {
-            "model": self._candidate.model_id,
-            "messages": [
-                {"role": "system", "content": self._protocol.system_prompt},
-                {
-                    "role": "user",
-                    "content": self._protocol.user_prompt_template.format(
-                        context_json=context_json
+        base_messages = [
+            {"role": "system", "content": self._protocol.system_prompt},
+            {
+                "role": "user",
+                "content": self._protocol.user_prompt_template.format(
+                    context_json=context_json,
+                    expected_story_count=len(expected_stable_keys),
+                    expected_stable_keys_json=json.dumps(
+                        expected_stable_keys,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
                     ),
-                },
-            ],
+                ),
+            },
+        ]
+        request_payload: dict[str, object] = {
+            "model": self._candidate.model_id,
+            "messages": base_messages,
             "response_format": {"type": "json_object"},
             "thinking": {"type": "disabled"},
+            "temperature": 0.0,
             "max_tokens": min(
                 self._candidate.maximum_output_tokens,
                 self._protocol.maximum_output_tokens,
@@ -244,11 +255,25 @@ class DeepSeekEditorialPlanProvider:
             "stream": False,
         }
         attempts = 0
-        response: httpx.Response | None = None
+        last_output_error: EditorialStateError | None = None
         while attempts < self._routing_protocol.retry_policy.max_attempts:
             attempts += 1
             if self._budget is not None and not self._budget.reserve():
                 raise EditorialStateError("Aggregate monthly Provider budget is exhausted")
+            messages = list(base_messages)
+            if last_output_error is not None:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "The previous response failed validation: "
+                            f"{last_output_error}. Return a fresh, complete JSON object for all "
+                            f"{len(expected_stable_keys)} supplied Stories. Keep every field concise, "
+                            "copy every stable_key exactly once, and do not add keys."
+                        ),
+                    }
+                )
+            request_payload["messages"] = messages
             try:
                 response = self._client.post(
                     f"{self._candidate.base_url.rstrip('/')}/chat/completions",
@@ -263,36 +288,85 @@ class DeepSeekEditorialPlanProvider:
                     raise EditorialStateError("Editorial Agent Provider request failed") from error
                 self._sleeper(self._routing_protocol.retry_policy.backoff_seconds[attempts - 1])
                 continue
-            if (
-                response.status_code not in self._routing_protocol.retry_policy.retry_status_codes
-                or attempts >= self._routing_protocol.retry_policy.max_attempts
-            ):
-                break
+            if not response.is_success:
+                if (
+                    response.status_code
+                    in self._routing_protocol.retry_policy.retry_status_codes
+                    and attempts < self._routing_protocol.retry_policy.max_attempts
+                ):
+                    self._sleeper(
+                        self._routing_protocol.retry_policy.backoff_seconds[attempts - 1]
+                    )
+                    continue
+                raise EditorialStateError(
+                    f"Editorial Agent Provider returned HTTP {response.status_code}"
+                )
+
+            output_error: EditorialStateError | None = None
+            response_identifier: object = "unavailable"
+            finish_reason: object = "unavailable"
+            content_characters: int | str = "unavailable"
+            try:
+                response_body = response.json()
+                if isinstance(response_body, dict):
+                    response_identifier = response_body.get("id", "unavailable")
+                choice = response_body["choices"][0]
+                content = choice["message"]["content"]
+                finish_reason = choice["finish_reason"]
+                returned_model = response_body["model"]
+                if isinstance(content, str):
+                    content_characters = len(content)
+            except (IndexError, KeyError, TypeError, ValueError):
+                output_error = EditorialStateError(
+                    "Editorial Agent Provider response shape is invalid"
+                )
+            else:
+                if returned_model != self._candidate.model_id:
+                    raise EditorialStateError(
+                        "Editorial Agent Provider returned an unapproved model"
+                    )
+                if finish_reason != "stop" or not isinstance(content, str):
+                    output_error = EditorialStateError(
+                        "Editorial Agent Provider response did not finish completely"
+                    )
+                else:
+                    try:
+                        proposal = _parse_editorial_plan_proposal(
+                            content,
+                            provider_identifier=(
+                                f"{self._protocol.route_identifier}@"
+                                f"{self._candidate.model_version}"
+                            ),
+                            protocol_version=self._protocol.version,
+                        )
+                        _proposals_by_stable_key(
+                            proposal.stories,
+                            expected_stable_keys=set(expected_stable_keys),
+                        )
+                    except EditorialStateError as error:
+                        output_error = error
+                    else:
+                        return proposal
+
+            if output_error is None:
+                raise AssertionError("Editorial Provider output validation lost its error")
+            LOGGER.warning(
+                "Editorial Provider output rejected: attempt=%d response_id=%s "
+                "finish_reason=%s content_characters=%s error=%s",
+                attempts,
+                response_identifier,
+                finish_reason,
+                content_characters,
+                output_error,
+            )
+            if attempts >= self._routing_protocol.retry_policy.max_attempts:
+                raise EditorialStateError(
+                    f"{output_error} after {attempts} attempts"
+                ) from output_error
+            last_output_error = output_error
             self._sleeper(self._routing_protocol.retry_policy.backoff_seconds[attempts - 1])
-        if response is None or not response.is_success:
-            status = response.status_code if response is not None else "unavailable"
-            raise EditorialStateError(f"Editorial Agent Provider returned HTTP {status}")
-        try:
-            response_body = response.json()
-            choice = response_body["choices"][0]
-            content = choice["message"]["content"]
-            finish_reason = choice["finish_reason"]
-            returned_model = response_body["model"]
-        except (IndexError, KeyError, TypeError, ValueError) as error:
-            raise EditorialStateError(
-                "Editorial Agent Provider response shape is invalid"
-            ) from error
-        if finish_reason != "stop" or not isinstance(content, str):
-            raise EditorialStateError("Editorial Agent Provider response did not finish completely")
-        if returned_model != self._candidate.model_id:
-            raise EditorialStateError("Editorial Agent Provider returned an unapproved model")
-        return _parse_editorial_plan_proposal(
-            content,
-            provider_identifier=(
-                f"{self._protocol.route_identifier}@{self._candidate.model_version}"
-            ),
-            protocol_version=self._protocol.version,
-        )
+
+        raise AssertionError("Editorial Provider retry loop exited unexpectedly")
 
 
 def load_editorial_agent_protocol() -> EditorialAgentProtocol:
@@ -324,7 +398,12 @@ def load_editorial_agent_protocol() -> EditorialAgentProtocol:
             raise EditorialStateError("Editorial Agent protocol text is invalid")
     if payload["route_identifier"] != "deepseek:v4-pro":
         raise EditorialStateError("Editorial Agent protocol route is not approved")
-    if payload["user_prompt_template"].count("{context_json}") != 1:
+    required_prompt_fields = (
+        "{context_json}",
+        "{expected_story_count}",
+        "{expected_stable_keys_json}",
+    )
+    if any(payload["user_prompt_template"].count(field) != 1 for field in required_prompt_fields):
         raise EditorialStateError("Editorial Agent prompt contract is invalid")
     maximum_pending_stories = payload["maximum_pending_stories"]
     maximum_output_tokens = payload["maximum_output_tokens"]
@@ -359,12 +438,11 @@ def _parse_editorial_plan_proposal(
         payload = json.loads(raw_content)
     except json.JSONDecodeError as error:
         raise EditorialStateError("Editorial Agent output is not valid JSON") from error
-    if not isinstance(payload, dict) or set(payload) != {"digest_summary", "stories"}:
-        raise EditorialStateError("Editorial Agent output keys do not match v1")
-    digest_summary = payload["digest_summary"]
+    if not isinstance(payload, dict) or set(payload) != {"stories"}:
+        raise EditorialStateError("Editorial Agent output keys do not match v2")
     raw_stories = payload["stories"]
-    if not isinstance(digest_summary, str) or not isinstance(raw_stories, list):
-        raise EditorialStateError("Editorial Agent output types do not match v1")
+    if not isinstance(raw_stories, list):
+        raise EditorialStateError("Editorial Agent output types do not match v2")
     stories: list[EditorialStoryProposal] = []
     required_story_keys = {
         "stable_key",
@@ -378,7 +456,7 @@ def _parse_editorial_plan_proposal(
     }
     for raw_story in raw_stories:
         if not isinstance(raw_story, dict) or set(raw_story) != required_story_keys:
-            raise EditorialStateError("Editorial Agent Story output keys do not match v1")
+            raise EditorialStateError("Editorial Agent Story output keys do not match v2")
         secondary_topics = raw_story["secondary_topics"]
         order = raw_story["order"]
         exclusion_reason = raw_story["exclusion_reason"]
@@ -396,7 +474,7 @@ def _parse_editorial_plan_proposal(
             or (order is not None and (isinstance(order, bool) or not isinstance(order, int)))
             or (exclusion_reason is not None and not isinstance(exclusion_reason, str))
         ):
-            raise EditorialStateError("Editorial Agent Story output types do not match v1")
+            raise EditorialStateError("Editorial Agent Story output types do not match v2")
         try:
             inclusion = DigestPlanInclusion(raw_story["inclusion"])
         except ValueError as error:
@@ -414,11 +492,27 @@ def _parse_editorial_plan_proposal(
             )
         )
     return EditorialPlanProposal(
-        digest_summary=digest_summary,
         stories=tuple(stories),
         provider_identifier=provider_identifier,
         protocol_version=protocol_version,
     )
+
+
+def _proposals_by_stable_key(
+    stories: tuple[EditorialStoryProposal, ...],
+    *,
+    expected_stable_keys: set[str],
+) -> dict[str, EditorialStoryProposal]:
+    proposals_by_key: dict[str, EditorialStoryProposal] = {}
+    for item in stories:
+        if item.stable_key in proposals_by_key:
+            raise EditorialStateError(f"Editorial Provider repeated Story {item.stable_key!r}")
+        proposals_by_key[item.stable_key] = item
+    if set(proposals_by_key) != expected_stable_keys:
+        raise EditorialStateError(
+            "Editorial Provider must return exactly one proposal for every pending Story"
+        )
+    return proposals_by_key
 
 
 @dataclass(frozen=True)
@@ -526,25 +620,25 @@ def _normalize_editorial_window_proposals(
                 exclusion_reason=_FUTURE_EDITORIAL_WINDOW_HOLD_REASON,
             )
 
-    provider_included = tuple(
-        item
-        for item in proposals_by_key.values()
-        if item.inclusion is DigestPlanInclusion.INCLUDED
+    for stable_key, item in tuple(normalized.items()):
+        if item.inclusion is not DigestPlanInclusion.INCLUDED and item.order is not None:
+            normalized[stable_key] = replace(item, order=None)
+
+    included = tuple(
+        item for item in normalized.values() if item.inclusion is DigestPlanInclusion.INCLUDED
     )
-    provider_orders = tuple(item.order for item in provider_included)
+    provider_orders = tuple(item.order for item in included)
     if (
-        any(order is None for order in provider_orders)
+        any(
+            order is None or isinstance(order, bool) or not isinstance(order, int)
+            for order in provider_orders
+        )
         or len(set(provider_orders)) != len(provider_orders)
-        or set(provider_orders) != set(range(len(provider_orders)))
     ):
         return normalized
 
     included_by_provider_order = sorted(
-        (
-            item
-            for item in normalized.values()
-            if item.inclusion is DigestPlanInclusion.INCLUDED
-        ),
+        included,
         key=lambda item: item.order if item.order is not None else -1,
     )
     for order, item in enumerate(included_by_provider_order):
@@ -596,16 +690,11 @@ def prepare_digest_plan(
     if version < 1:
         raise EditorialStateError("Digest Plan version must be positive")
     proposal = provider.prepare(context)
-    proposals_by_key: dict[str, EditorialStoryProposal] = {}
-    for item in proposal.stories:
-        if item.stable_key in proposals_by_key:
-            raise EditorialStateError(f"Editorial Provider repeated Story {item.stable_key!r}")
-        proposals_by_key[item.stable_key] = item
     expected_keys = {story.stable_key for story in context.stories}
-    if set(proposals_by_key) != expected_keys:
-        raise EditorialStateError(
-            "Editorial Provider must return exactly one proposal for every pending Story"
-        )
+    proposals_by_key = _proposals_by_stable_key(
+        proposal.stories,
+        expected_stable_keys=expected_keys,
+    )
     proposals_by_key = _normalize_editorial_window_proposals(context, proposals_by_key)
     provider_identifier = proposal.provider_identifier.strip()
     protocol_version = proposal.protocol_version.strip()
@@ -906,26 +995,50 @@ def _digest_plan_anomalies(
     valid_topics = {topic.value for topic in Topic}
     source_health = {item.source_definition_id: item for item in context.source_health}
     for item in stories:
-        invalid_fields = (
-            not 20 <= len(item.summary.strip()) <= 1000
-            or not 20 <= len(item.why_it_matters.strip()) <= 1000
-            or item.primary_topic not in valid_topics
-            or len(item.secondary_topics) != len(set(item.secondary_topics))
-            or item.primary_topic in item.secondary_topics
-            or any(topic not in valid_topics for topic in item.secondary_topics)
-            or (
-                item.inclusion is DigestPlanInclusion.INCLUDED and item.exclusion_reason is not None
-            )
-            or (
-                item.inclusion is not DigestPlanInclusion.INCLUDED
-                and not (item.exclusion_reason or "").strip()
-            )
+        invalid_fields: list[str] = []
+        if item.inclusion is DigestPlanInclusion.INCLUDED:
+            summary_length = len(item.summary.strip())
+            why_it_matters_length = len(item.why_it_matters.strip())
+            if not 20 <= summary_length <= 1000:
+                invalid_fields.append(
+                    f"summary length {summary_length} is outside 20..1000"
+                )
+            if not 20 <= why_it_matters_length <= 1000:
+                invalid_fields.append(
+                    "why_it_matters length "
+                    f"{why_it_matters_length} is outside 20..1000"
+                )
+        if item.primary_topic not in valid_topics:
+            invalid_fields.append(f"primary_topic {item.primary_topic!r} is invalid")
+        if len(item.secondary_topics) != len(set(item.secondary_topics)):
+            invalid_fields.append("secondary_topics contains duplicates")
+        if item.primary_topic in item.secondary_topics:
+            invalid_fields.append("primary_topic is repeated in secondary_topics")
+        invalid_secondary_topics = tuple(
+            topic for topic in item.secondary_topics if topic not in valid_topics
         )
+        if invalid_secondary_topics:
+            invalid_fields.append(
+                f"secondary_topics contains invalid values {invalid_secondary_topics!r}"
+            )
+        if (
+            item.inclusion is DigestPlanInclusion.INCLUDED
+            and item.exclusion_reason is not None
+        ):
+            invalid_fields.append("included Story has an exclusion_reason")
+        if (
+            item.inclusion is not DigestPlanInclusion.INCLUDED
+            and not (item.exclusion_reason or "").strip()
+        ):
+            invalid_fields.append("excluded or held Story lacks an exclusion_reason")
         if invalid_fields:
             anomalies.append(
                 DigestPlanAnomaly(
                     code="invalid-editorial-fields",
-                    message="Story reader-facing fields do not satisfy the Editorial contract",
+                    message=(
+                        "Story Editorial fields do not satisfy the contract: "
+                        + "; ".join(invalid_fields)
+                    ),
                     blocking=True,
                     story_stable_key=item.stable_key,
                 )

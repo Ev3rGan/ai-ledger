@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from typer.testing import CliRunner
 
 import ai_intel_agent.cli as cli_module
+import ai_intel_agent.editorial as editorial_module
 from ai_intel_agent.cli import app
 from ai_intel_agent.domain import (
     Candidate,
@@ -153,7 +154,6 @@ class _FakeEditorialProvider:
                 )
             )
         return EditorialPlanProposal(
-            digest_summary="本期 Digest 汇总多来源 AI 进展，并保留逐条 Evidence 可追溯性。",
             stories=tuple(proposals),
             provider_identifier=self.identifier,
             protocol_version=self.protocol_version,
@@ -188,7 +188,6 @@ class _ExcludeUnsupportedEditorialProvider(_FakeEditorialProvider):
             if included:
                 included_order += 1
         return EditorialPlanProposal(
-            digest_summary=f"  {original.digest_summary}  ",
             stories=tuple(proposals),
             provider_identifier=self.identifier,
             protocol_version=self.protocol_version,
@@ -216,7 +215,6 @@ class _StaticEditorialProvider:
             story.stable_key for story in context.stories
         }
         return EditorialPlanProposal(
-            digest_summary="本期 Digest 对 Editorial Window 进行确定性安全归一化并保留完整证据。",
             stories=self._proposals,
             provider_identifier=self.identifier,
             protocol_version=self.protocol_version,
@@ -773,6 +771,179 @@ def test_editorial_window_normalization_holds_future_without_upgrading_provider_
     assert not any(anomaly.blocking for anomaly in plan.anomalies)
 
 
+def test_editorial_order_normalization_accepts_one_based_provider_rankings() -> None:
+    source_ids = tuple(_id(f"one-based-source:{position}") for position in range(4))
+    publishers = ("Gemini", "TechCrunch", "Hugging Face", "QbitAI")
+    window_start, _ = editorial_window_for(date(2026, 8, 21))
+    stories = tuple(
+        replace(
+            _story(
+                position,
+                publisher=publishers[position % len(publishers)],
+                source_id=source_ids[position % len(source_ids)],
+            ),
+            original_published_at=window_start + timedelta(hours=position),
+        )
+        for position in range(8)
+    )
+    context = _editorial_context_for(stories)
+    provider_order = (
+        "story:7",
+        "story:3",
+        "story:0",
+        "story:6",
+        "story:2",
+        "story:5",
+        "story:1",
+        "story:4",
+    )
+    one_based_orders = {
+        stable_key: order for order, stable_key in enumerate(provider_order, start=1)
+    }
+    one_based_proposals = tuple(
+        _editorial_story_proposal(
+            story,
+            inclusion=DigestPlanInclusion.INCLUDED,
+            order=one_based_orders[story.stable_key],
+            exclusion_reason=None,
+        )
+        for story in stories
+    )
+    provider = _StaticEditorialProvider(one_based_proposals)
+
+    plan = prepare_digest_plan(
+        context,
+        provider,
+        version=1,
+        prepared_at=datetime(2026, 8, 20, 16, tzinfo=UTC),
+    )
+
+    assert tuple(story.stable_key for story in plan.included_stories) == provider_order
+    assert tuple(story.order for story in plan.included_stories) == tuple(range(8))
+    assert not any(anomaly.code == "invalid-order" for anomaly in plan.anomalies)
+    assert not any(anomaly.blocking for anomaly in plan.anomalies)
+
+    duplicate_rank_plan = prepare_digest_plan(
+        context,
+        _StaticEditorialProvider(
+            tuple(
+                replace(item, order=1 if item.order == 2 else item.order)
+                for item in one_based_proposals
+            )
+        ),
+        version=1,
+        prepared_at=datetime(2026, 8, 20, 16, tzinfo=UTC),
+    )
+    duplicate_rank_anomaly = next(
+        anomaly
+        for anomaly in duplicate_rank_plan.anomalies
+        if anomaly.code == "invalid-order"
+    )
+    assert duplicate_rank_anomaly.blocking
+
+
+def test_excluded_story_short_reader_fields_do_not_block_plan() -> None:
+    source_ids = tuple(_id(f"excluded-fields-source:{position}") for position in range(4))
+    publishers = ("Gemini", "TechCrunch", "Hugging Face", "QbitAI")
+    window_start, _ = editorial_window_for(date(2026, 8, 21))
+    stories = tuple(
+        replace(
+            _story(
+                position,
+                publisher=publishers[position % len(publishers)],
+                source_id=source_ids[position % len(source_ids)],
+            ),
+            original_published_at=window_start + timedelta(hours=position),
+        )
+        for position in range(9)
+    )
+    context = _editorial_context_for(stories)
+    proposals = []
+    for position, story in enumerate(stories):
+        included = position < 8
+        proposal = _editorial_story_proposal(
+            story,
+            inclusion=(
+                DigestPlanInclusion.INCLUDED if included else DigestPlanInclusion.EXCLUDED
+            ),
+            order=position if included else 99,
+            exclusion_reason=None if included else "Outside the selected editorial focus.",
+        )
+        if not included:
+            proposal = replace(
+                proposal,
+                why_it_matters="改进AI代理基准测试的可信度与泛化性。",
+            )
+        proposals.append(proposal)
+
+    plan = prepare_digest_plan(
+        context,
+        _StaticEditorialProvider(tuple(proposals)),
+        version=1,
+        prepared_at=datetime(2026, 8, 20, 16, tzinfo=UTC),
+    )
+
+    assert len(plan.included_stories) == 8
+    assert plan.excluded_stories[0].order is None
+    assert not any(anomaly.code == "invalid-order" for anomaly in plan.anomalies)
+    assert not any(
+        anomaly.code == "invalid-editorial-fields"
+        and anomaly.story_stable_key == stories[-1].stable_key
+        for anomaly in plan.anomalies
+    )
+    assert not any(anomaly.blocking for anomaly in plan.anomalies)
+
+
+def test_included_story_invalid_field_anomaly_names_the_failing_field() -> None:
+    source_ids = tuple(_id(f"included-fields-source:{position}") for position in range(4))
+    publishers = ("Gemini", "TechCrunch", "Hugging Face", "QbitAI")
+    window_start, _ = editorial_window_for(date(2026, 8, 21))
+    stories = tuple(
+        replace(
+            _story(
+                position,
+                publisher=publishers[position % len(publishers)],
+                source_id=source_ids[position % len(source_ids)],
+            ),
+            original_published_at=window_start + timedelta(hours=position),
+        )
+        for position in range(8)
+    )
+    context = _editorial_context_for(stories)
+    proposals = tuple(
+        replace(
+            _editorial_story_proposal(
+                story,
+                inclusion=DigestPlanInclusion.INCLUDED,
+                order=position,
+                exclusion_reason=None,
+            ),
+            why_it_matters=(
+                "改进AI代理基准测试的可信度与泛化性。"
+                if position == 0
+                else "这项进展会影响开发者的模型选择、验证工作以及后续迁移计划。"
+            ),
+        )
+        for position, story in enumerate(stories)
+    )
+
+    plan = prepare_digest_plan(
+        context,
+        _StaticEditorialProvider(proposals),
+        version=1,
+        prepared_at=datetime(2026, 8, 20, 16, tzinfo=UTC),
+    )
+
+    anomaly = next(
+        anomaly
+        for anomaly in plan.anomalies
+        if anomaly.code == "invalid-editorial-fields"
+        and anomaly.story_stable_key == stories[0].stable_key
+    )
+    assert anomaly.blocking
+    assert "why_it_matters length 19 is outside 20..1000" in anomaly.message
+
+
 def test_digest_summary_stays_approvable_with_long_included_headlines() -> None:
     source_ids = tuple(_id(f"summary-bound-source:{position}") for position in range(4))
     publishers = ("Gemini", "TechCrunch", "Hugging Face", "QbitAI")
@@ -948,7 +1119,6 @@ def test_versioned_editorial_provider_protocol_is_strict_and_uses_no_live_networ
     )
     fake_proposal = _FakeEditorialProvider().prepare(context)
     provider_output = {
-        "digest_summary": fake_proposal.digest_summary,
         "stories": [
             {
                 "stable_key": item.stable_key,
@@ -971,8 +1141,11 @@ def test_versioned_editorial_provider_protocol_is_strict_and_uses_no_live_networ
         assert request.headers["Authorization"] == "Bearer fixture-key"
         assert payload["model"] == "deepseek-v4-pro"
         assert payload["thinking"] == {"type": "disabled"}
+        assert payload["temperature"] == 0.0
         user_message = payload["messages"][1]["content"]
         assert stories[0].claims[0].evidence_spans[0].exact_text in user_message
+        assert "Expected Story count: 12" in user_message
+        assert stories[0].stable_key in user_message
         return httpx.Response(
             200,
             json={
@@ -1008,6 +1181,7 @@ def test_versioned_editorial_provider_protocol_is_strict_and_uses_no_live_networ
     assert len(protocol.content_sha256) == 64
     assert protocol.maximum_pending_stories == 12
     assert protocol.maximum_output_tokens == 4096
+    assert protocol.version == "editorial-digest-plan-2026-08-26.v2"
     assert budget.calls == 1
     assert len(observed_requests) == 1
     assert observed_requests[0]["max_tokens"] == 4096
@@ -1015,7 +1189,10 @@ def test_versioned_editorial_provider_protocol_is_strict_and_uses_no_live_networ
     invalid_output = json.loads(json.dumps(provider_output))
     invalid_output["stories"][0]["evidence"] = "invented Evidence"
 
-    def invalid_response(_: httpx.Request) -> httpx.Response:
+    invalid_requests: list[httpx.Request] = []
+
+    def invalid_response(request: httpx.Request) -> httpx.Response:
+        invalid_requests.append(request)
         return httpx.Response(
             200,
             json={
@@ -1034,6 +1211,99 @@ def test_versioned_editorial_provider_protocol_is_strict_and_uses_no_live_networ
         pytest.raises(ValueError, match="Story output keys"),
     ):
         DeepSeekEditorialPlanProvider(client, api_key="fixture-key").prepare(context)
+    assert len(invalid_requests) == 2
+
+
+@pytest.mark.parametrize(
+    ("failure_mode", "expected_retry_error"),
+    (
+        ("wrong-order-type", "Story output types do not match v2"),
+        (
+            "missing-story",
+            "must return exactly one proposal for every pending Story",
+        ),
+    ),
+)
+def test_editorial_provider_retries_invalid_successful_response(
+    failure_mode: str,
+    expected_retry_error: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    story = _story(0, publisher="Gemini", source_id=_id("semantic-retry-source"))
+    context = _editorial_context_for((story,))
+    fake_proposal = _FakeEditorialProvider().prepare(context)
+    valid_output = {
+        "stories": [
+            {
+                "stable_key": item.stable_key,
+                "inclusion": item.inclusion.value,
+                "order": item.order,
+                "summary": item.summary,
+                "why_it_matters": item.why_it_matters,
+                "primary_topic": item.primary_topic,
+                "secondary_topics": list(item.secondary_topics),
+                "exclusion_reason": item.exclusion_reason,
+            }
+            for item in fake_proposal.stories
+        ],
+    }
+    invalid_output = json.loads(json.dumps(valid_output))
+    if failure_mode == "wrong-order-type":
+        invalid_output["stories"][0]["order"] = "1"
+    else:
+        invalid_output["stories"] = []
+    observed_requests: list[dict[str, object]] = []
+    warning_messages: list[str] = []
+    monkeypatch.setattr(
+        editorial_module.LOGGER,
+        "warning",
+        lambda message, *args: warning_messages.append(message % args),
+    )
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        observed_requests.append(json.loads(request.content))
+        output = invalid_output if len(observed_requests) == 1 else valid_output
+        return httpx.Response(
+            200,
+            json={
+                "id": f"fixture-response-{len(observed_requests)}",
+                "model": "deepseek-v4-pro",
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": json.dumps(output, ensure_ascii=False)},
+                    }
+                ],
+            },
+        )
+
+    class Budget:
+        calls = 0
+
+        def reserve(self) -> bool:
+            self.calls += 1
+            return True
+
+    budget = Budget()
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        proposal = DeepSeekEditorialPlanProvider(
+            client,
+            api_key="fixture-key",
+            budget=budget,
+            sleeper=lambda _: None,
+        ).prepare(context)
+
+    assert proposal.stories == fake_proposal.stories
+    assert budget.calls == 2
+    assert len(observed_requests) == 2
+    retry_messages = observed_requests[1]["messages"]
+    assert expected_retry_error in retry_messages[-1]["content"]
+    assert len(warning_messages) == 1
+    warning = warning_messages[0]
+    assert "attempt=1 response_id=fixture-response-1" in warning
+    assert expected_retry_error in warning
+    assert "fixture-key" not in warning
+    assert fake_proposal.stories[0].summary not in warning
 
 
 def test_repository_prepares_and_approves_only_the_newest_twelve_story_batch(
