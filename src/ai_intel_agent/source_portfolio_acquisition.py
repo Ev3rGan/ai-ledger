@@ -1358,7 +1358,7 @@ def _compiled_tag_patterns(value: Any) -> tuple[re.Pattern[str], ...]:
     compiled: list[re.Pattern[str]] = []
     for pattern in value:
         try:
-            compiled.append(re.compile(pattern, re.IGNORECASE))
+            compiled.append(re.compile(pattern.strip(), re.IGNORECASE))
         except re.error as error:
             raise SourcePortfolioInvalidFormatError(
                 "Release tag exclusion pattern is invalid"
