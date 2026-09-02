@@ -91,7 +91,7 @@ jobs:
             "required=false" >> $env:GITHUB_OUTPUT
             exit 0
           }
-          git diff --quiet $env:BASE_SHA $env:HEAD_SHA -- `
+          $changed = @(git diff --name-only $env:BASE_SHA $env:HEAD_SHA -- `
             pyproject.toml `
             uv.lock `
             src/ai_intel_agent/cli.py `
@@ -103,13 +103,14 @@ jobs:
             src/ai_intel_agent/data/model_routing_evaluation.v1.json `
             src/ai_intel_agent/data/model_routing_protocol.v1.json `
             src/ai_intel_agent/data/research_protocol.v1.json `
-            src/ai_intel_agent/data/research_provider_qualification.v1.json
-          if ($LASTEXITCODE -eq 0) {
-            "required=false" >> $env:GITHUB_OUTPUT
-          } elseif ($LASTEXITCODE -eq 1) {
-            "required=true" >> $env:GITHUB_OUTPUT
-          } else {
+            src/ai_intel_agent/data/research_provider_qualification.v1.json)
+          if ($LASTEXITCODE -ne 0) {
             throw "Could not classify Provider-facing changes"
+          }
+          if ($changed.Count -eq 0) {
+            "required=false" >> $env:GITHUB_OUTPUT
+          } else {
+            "required=true" >> $env:GITHUB_OUTPUT
           }
 
   provider-qualification:

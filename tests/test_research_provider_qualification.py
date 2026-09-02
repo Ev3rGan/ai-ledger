@@ -250,6 +250,8 @@ def test_provider_facing_pull_requests_run_one_protected_live_gate() -> None:
     assert "uses: ./.github/workflows/provider-qualification.yml" in deterministic_ci
     assert "github.event.pull_request.head.sha" in deterministic_ci
     assert "name: provider-acceptance" in deterministic_ci
+    assert "git diff --name-only" in deterministic_ci
+    assert "git diff --quiet" not in deterministic_ci
     qualified_paths = set(
         load_research_provider_qualification_corpus().qualified_source_paths
     )
