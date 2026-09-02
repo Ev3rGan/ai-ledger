@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   quality:
@@ -31,7 +32,7 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked --python 3.12 --extra ch3 --extra dev
 
-      - name: Run tests
+      - name: Run deterministic tests (mocked providers only)
         run: uv run --extra dev pytest
 
       - name: Run lint
@@ -66,3 +67,156 @@ jobs:
               server.drop()
           '@
           uv run --extra dev python -c $script
+
+  provider-scope:
+    name: detect Provider-facing changes
+    runs-on: windows-latest
+    outputs:
+      required: ${{ steps.scope.outputs.required }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Detect the qualified source boundary
+        id: scope
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if ($env:EVENT_NAME -ne "pull_request") {
+            "required=false" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          $changed = @(git diff --name-only $env:BASE_SHA $env:HEAD_SHA -- `
+            pyproject.toml `
+            uv.lock `
+            src/ai_intel_agent/cli.py `
+            src/ai_intel_agent/domain.py `
+            src/ai_intel_agent/model_routing_evaluation.py `
+            src/ai_intel_agent/research.py `
+            src/ai_intel_agent/research_provider_qualification.py `
+            src/ai_intel_agent/data/model_routing_candidates.v1.json `
+            src/ai_intel_agent/data/model_routing_evaluation.v1.json `
+            src/ai_intel_agent/data/model_routing_protocol.v1.json `
+            src/ai_intel_agent/data/research_protocol.v1.json `
+            src/ai_intel_agent/data/research_provider_qualification.v1.json)
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not classify Provider-facing changes"
+          }
+          if ($changed.Count -eq 0) {
+            "required=false" >> $env:GITHUB_OUTPUT
+          } else {
+            "required=true" >> $env:GITHUB_OUTPUT
+          }
+
+  provider-qualification:
+    name: live Provider qualification
+    needs:
+      - quality
+      - provider-scope
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      needs.quality.result == 'success' &&
+      needs.provider-scope.outputs.required == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 15
+    environment: provider-acceptance
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check out the exact PR HEAD
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify the current same-repository PR HEAD
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PULL_REQUEST_NUMBER: ${{ github.event.pull_request.number }}
+          REQUESTED_REVISION: ${{ github.event.pull_request.head.sha }}
+        run: |
+          $pullRequest = gh api `
+            "repos/$env:GITHUB_REPOSITORY/pulls/$env:PULL_REQUEST_NUMBER" |
+            ConvertFrom-Json
+          if ($pullRequest.state -ne "open") {
+            throw "Provider qualification requires an open pull request"
+          }
+          if ($pullRequest.head.repo.full_name -ne $env:GITHUB_REPOSITORY) {
+            throw "Provider qualification does not expose secrets to fork pull requests"
+          }
+          if ([string]$pullRequest.head.sha -ne $env:REQUESTED_REVISION) {
+            throw "Requested PR revision is stale"
+          }
+          if ((git rev-parse HEAD).Trim() -ne $env:REQUESTED_REVISION) {
+            throw "Checked-out revision does not match the current PR HEAD"
+          }
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install locked runtime
+        run: uv sync --locked --python 3.12 --extra ch3
+
+      - name: Run the one real Provider qualification gate
+        shell: pwsh
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          uv run ai-intel-agent evaluate-research-provider `
+            --revision "${{ github.event.pull_request.head.sha }}" `
+            --output "reports/research-provider-qualification.json"
+
+      - name: Publish the safe qualification report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: research-provider-qualification-pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: reports/research-provider-qualification.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  provider-acceptance:
+    name: provider-acceptance
+    runs-on: windows-latest
+    needs:
+      - provider-scope
+      - provider-qualification
+    if: always()
+    steps:
+      - name: Require qualification only for Provider-facing changes
+        shell: pwsh
+        env:
+          SCOPE_RESULT: ${{ needs.provider-scope.result }}
+          QUALIFICATION_REQUIRED: ${{ needs.provider-scope.outputs.required }}
+          QUALIFICATION_RESULT: ${{ needs.provider-qualification.result }}
+        run: |
+          if ($env:SCOPE_RESULT -ne "success") {
+            throw "Provider change classification did not complete"
+          }
+          if (
+            $env:QUALIFICATION_REQUIRED -eq "true" -and
+            $env:QUALIFICATION_RESULT -ne "success"
+          ) {
+            throw "Provider-facing changes require the live Provider qualification"
+          }
+          if ($env:QUALIFICATION_REQUIRED -eq "true") {
+            "Provider-facing changes passed the live Provider qualification."
+          } else {
+            "No Provider-facing changes; no real Provider call was required."
+          }

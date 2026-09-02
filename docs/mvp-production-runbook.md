@@ -31,6 +31,7 @@ Use these root-owned host paths; none belongs inside the repository or image:
 ```text
 /opt/ai-ledger/releases/<commit>/   frozen release checkout
 /etc/ai-ledger-m1/releases/         non-secret release env files
+/etc/ai-ledger-m1/qualifications/   safe SHA-bound Provider qualification reports
 /etc/ai-ledger-m1/secrets/          injected secret files, mode 0600
 /etc/ai-ledger-m1/state/            current and previous release records
 /var/backups/ai-ledger-m1/          logical backups, mode 0700 directory
@@ -73,6 +74,42 @@ refunds a reservation, so retries and failed calls remain safely counted and all
 metered calls stop before the configured aggregate cap can be exceeded.
 The file-backed `collect-gemini` and `collect-sources` operator commands detect this production
 contract and use the same ledger; neither can bypass the cap.
+
+## Real Provider release qualification
+
+Deterministic CI deliberately uses mocked Providers and cannot qualify a release. The same CI
+classifies the files changed by every PR. A Provider-facing PR automatically runs the protected
+**live Provider qualification** job after deterministic quality checks pass; an unrelated PR
+records that no paid qualification is required. The job verifies the exact open same-repository PR
+HEAD, waits for `provider-acceptance` approval, reads its `DEEPSEEK_API_KEY`, runs the versioned
+production-shaped Research corpus once against the real Provider, and uploads a safe report. Fork
+PRs never receive the secret. Use GitHub Actions' failed-job retry for transient failures.
+
+This is the only pre-deployment real-Provider qualification stage. There is no second post-merge
+qualification and no scheduled Provider-drift run. Configure `provider-acceptance` for `main` and
+`refs/pull/*/merge`, list the trusted collaborators as reviewers, and leave self-review enabled so
+either a collaborator or a sole maintainer can authorize their own bounded run. Approval protects
+the secret and paid call; it is not an independent code-review requirement.
+
+Download the successful workflow artifact without editing it and install the JSON report as
+`/etc/ai-ledger-m1/qualifications/<pr-head>.json`, owned by root and mode `0600`. Set
+`AI_INTEL_PROVIDER_QUALIFICATION_FILE` in the candidate release file to that absolute path. The
+report contains only the tested PR commit, qualified-source and contract hashes, route/model
+identifiers, a timestamp, bounded cost/attempt metadata, and per-case pass/fail metadata; it
+excludes credentials, prompts, evidence, and model answer text.
+
+`validate`, `start`, and `upgrade` fail before image pull, backup, migration, or service mutation
+when the report is missing, failed, mocked, bound to different Provider-qualified source or
+contract content, names a route or model not approved by that checkout, or omits any required
+corpus observation. Squash merging may change the commit SHA, so deployment compares the
+versioned qualified-source content hash rather than requiring the release SHA to equal the tested
+PR SHA. Unrelated changes may reuse the report while that content is unchanged. This gate does not
+replace the post-deploy anonymous browser acceptance; it prevents changed Provider behavior from
+first reaching the real Provider only after deployment.
+
+For the first rollout of this gate, run the new checkout's `operate.sh validate` explicitly before
+using an older installed operator, then install/use the new operator. Older operator code cannot
+retroactively enforce a gate it does not contain. Later upgrades enforce the report normally.
 
 ## Validate, start, and inspect
 

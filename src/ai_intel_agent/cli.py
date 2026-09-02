@@ -87,6 +87,15 @@ from ai_intel_agent.persistence import (
 )
 from ai_intel_agent.pipeline import publish_sample_digest
 from ai_intel_agent.research import DeepSeekResearchProvider, ResearchError
+from ai_intel_agent.research_provider_qualification import (
+    QualificationAttemptBudget,
+    ResearchProviderQualificationError,
+    load_research_provider_qualification_corpus,
+    maximum_provider_attempts,
+    qualified_source_sha256,
+    run_research_provider_qualification,
+    write_research_provider_qualification,
+)
 from ai_intel_agent.retrieval_calibration import (
     FastEmbedCalibrationRuntime,
     RetrievalCalibrationConfigurationError,
@@ -110,6 +119,7 @@ from ai_intel_agent.runtime import (
     SchedulerStopController,
     bounded_integer_from_environment,
     configure_structured_logging,
+    injected_secret_from_environment,
     production_database_url,
 )
 from ai_intel_agent.runtime_benchmark import (
@@ -146,6 +156,9 @@ DEFAULT_MODEL_ROUTING_OUTPUT = Path("reports/model-routing-evaluation.md")
 DEFAULT_RUNTIME_BENCHMARK_OUTPUT = Path("reports/hong-kong-runtime-benchmark.md")
 DEFAULT_RETRIEVAL_CALIBRATION_OUTPUT = Path("reports/retrieval-calibration.md")
 DEFAULT_RETRIEVAL_PROFILE_OUTPUT = Path("reports/retrieval-profile.v1.json")
+DEFAULT_RESEARCH_PROVIDER_QUALIFICATION_OUTPUT = Path(
+    "reports/research-provider-qualification.json"
+)
 RETRIEVAL_TIME_BOUNDARY_PATTERN = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})"
 )
@@ -1841,6 +1854,67 @@ def evaluate_model_routes(
     eligible = sum(route is not None for route in evaluation.recommendations.values())
     console.print(
         f"[green]Evaluated DeepSeek and Kimi routes for {eligible}/5 task classes:[/] {output}"
+    )
+
+
+@app.command("evaluate-research-provider")
+def evaluate_research_provider(
+    revision: Annotated[
+        str,
+        typer.Option(
+            "--revision",
+            help="Exact 40-character commit SHA being qualified for release.",
+        ),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Write the safe machine-readable qualification result here.",
+        ),
+    ] = DEFAULT_RESEARCH_PROVIDER_QUALIFICATION_OUTPUT,
+) -> None:
+    """Qualify one PR revision against the live DeepSeek Research route."""
+    api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    try:
+        if not api_key and os.environ.get("DEEPSEEK_API_KEY_FILE", "").strip():
+            api_key = injected_secret_from_environment(os.environ, "DEEPSEEK_API_KEY")
+        if not api_key:
+            raise ResearchProviderQualificationError(
+                "Set DEEPSEEK_API_KEY or DEEPSEEK_API_KEY_FILE for live qualification"
+            )
+        corpus = load_research_provider_qualification_corpus()
+        source_sha256 = qualified_source_sha256(
+            Path.cwd(), corpus.qualified_source_paths
+        )
+        with httpx.Client() as client:
+            provider = DeepSeekResearchProvider(
+                client,
+                api_key=api_key,
+                budget=QualificationAttemptBudget(maximum_provider_attempts(corpus)),
+                maximum_input_tokens=corpus.maximum_input_tokens_per_request,
+            )
+            qualification = run_research_provider_qualification(
+                provider=provider,
+                revision=revision,
+                qualified_source_sha256=source_sha256,
+                execution_mode="live-provider",
+                corpus=corpus,
+            )
+        write_research_provider_qualification(qualification, output)
+    except (ResearchError, ResearchProviderQualificationError, ValueError) as error:
+        raise typer.BadParameter(str(error)) from error
+    if qualification.status != "passed":
+        console.print(
+            "[red]Research Provider qualification failed:[/] "
+            f"{len([result for result in qualification.results if not result.passed])} "
+            f"of {len(qualification.results)} observations failed; report: {output}"
+        )
+        raise typer.Exit(code=1)
+    console.print(
+        "[green]Qualified live Research Provider for exact revision[/] "
+        f"{qualification.commit_sha}: {output}"
     )
 
 

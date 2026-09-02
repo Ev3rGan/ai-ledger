@@ -761,6 +761,7 @@ def test_versioned_linux_bundle_keeps_only_https_boundary_public() -> None:
     assert 'command: ["schedule-sources", "--production"' in compose
     assert "AI_INTEL_SCHEDULE_BACKFILL_LIMIT" in compose
     assert "AI_INTEL_SCHEDULE_BACKFILL_LIMIT=5" in release_example
+    assert "AI_INTEL_PROVIDER_QUALIFICATION_FILE=" in release_example
     assert "AI_INTEL_RELEASE: ${AI_INTEL_RELEASE:?required}" in compose
     assert "80:80" in compose and "443:443" in compose
     postgres_block = compose.split("\n  postgres:\n", 1)[1].split("\n  web:\n", 1)[0]
@@ -826,6 +827,7 @@ def test_operator_script_supports_lifecycle_backup_restore_and_rollback() -> Non
     assert "status --porcelain --untracked-files=all" in operator
     assert "mountpoint --quiet" in operator
     assert "AI_INTEL_SCHEDULE_BACKFILL_LIMIT=[1-5]" in operator
+    assert "validate_provider_qualification" in operator
     compose_block = operator.split("compose() {", 1)[1].split("\n}\n", 1)[0]
     assert '"COMPOSE_PROJECT_NAME=ai-ledger-m1"' in compose_block
     for release_key in (

@@ -82,6 +82,19 @@ release: it requires explicit M2 live-acceptance authorization, an isolated or a
 database, and an approved real Provider budget. Automated acceptance uses deterministic Feed,
 article, and Provider fakes instead.
 
+The release qualification for Research is intentionally separate from those deterministic tests:
+
+```powershell
+uv run ai-intel-agent evaluate-research-provider --revision <exact-40-character-sha> --output reports\research-provider-qualification.json
+```
+
+Run it only in an authorized trusted environment with a real `DEEPSEEK_API_KEY`, the approved
+budget, and the exact clean PR revision. The command fingerprints the versioned Provider-qualified
+source boundary in the current checkout. A missing key is a failure, never a skip. Mocked Providers
+can exercise the report mechanics but are always marked non-qualifying and cannot satisfy the
+production deployment gate. Prefer the protected PR workflow documented in the production runbook
+for an actual release.
+
 ## Acceptance record
 
 Record metadata and pass/fail observations, never source bodies, model responses, secrets, or the

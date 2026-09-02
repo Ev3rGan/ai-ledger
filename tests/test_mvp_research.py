@@ -547,6 +547,7 @@ def test_deepseek_research_provider_uses_streaming_without_tools_or_reasoning() 
         streamed_output = "".join(provider.stream(evidence_set))
 
     assert json.loads(streamed_output) == json.loads(output)
+    assert provider.last_returned_model_id == "deepseek-v4-pro"
 
 
 @pytest.mark.postgres

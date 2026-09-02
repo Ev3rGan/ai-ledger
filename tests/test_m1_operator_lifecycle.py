@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,7 @@ def _bash_executable() -> Path:
     "case_name",
     (
         "validate_no_side_effect",
+        "qualification_failure_no_side_effect",
         "preflight_failure_no_side_effect",
         "upgrade_success",
         "upgrade_failure_recovery",
@@ -48,6 +50,10 @@ def test_m1_operator_lifecycle(case_name: str) -> None:
     result = subprocess.run(
         (str(_bash_executable()), str(harness), str(operator), case_name),
         cwd=project_root,
+        env={
+            **os.environ,
+            "QUALIFICATION_TEST_PYTHON": Path(sys.executable).as_posix(),
+        },
         capture_output=True,
         text=True,
         check=False,
