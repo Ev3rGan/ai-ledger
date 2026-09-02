@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Annotated, Literal, cast
+from typing import Annotated
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
@@ -92,6 +92,7 @@ from ai_intel_agent.research_provider_qualification import (
     ResearchProviderQualificationError,
     load_research_provider_qualification_corpus,
     maximum_provider_attempts,
+    qualified_source_sha256,
     run_research_provider_qualification,
     write_research_provider_qualification,
 )
@@ -1865,13 +1866,6 @@ def evaluate_research_provider(
             help="Exact 40-character commit SHA being qualified for release.",
         ),
     ],
-    target_kind: Annotated[
-        str,
-        typer.Option(
-            "--target-kind",
-            help="Classify this run as merged-revision or pull-request-head.",
-        ),
-    ] = "merged-revision",
     output: Annotated[
         Path,
         typer.Option(
@@ -1881,7 +1875,7 @@ def evaluate_research_provider(
         ),
     ] = DEFAULT_RESEARCH_PROVIDER_QUALIFICATION_OUTPUT,
 ) -> None:
-    """Qualify one exact revision against the live DeepSeek Research route."""
+    """Qualify one PR revision against the live DeepSeek Research route."""
     api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     try:
         if not api_key and os.environ.get("DEEPSEEK_API_KEY_FILE", "").strip():
@@ -1891,6 +1885,9 @@ def evaluate_research_provider(
                 "Set DEEPSEEK_API_KEY or DEEPSEEK_API_KEY_FILE for live qualification"
             )
         corpus = load_research_provider_qualification_corpus()
+        source_sha256 = qualified_source_sha256(
+            Path.cwd(), corpus.qualified_source_paths
+        )
         with httpx.Client() as client:
             provider = DeepSeekResearchProvider(
                 client,
@@ -1901,11 +1898,8 @@ def evaluate_research_provider(
             qualification = run_research_provider_qualification(
                 provider=provider,
                 revision=revision,
+                qualified_source_sha256=source_sha256,
                 execution_mode="live-provider",
-                target_kind=cast(
-                    Literal["merged-revision", "pull-request-head"],
-                    target_kind,
-                ),
                 corpus=corpus,
             )
         write_research_provider_qualification(qualification, output)

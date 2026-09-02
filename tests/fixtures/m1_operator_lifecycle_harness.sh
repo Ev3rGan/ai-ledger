@@ -5,6 +5,7 @@ operator="${1:?usage: m1_operator_lifecycle_harness.sh OPERATE_SH [CASE]}"
 selected_case="${2:-all}"
 current_release="d83a3ae70fa970893fde0e669864c677ef49392a"
 candidate_release="5477c5538248f97fe6db331d7d33cdea384966c1"
+candidate_qualified_revision="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 legacy_subnet="172.19.0.0/16"
 fixed_subnet="172.31.255.0/24"
 fixed_ip_range="172.31.255.128/25"
@@ -81,17 +82,38 @@ EOF
 
 write_qualification() {
   qualification_file="$1"
-  release_sha="$2"
+  qualified_revision="$2"
   release_dir="$3"
   protocol_sha="$(sha256sum "$release_dir/src/ai_intel_agent/data/research_protocol.v1.json" | awk '{print $1}')"
   corpus_sha="$(sha256sum "$release_dir/src/ai_intel_agent/data/research_provider_qualification.v1.json" | awk '{print $1}')"
+  qualified_source_sha="$($QUALIFICATION_TEST_PYTHON - "$release_dir" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+corpus = json.loads(
+    (root / "src/ai_intel_agent/data/research_provider_qualification.v1.json").read_text(
+        encoding="utf-8"
+    )
+)
+digest = hashlib.sha256()
+for relative_path in sorted(corpus["qualified_source_paths"]):
+    source = root / relative_path
+    digest.update(relative_path.encode("utf-8"))
+    digest.update(b"\0")
+    content = source.read_bytes().replace(b"\r\n", b"\n")
+    digest.update(hashlib.sha256(content).hexdigest().encode("ascii"))
+    digest.update(b"\n")
+print(digest.hexdigest())
+PY
+)"
   generated_epoch="$(date -u +%s)"
   generated_epoch="$((generated_epoch - 60))"
-  valid_until_epoch="$((generated_epoch + 86400))"
   generated_at="$(date -u -d "@$generated_epoch" '+%Y-%m-%dT%H:%M:%SZ')"
-  valid_until="$(date -u -d "@$valid_until_epoch" '+%Y-%m-%dT%H:%M:%SZ')"
   cat >"$qualification_file" <<EOF
-{"schema_version":"research-provider-qualification-report.v1","status":"passed","execution_mode":"live-provider","target_kind":"merged-revision","commit_sha":"$release_sha","route_identifier":"deepseek:v4-pro","approved_model_id":"deepseek-v4-pro","protocol_version":"fixture","protocol_sha256":"$protocol_sha","corpus_version":"fixture","corpus_sha256":"$corpus_sha","generated_at":"$generated_at","valid_until":"$valid_until","maximum_provider_attempts":14,"worst_case_reserved_cost_usd":0.062,"results":[{"case_identifier":"fixture","repetition":1,"expected_status":"answered","observed_status":"answered","passed":true,"failure_code":null,"citation_count":1,"validated_returned_model_id":"deepseek-v4-pro"}]}
+{"schema_version":"research-provider-qualification-report.v1","status":"passed","execution_mode":"live-provider","commit_sha":"$qualified_revision","qualified_source_sha256":"$qualified_source_sha","route_identifier":"deepseek:v4-pro","approved_model_id":"deepseek-v4-pro","protocol_version":"fixture","protocol_sha256":"$protocol_sha","corpus_version":"fixture","corpus_sha256":"$corpus_sha","generated_at":"$generated_at","maximum_provider_attempts":14,"worst_case_reserved_cost_usd":0.062,"results":[{"case_identifier":"fixture","repetition":1,"expected_status":"answered","observed_status":"answered","passed":true,"failure_code":null,"citation_count":1,"validated_returned_model_id":"deepseek-v4-pro"}]}
 EOF
 }
 
@@ -118,11 +140,11 @@ new_fixture() {
     printf '%s\n' 'public.example { respond 200 }' >"$release_dir/deploy/m1/Caddyfile"
     printf '%s\n' '{"version":"fixture","route_identifier":"deepseek:v4-pro"}' >"$release_dir/src/ai_intel_agent/data/research_protocol.v1.json"
     printf '%s\n' '{"version":"fixture-candidates","candidates":[{"identifier":"deepseek:v4-pro","model_id":"deepseek-v4-pro"}]}' >"$release_dir/src/ai_intel_agent/data/model_routing_candidates.v1.json"
-    printf '%s\n' '{"version":"fixture","validity_seconds":86400,"maximum_cost_usd":0.1,"cases":[{"identifier":"fixture","expected_status":"answered","repetitions":1}]}' >"$release_dir/src/ai_intel_agent/data/research_provider_qualification.v1.json"
+    printf '%s\n' '{"version":"fixture","maximum_cost_usd":0.1,"qualified_source_paths":["src/ai_intel_agent/data/model_routing_candidates.v1.json","src/ai_intel_agent/data/research_protocol.v1.json","src/ai_intel_agent/data/research_provider_qualification.v1.json"],"cases":[{"identifier":"fixture","expected_status":"answered","repetitions":1}]}' >"$release_dir/src/ai_intel_agent/data/research_provider_qualification.v1.json"
   done
 
   write_qualification "$current_qualification" "$current_release" "$current_dir"
-  write_qualification "$candidate_qualification" "$candidate_release" "$candidate_dir"
+  write_qualification "$candidate_qualification" "$candidate_qualified_revision" "$candidate_dir"
 
   current_file="$state_dir/current.env"
   candidate_file="$fixture/candidate.env"
@@ -381,23 +403,18 @@ case_validate_no_side_effect() {
 }
 
 case_qualification_failure_no_side_effect() {
-  for failure_mode in missing failed mocked target revision route model contract cost expired observation; do
+  for failure_mode in missing failed mocked revision source route model contract cost observation; do
     new_fixture "qualification-$failure_mode"
     case "$failure_mode" in
       missing) rm "$candidate_qualification" ;;
       failed) sed -i 's/"status":"passed"/"status":"failed"/' "$candidate_qualification" ;;
       mocked) sed -i 's/"execution_mode":"live-provider"/"execution_mode":"mocked-provider"/' "$candidate_qualification" ;;
-      target) sed -i 's/"target_kind":"merged-revision"/"target_kind":"pull-request-head"/' "$candidate_qualification" ;;
-      revision) sed -i "s/$candidate_release/$current_release/" "$candidate_qualification" ;;
+      revision) sed -i 's/"commit_sha":"[0-9a-f]*"/"commit_sha":"not-a-revision"/' "$candidate_qualification" ;;
+      source) sed -i 's/"qualified_source_sha256":"[0-9a-f]*"/"qualified_source_sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"/' "$candidate_qualification" ;;
       route) sed -i 's/"route_identifier":"deepseek:v4-pro"/"route_identifier":"unapproved:route"/' "$candidate_qualification" ;;
       model) sed -i 's/"approved_model_id":"deepseek-v4-pro"/"approved_model_id":"unapproved-model"/' "$candidate_qualification" ;;
-      contract) printf '%s\n' '{"version":"changed","validity_seconds":86400}' >"$candidate_dir/src/ai_intel_agent/data/research_provider_qualification.v1.json" ;;
+      contract) printf '%s\n' '{"version":"changed"}' >"$candidate_dir/src/ai_intel_agent/data/research_provider_qualification.v1.json" ;;
       cost) sed -i 's/"worst_case_reserved_cost_usd":0.062/"worst_case_reserved_cost_usd":1.0/' "$candidate_qualification" ;;
-      expired)
-        sed -i \
-          's/"generated_at":"[^"]*"/"generated_at":"2000-01-01T00:00:00Z"/; s/"valid_until":"[^"]*"/"valid_until":"2000-01-02T00:00:00Z"/' \
-          "$candidate_qualification"
-        ;;
       observation) sed -i 's/"passed":true/"passed":false/' "$candidate_qualification" ;;
     esac
     before_runtime="$(cat "$runtime_state")"

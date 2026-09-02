@@ -1,9 +1,21 @@
 {
-  "version": "research-provider-qualification-2026-09-02.v1",
+  "version": "research-provider-qualification-2026-09-03.v1",
   "description": "Small production-shaped corpus for release qualification against the live Research Provider.",
-  "validity_seconds": 86400,
   "maximum_input_tokens_per_request": 8192,
   "maximum_cost_usd": 0.10,
+  "qualified_source_paths": [
+    "pyproject.toml",
+    "uv.lock",
+    "src/ai_intel_agent/domain.py",
+    "src/ai_intel_agent/model_routing_evaluation.py",
+    "src/ai_intel_agent/research.py",
+    "src/ai_intel_agent/research_provider_qualification.py",
+    "src/ai_intel_agent/data/model_routing_candidates.v1.json",
+    "src/ai_intel_agent/data/model_routing_evaluation.v1.json",
+    "src/ai_intel_agent/data/model_routing_protocol.v1.json",
+    "src/ai_intel_agent/data/research_protocol.v1.json",
+    "src/ai_intel_agent/data/research_provider_qualification.v1.json"
+  ],
   "evidence_sets": {
     "hugging-face-webgpu": [
       {

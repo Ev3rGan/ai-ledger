@@ -89,10 +89,11 @@ uv run ai-intel-agent evaluate-research-provider --revision <exact-40-character-
 ```
 
 Run it only in an authorized trusted environment with a real `DEEPSEEK_API_KEY`, the approved
-budget, and the exact clean revision. A missing key is a failure, never a skip. Mocked Providers can
-exercise the report mechanics but are always marked non-qualifying and cannot satisfy the
-production deployment gate. Prefer the protected GitHub Actions workflow documented in the
-production runbook for an actual release.
+budget, and the exact clean PR revision. The command fingerprints the versioned Provider-qualified
+source boundary in the current checkout. A missing key is a failure, never a skip. Mocked Providers
+can exercise the report mechanics but are always marked non-qualifying and cannot satisfy the
+production deployment gate. Prefer the protected PR workflow documented in the production runbook
+for an actual release.
 
 ## Acceptance record
 

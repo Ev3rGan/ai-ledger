@@ -77,35 +77,36 @@ contract and use the same ledger; neither can bypass the cap.
 
 ## Real Provider release qualification
 
-Deterministic CI deliberately uses mocked Providers and cannot qualify a release. Before deploying
-an exact commit, run the separate **Live Provider qualification** GitHub Actions workflow for that
-40-character commit SHA. The workflow accepts only a commit already merged into `main`, reads the
-DeepSeek key through the protected `provider-acceptance` environment, runs the versioned
-production-shaped Research corpus against the real Provider, and uploads a safe report. Configure
-that environment with required reviewers and the `DEEPSEEK_API_KEY` secret. The nightly scheduled
-run checks the current `main` route for Provider drift; a failed run is an operational alert, not a
-CI failure that mocked tests can hide.
+Deterministic CI deliberately uses mocked Providers and cannot qualify a release. The same CI
+classifies the files changed by every PR. A Provider-facing PR automatically calls the separate
+**Live Provider qualification** workflow after deterministic quality checks pass; an unrelated PR
+records that no paid qualification is required. The protected job resolves and fetches the exact
+open same-repository PR HEAD, waits for `provider-acceptance` approval, reads its
+`DEEPSEEK_API_KEY`, runs the versioned production-shaped Research corpus once against the real
+Provider, and uploads a safe report. Fork PRs never receive the secret. A manual dispatch for the
+current open PR HEAD is retained only as a retry path.
 
-For earlier feedback on a Provider-facing PR, dispatch the same default-branch workflow with
-`target_kind=pull-request-head` and the open PR number. After environment approval, the workflow
-resolves and fetches the exact current PR HEAD before running it. This report is explicitly PR
-feedback and the production operator rejects it. After merge, dispatch again with
-`target_kind=merged-revision` and the actual merged commit SHA; only that second report can qualify
-the release. Do not add an automatic secret-bearing `pull_request` workflow whose definition can
-be changed by the PR it executes.
+This is the only pre-deployment real-Provider qualification stage. There is no second post-merge
+qualification and no scheduled Provider-drift run. Configure `provider-acceptance` for `main` and
+`refs/pull/*/merge`, list the trusted collaborators as reviewers, and leave self-review enabled so
+either a collaborator or a sole maintainer can authorize their own bounded run. Approval protects
+the secret and paid call; it is not an independent code-review requirement.
 
 Download the successful workflow artifact without editing it and install the JSON report as
-`/etc/ai-ledger-m1/qualifications/<commit>.json`, owned by root and mode `0600`. Set
+`/etc/ai-ledger-m1/qualifications/<pr-head>.json`, owned by root and mode `0600`. Set
 `AI_INTEL_PROVIDER_QUALIFICATION_FILE` in the candidate release file to that absolute path. The
-report contains only commit and contract hashes, route/model identifiers, timestamps, bounded
-cost/attempt metadata, and per-case pass/fail metadata; it excludes credentials, prompts,
-evidence, and model answer text.
+report contains only the tested PR commit, qualified-source and contract hashes, route/model
+identifiers, a timestamp, bounded cost/attempt metadata, and per-case pass/fail metadata; it
+excludes credentials, prompts, evidence, and model answer text.
 
 `validate`, `start`, and `upgrade` fail before image pull, backup, migration, or service mutation
-when the report is missing, failed, mocked, expired, bound to another commit/contract, names a
-route or model not approved by that checkout, or omits any required corpus observation. This gate
-does not replace the post-deploy anonymous browser acceptance; it prevents a release from reaching
-that stage without a recent real-Provider proof for the exact code being deployed.
+when the report is missing, failed, mocked, bound to different Provider-qualified source or
+contract content, names a route or model not approved by that checkout, or omits any required
+corpus observation. Squash merging may change the commit SHA, so deployment compares the
+versioned qualified-source content hash rather than requiring the release SHA to equal the tested
+PR SHA. Unrelated changes may reuse the report while that content is unchanged. This gate does not
+replace the post-deploy anonymous browser acceptance; it prevents changed Provider behavior from
+first reaching the real Provider only after deployment.
 
 For the first rollout of this gate, run the new checkout's `operate.sh validate` explicitly before
 using an older installed operator, then install/use the new operator. Older operator code cannot

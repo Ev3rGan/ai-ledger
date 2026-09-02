@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   quality:
@@ -66,3 +67,94 @@ jobs:
               server.drop()
           '@
           uv run --extra dev python -c $script
+
+  provider-scope:
+    name: detect Provider-facing changes
+    runs-on: windows-latest
+    outputs:
+      required: ${{ steps.scope.outputs.required }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Detect the qualified source boundary
+        id: scope
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if ($env:EVENT_NAME -ne "pull_request") {
+            "required=false" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          git diff --quiet $env:BASE_SHA $env:HEAD_SHA -- `
+            pyproject.toml `
+            uv.lock `
+            src/ai_intel_agent/cli.py `
+            src/ai_intel_agent/domain.py `
+            src/ai_intel_agent/model_routing_evaluation.py `
+            src/ai_intel_agent/research.py `
+            src/ai_intel_agent/research_provider_qualification.py `
+            src/ai_intel_agent/data/model_routing_candidates.v1.json `
+            src/ai_intel_agent/data/model_routing_evaluation.v1.json `
+            src/ai_intel_agent/data/model_routing_protocol.v1.json `
+            src/ai_intel_agent/data/research_protocol.v1.json `
+            src/ai_intel_agent/data/research_provider_qualification.v1.json
+          if ($LASTEXITCODE -eq 0) {
+            "required=false" >> $env:GITHUB_OUTPUT
+          } elseif ($LASTEXITCODE -eq 1) {
+            "required=true" >> $env:GITHUB_OUTPUT
+          } else {
+            throw "Could not classify Provider-facing changes"
+          }
+
+  provider-qualification:
+    name: live Provider qualification
+    needs:
+      - quality
+      - provider-scope
+    if: >-
+      github.event_name == 'pull_request' &&
+      needs.quality.result == 'success' &&
+      needs.provider-scope.outputs.required == 'true'
+    uses: ./.github/workflows/provider-qualification.yml
+    with:
+      pull_request_number: ${{ github.event.pull_request.number }}
+      revision: ${{ github.event.pull_request.head.sha }}
+    permissions:
+      contents: read
+      pull-requests: read
+
+  provider-acceptance:
+    name: provider-acceptance
+    runs-on: windows-latest
+    needs:
+      - provider-scope
+      - provider-qualification
+    if: always()
+    steps:
+      - name: Require qualification only for Provider-facing changes
+        shell: pwsh
+        env:
+          SCOPE_RESULT: ${{ needs.provider-scope.result }}
+          QUALIFICATION_REQUIRED: ${{ needs.provider-scope.outputs.required }}
+          QUALIFICATION_RESULT: ${{ needs.provider-qualification.result }}
+        run: |
+          if ($env:SCOPE_RESULT -ne "success") {
+            throw "Provider change classification did not complete"
+          }
+          if (
+            $env:QUALIFICATION_REQUIRED -eq "true" -and
+            $env:QUALIFICATION_RESULT -ne "success"
+          ) {
+            throw "Provider-facing changes require the live Provider qualification"
+          }
+          if ($env:QUALIFICATION_REQUIRED -eq "true") {
+            "Provider-facing changes passed the live Provider qualification."
+          } else {
+            "No Provider-facing changes; no real Provider call was required."
+          }

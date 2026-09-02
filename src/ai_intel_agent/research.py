@@ -1169,6 +1169,19 @@ class PersistentAnonymousResearchAllowance:
         )
 
 
+class ResearchEvidenceRepository(Protocol):
+    """Minimal evidence-loading boundary used by the Research execution stream."""
+
+    def retrieve_intent(
+        self,
+        intent: QueryIntent,
+        *,
+        evidence_limit: int | None = None,
+        deadline: float | None = None,
+        clock: Callable[[], float] = monotonic,
+    ) -> ResearchEvidenceSet: ...
+
+
 def _advanced_answer_lacks_required_story_coverage(
     intent: QueryIntent,
     story_ids: set[UUID],
@@ -1186,7 +1199,7 @@ def _advanced_answer_lacks_required_story_coverage(
 def stream_research_events(
     question: str,
     *,
-    repository: ResearchRepository,
+    repository: ResearchEvidenceRepository,
     provider: ResearchProvider | None,
     allowance: ResearchAllowance | None = None,
     anonymous_client_id: str | None = None,

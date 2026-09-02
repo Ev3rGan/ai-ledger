@@ -18,10 +18,33 @@ from ai_intel_agent.research import (
 )
 from ai_intel_agent.research_provider_qualification import (
     load_research_provider_qualification_corpus,
+    qualified_source_sha256,
     run_research_provider_qualification,
 )
 
 runner = CliRunner()
+
+
+def test_qualified_source_identity_is_stable_and_content_sensitive(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first.txt"
+    nested = tmp_path / "nested" / "second.txt"
+    nested.parent.mkdir()
+    first.write_bytes(b"alpha\r\n")
+    nested.write_text("beta", encoding="utf-8")
+    paths = ("nested/second.txt", "first.txt")
+
+    original = qualified_source_sha256(tmp_path, paths)
+    reordered = qualified_source_sha256(tmp_path, tuple(reversed(paths)))
+    first.write_bytes(b"alpha\n")
+    normalized_line_endings = qualified_source_sha256(tmp_path, paths)
+    nested.write_text("changed", encoding="utf-8")
+
+    assert original == reordered
+    assert original == normalized_line_endings
+    assert len(original) == 64
+    assert original != qualified_source_sha256(tmp_path, paths)
 
 
 class AbstainingProvider:
@@ -64,6 +87,7 @@ def test_qualification_fails_when_provider_abstains_from_supported_case() -> Non
     qualification = run_research_provider_qualification(
         provider=AbstainingProvider(),
         revision="a" * 40,
+        qualified_source_sha256="1" * 64,
         now=datetime(2026, 9, 2, 12, 0, tzinfo=UTC),
     )
 
@@ -84,6 +108,7 @@ def test_mocked_provider_can_never_produce_release_qualification() -> None:
     qualification = run_research_provider_qualification(
         provider=provider,
         revision="b" * 40,
+        qualified_source_sha256="2" * 64,
         execution_mode="mocked-provider",
         now=datetime(2026, 9, 2, 12, 0, tzinfo=UTC),
     )
@@ -91,7 +116,7 @@ def test_mocked_provider_can_never_produce_release_qualification() -> None:
 
     assert provider.calls == 7
     assert qualification.status == "non-qualifying"
-    assert qualification.target_kind == "merged-revision"
+    assert qualification.qualified_source_sha256 == "2" * 64
     assert all(result.passed for result in qualification.results)
     serialized = json.dumps(payload, ensure_ascii=False)
     assert "谁发布了" not in serialized
@@ -99,18 +124,20 @@ def test_mocked_provider_can_never_produce_release_qualification() -> None:
     assert "Hugging Face 发布了 WebGPU 内核库。" not in serialized
 
 
-def test_live_mode_pr_head_result_is_explicitly_non_release_feedback() -> None:
+def test_live_pr_qualification_binds_the_qualified_source_content() -> None:
     qualification = run_research_provider_qualification(
         provider=PassingMockProvider(),
         revision="e" * 40,
+        qualified_source_sha256="f" * 64,
         execution_mode="live-provider",
-        target_kind="pull-request-head",
         now=datetime(2026, 9, 2, 12, 0, tzinfo=UTC),
     )
 
     assert qualification.status == "passed"
-    assert qualification.target_kind == "pull-request-head"
-    assert qualification.as_dict()["target_kind"] == "pull-request-head"
+    assert qualification.commit_sha == "e" * 40
+    assert qualification.qualified_source_sha256 == "f" * 64
+    assert qualification.as_dict()["qualified_source_sha256"] == "f" * 64
+    assert "target_kind" not in qualification.as_dict()
 
 
 def test_live_qualification_command_fails_closed_without_deepseek_credential(
@@ -182,10 +209,15 @@ def test_live_qualification_command_writes_only_safe_sha_bound_results(
 
     assert result.exit_code == 0, result.output
     payload = json.loads(output.read_text(encoding="utf-8"))
+    corpus = load_research_provider_qualification_corpus()
+    expected_source_sha = qualified_source_sha256(
+        Path(__file__).parents[1], corpus.qualified_source_paths
+    )
     assert payload["status"] == "passed"
     assert payload["execution_mode"] == "live-provider"
-    assert payload["target_kind"] == "merged-revision"
     assert payload["commit_sha"] == "d" * 40
+    assert payload["qualified_source_sha256"] == expected_source_sha
+    assert "target_kind" not in payload
     assert payload["protocol_sha256"]
     assert payload["corpus_sha256"]
     assert payload["maximum_provider_attempts"] == 14
@@ -196,7 +228,7 @@ def test_live_qualification_command_writes_only_safe_sha_bound_results(
     assert "Hugging Face 发布了 WebGPU 内核库。" not in serialized
 
 
-def test_live_provider_workflow_is_separate_from_deterministic_ci() -> None:
+def test_provider_facing_pull_requests_run_one_protected_live_gate() -> None:
     project_root = Path(__file__).parents[1]
     workflow = (
         project_root / ".github" / "workflows" / "provider-qualification.yml"
@@ -205,14 +237,26 @@ def test_live_provider_workflow_is_separate_from_deterministic_ci() -> None:
         encoding="utf-8"
     )
 
+    assert "workflow_call:" in workflow
     assert "workflow_dispatch:" in workflow
-    assert "schedule:" in workflow
     assert "pull_request_number:" in workflow
-    assert "pull-request-head" in workflow
     assert "pull/$pullRequestNumber/head" in workflow
     assert "environment: provider-acceptance" in workflow
     assert "secrets.DEEPSEEK_API_KEY" in workflow
     assert "evaluate-research-provider" in workflow
-    assert "git rev-parse HEAD" in workflow
-    assert "pull_request:" not in workflow
+    assert "schedule:" not in workflow
+    assert "merged-revision" not in workflow
+    assert "push:" not in workflow
+    assert "uses: ./.github/workflows/provider-qualification.yml" in deterministic_ci
+    assert "github.event.pull_request.head.sha" in deterministic_ci
+    assert "name: provider-acceptance" in deterministic_ci
+    qualified_paths = set(
+        load_research_provider_qualification_corpus().qualified_source_paths
+    )
+    assert {
+        "src/ai_intel_agent/data/model_routing_evaluation.v1.json",
+        "src/ai_intel_agent/data/model_routing_protocol.v1.json",
+    } <= qualified_paths
+    for qualified_path in qualified_paths:
+        assert qualified_path in deterministic_ci
     assert "deterministic tests (mocked providers only)" in deterministic_ci

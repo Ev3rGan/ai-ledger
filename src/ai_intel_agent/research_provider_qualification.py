@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from hashlib import sha256
 from importlib.resources import files
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal
 from uuid import UUID
 
@@ -21,12 +21,12 @@ from ai_intel_agent.research import (
     ResearchEvidence,
     ResearchEvidenceSet,
     ResearchProvider,
-    ResearchRepository,
     load_research_protocol,
     stream_research_events,
 )
 
 _REVISION = re.compile(r"[0-9a-f]{40}")
+_SOURCE_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 class ResearchProviderQualificationError(ValueError):
@@ -61,9 +61,9 @@ class ResearchProviderQualificationCase:
 class ResearchProviderQualificationCorpus:
     version: str
     content_sha256: str
-    validity_seconds: int
     maximum_input_tokens_per_request: int
     maximum_cost_usd: float
+    qualified_source_paths: tuple[str, ...]
     cases: tuple[ResearchProviderQualificationCase, ...]
 
 
@@ -84,8 +84,8 @@ class ResearchProviderQualification:
     schema_version: str
     status: Literal["passed", "failed", "non-qualifying"]
     execution_mode: Literal["live-provider", "mocked-provider"]
-    target_kind: Literal["merged-revision", "pull-request-head"]
     commit_sha: str
+    qualified_source_sha256: str
     route_identifier: str
     approved_model_id: str
     protocol_version: str
@@ -93,7 +93,6 @@ class ResearchProviderQualification:
     corpus_version: str
     corpus_sha256: str
     generated_at: datetime
-    valid_until: datetime
     maximum_provider_attempts: int
     worst_case_reserved_cost_usd: float
     results: tuple[ResearchProviderQualificationResult, ...]
@@ -103,8 +102,8 @@ class ResearchProviderQualification:
             "schema_version": self.schema_version,
             "status": self.status,
             "execution_mode": self.execution_mode,
-            "target_kind": self.target_kind,
             "commit_sha": self.commit_sha,
+            "qualified_source_sha256": self.qualified_source_sha256,
             "route_identifier": self.route_identifier,
             "approved_model_id": self.approved_model_id,
             "protocol_version": self.protocol_version,
@@ -112,7 +111,6 @@ class ResearchProviderQualification:
             "corpus_version": self.corpus_version,
             "corpus_sha256": self.corpus_sha256,
             "generated_at": self.generated_at.isoformat().replace("+00:00", "Z"),
-            "valid_until": self.valid_until.isoformat().replace("+00:00", "Z"),
             "maximum_provider_attempts": self.maximum_provider_attempts,
             "worst_case_reserved_cost_usd": self.worst_case_reserved_cost_usd,
             "results": [
@@ -144,7 +142,50 @@ def write_research_provider_qualification(
     temporary.replace(output)
 
 
-class _QualificationRepository(ResearchRepository):
+def qualified_source_sha256(
+    project_root: Path,
+    relative_paths: tuple[str, ...],
+) -> str:
+    """Bind a PR qualification to deployable Provider behavior.
+
+    The stdlib-only deployment preflight intentionally mirrors this small algorithm so
+    it can validate a release before pulling or starting application containers.
+    """
+    if (
+        not relative_paths
+        or any(not isinstance(path, str) for path in relative_paths)
+        or len(set(relative_paths)) != len(relative_paths)
+    ):
+        raise ResearchProviderQualificationError(
+            "Research Provider qualified source paths are invalid"
+        )
+    digest = sha256()
+    for relative_path in sorted(relative_paths):
+        normalized = PurePosixPath(relative_path)
+        if (
+            normalized.is_absolute()
+            or ".." in normalized.parts
+            or normalized.as_posix() != relative_path
+        ):
+            raise ResearchProviderQualificationError(
+                "Research Provider qualified source path is unsafe"
+            )
+        source = project_root.joinpath(*normalized.parts)
+        if not source.is_file():
+            raise ResearchProviderQualificationError(
+                f"Research Provider qualified source is missing: {relative_path}"
+            )
+        path_bytes = relative_path.encode("utf-8")
+        content = source.read_bytes().replace(b"\r\n", b"\n")
+        content_sha = sha256(content).hexdigest().encode("ascii")
+        digest.update(path_bytes)
+        digest.update(b"\0")
+        digest.update(content_sha)
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+class _QualificationRepository:
     def __init__(self, case: ResearchProviderQualificationCase) -> None:
         self._case = case
 
@@ -183,11 +224,11 @@ def load_research_provider_qualification_corpus() -> ResearchProviderQualificati
         corpus = ResearchProviderQualificationCorpus(
             version=payload["version"],
             content_sha256=sha256(raw).hexdigest(),
-            validity_seconds=int(payload["validity_seconds"]),
             maximum_input_tokens_per_request=int(
                 payload["maximum_input_tokens_per_request"]
             ),
             maximum_cost_usd=float(payload["maximum_cost_usd"]),
+            qualified_source_paths=tuple(payload["qualified_source_paths"]),
             cases=cases,
         )
     except (KeyError, TypeError, ValueError) as error:
@@ -202,8 +243,8 @@ def run_research_provider_qualification(
     *,
     provider: ResearchProvider,
     revision: str,
+    qualified_source_sha256: str,
     execution_mode: Literal["live-provider", "mocked-provider"] = "mocked-provider",
-    target_kind: Literal["merged-revision", "pull-request-head"] = "merged-revision",
     corpus: ResearchProviderQualificationCorpus | None = None,
     now: datetime | None = None,
 ) -> ResearchProviderQualification:
@@ -211,9 +252,9 @@ def run_research_provider_qualification(
         raise ResearchProviderQualificationError(
             "Research Provider qualification requires an exact 40-character commit SHA"
         )
-    if target_kind not in {"merged-revision", "pull-request-head"}:
+    if _SOURCE_SHA256.fullmatch(qualified_source_sha256) is None:
         raise ResearchProviderQualificationError(
-            "Research Provider qualification target kind is invalid"
+            "Research Provider qualification requires a qualified source SHA-256"
         )
     corpus = corpus or load_research_provider_qualification_corpus()
     protocol = load_research_protocol()
@@ -256,8 +297,8 @@ def run_research_provider_qualification(
         schema_version="research-provider-qualification-report.v1",
         status=status,
         execution_mode=execution_mode,
-        target_kind=target_kind,
         commit_sha=revision,
+        qualified_source_sha256=qualified_source_sha256,
         route_identifier=protocol.route_identifier,
         approved_model_id=candidate.model_id,
         protocol_version=protocol.version,
@@ -265,7 +306,6 @@ def run_research_provider_qualification(
         corpus_version=corpus.version,
         corpus_sha256=corpus.content_sha256,
         generated_at=generated_at,
-        valid_until=generated_at + timedelta(seconds=corpus.validity_seconds),
         maximum_provider_attempts=maximum_provider_attempts,
         worst_case_reserved_cost_usd=worst_case_reserved_cost_usd,
         results=tuple(results),
@@ -374,9 +414,9 @@ def _parse_evidence(item: dict[str, object]) -> ResearchEvidence:
 def _validate_corpus(corpus: ResearchProviderQualificationCorpus) -> None:
     if (
         not corpus.version.strip()
-        or corpus.validity_seconds < 1
         or corpus.maximum_input_tokens_per_request < 1
         or corpus.maximum_cost_usd <= 0
+        or not corpus.qualified_source_paths
         or not corpus.cases
     ):
         raise ResearchProviderQualificationError(
