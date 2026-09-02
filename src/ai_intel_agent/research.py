@@ -1784,7 +1784,7 @@ def _validated_v2_provider_answer(
     if _advanced_answer_lacks_required_story_coverage(intent, cited_stories):
         raise ResearchError("Advanced Research collapsed distinct Stories")
     return ResearchAnswer(
-        text=canonical_answer,
+        text=answer_text,
         citations=tuple(citations),
         statements=tuple(supported_statements),
     )

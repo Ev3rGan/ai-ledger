@@ -2,7 +2,7 @@
   "version": "research-protocol-2026-09-02.v4",
   "prompt_version": "research-prompt-2026-09-02.v4",
   "output_schema_version": "research-output-2026-08-22.v2",
-  "sse_contract_version": "research-sse-2026-08-15.v1",
+  "sse_contract_version": "research-sse-2026-09-02.v2",
   "route_identifier": "deepseek:v4-pro",
   "candidate_configuration_version": "model-routing-candidates-2026-08-12.v1",
   "routing_evaluation_version": "model-routing-evaluation-2026-08-12.v1",

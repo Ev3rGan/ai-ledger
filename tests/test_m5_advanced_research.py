@@ -1123,7 +1123,7 @@ def test_comparison_refuses_single_story_evidence_before_allowance_and_provider(
     assert events[-2][1]["reason"] == "insufficient-evidence"
     assert events[-1] == (
         "done",
-        {"version": "research-sse-2026-08-15.v1", "status": "refused"},
+        {"version": "research-sse-2026-09-02.v2", "status": "refused"},
     )
     assert {event for event, _ in events}.isdisjoint(
         {"answer.delta", "citation", "error"}
@@ -1449,7 +1449,7 @@ def test_retrieval_failure_returns_structured_sse_without_calling_provider() -> 
 
     assert [event for event, _ in events] == ["status", "error", "done"]
     assert events[1][1] == {
-        "version": "research-sse-2026-08-15.v1",
+        "version": "research-sse-2026-09-02.v2",
         "code": "retrieval-failed",
         "message": "Research 检索失败，未生成答案。",
     }

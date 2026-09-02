@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import date
@@ -40,8 +41,13 @@ from ai_intel_agent.research import (
     PersistentAnonymousResearchAllowance,
     ResearchProvider,
     ResearchRepository,
+    ResearchTaskType,
+    interpret_query_intent,
     stream_research_events,
 )
+
+LOGGER = logging.getLogger(__name__)
+RESEARCH_QUESTION_MAX_CHARACTERS = 500
 
 EVIDENCE_STATE_LABELS: dict[EvidenceState, str] = {
     EvidenceState.SINGLE_SOURCE: "单一来源",
@@ -64,7 +70,10 @@ EVIDENCE_RELATION_LABELS: dict[EvidenceRelation, str] = {
 class ResearchQuestion(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    question: str = Field(min_length=1, max_length=500)
+    question: str = Field(
+        min_length=1,
+        max_length=RESEARCH_QUESTION_MAX_CHARACTERS,
+    )
 
 
 def create_app(
@@ -267,7 +276,15 @@ def create_app(
 
     @app.get("/research", response_class=HTMLResponse, name="research")
     def research() -> HTMLResponse:
-        examples = _research_example_questions(repository.latest_digest())
+        try:
+            digest = repository.latest_digest()
+        except Exception as error:  # noqa: BLE001 - examples are best-effort UI data.
+            LOGGER.warning(
+                "Research examples unavailable: %s",
+                type(error).__name__,
+            )
+            digest = None
+        examples = _research_example_questions(digest)
         return HTMLResponse(_render_page("Research", _render_research_page(examples)))
 
     @app.post("/research/answer", name="research_answer")
@@ -577,6 +594,12 @@ def _research_example_questions(digest: PublicDigest | None) -> tuple[str, ...]:
         ):
             continue
         question = f"关于「{story.headline}」，已发布知识支持什么事实？"
+        if (
+            len(question) > RESEARCH_QUESTION_MAX_CHARACTERS
+            or interpret_query_intent(question).task_type
+            is not ResearchTaskType.SIMPLE_LOOKUP
+        ):
+            continue
         if question not in questions:
             questions.append(question)
         if len(questions) == 4:

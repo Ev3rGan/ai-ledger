@@ -84,6 +84,7 @@ def _persist_research_story(
     identity: str,
     review_state: StoryReviewState,
     digest_state: DigestState,
+    headline: str | None = None,
 ) -> tuple[UUID, UUID, UUID]:
     candidate_id = _id(f"{identity}:candidate")
     document_id = _id(f"{identity}:document")
@@ -91,6 +92,7 @@ def _persist_research_story(
     claim_id = _id(f"{identity}:claim")
     evidence_id = _id(f"{identity}:evidence")
     digest_id = _id(f"{identity}:digest")
+    story_headline = headline or f"{HEADLINE} · {identity}"
     body = f"August 12, 2026\n{EVIDENCE_TEXT}"
     now = datetime(2026, 8, 15, tzinfo=UTC)
     engine = create_database_engine(database_url)
@@ -128,7 +130,7 @@ def _persist_research_story(
                     id=story_id,
                     primary_document_version_id=document_id,
                     stable_key=f"{STORY_KEY}:{identity}",
-                    headline=f"{HEADLINE} · {identity}",
+                    headline=story_headline,
                     occurred_at=datetime(2026, 8, 12, tzinfo=UTC),
                     review_state=review_state.value,
                 )
@@ -136,7 +138,7 @@ def _persist_research_story(
             session.execute(
                 insert(StoryPresentationRecord).values(
                     story_id=story_id,
-                    summary=f"{HEADLINE} · {identity} 的已审核读者摘要。",
+                    summary=f"{story_headline} 的已审核读者摘要。",
                     why_it_matters=(
                         f"这条 {identity} 信息帮助开发者理解 Gemini 发布与采用影响。"
                     ),
@@ -462,7 +464,7 @@ def test_research_protocol_reuses_the_human_approved_m1_route() -> None:
     assert protocol.version == "research-protocol-2026-09-02.v4"
     assert protocol.prompt_version == "research-prompt-2026-09-02.v4"
     assert protocol.output_schema_version == "research-output-2026-08-22.v2"
-    assert protocol.sse_contract_version == "research-sse-2026-08-15.v1"
+    assert protocol.sse_contract_version == "research-sse-2026-09-02.v2"
     assert protocol.route_identifier == "deepseek:v4-pro"
     assert protocol.routing_evaluation_version == "model-routing-evaluation-2026-08-12.v1"
     assert protocol.maximum_iterations == 2
@@ -599,6 +601,48 @@ def test_research_page_explains_curated_capabilities_and_offers_fill_only_exampl
     assert "管理员" not in response.text
 
 
+def test_research_page_stays_available_when_dynamic_examples_cannot_be_loaded(
+) -> None:
+    unavailable_database_url = (
+        "postgresql://postgres:postgres@127.0.0.1:1/postgres?connect_timeout=1"
+    )
+    with TestClient(create_app(unavailable_database_url)) as client:
+        response = client.get("/research")
+
+    assert response.status_code == 200
+    assert '<form id="research-form">' in response.text
+    assert 'class="research-example"' not in response.text
+    assert "当前没有可由已发布知识支持的示例问题。" in response.text
+
+
+@pytest.mark.postgres
+@pytest.mark.parametrize(
+    "headline",
+    (
+        "比较 OpenAI 和 Anthropic 的模型发布进展",
+        "模型" * 250,
+    ),
+)
+def test_research_page_hides_examples_that_are_not_valid_simple_lookup_questions(
+    research_database_url: str,
+    headline: str,
+) -> None:
+    _persist_research_story(
+        research_database_url,
+        identity="invalid-example",
+        review_state=StoryReviewState.ACCEPTED,
+        digest_state=DigestState.PUBLISHED,
+        headline=headline,
+    )
+
+    with TestClient(create_app(research_database_url)) as client:
+        response = client.get("/research")
+
+    assert response.status_code == 200
+    assert 'class="research-example"' not in response.text
+    assert "当前没有可由已发布知识支持的示例问题。" in response.text
+
+
 @pytest.mark.postgres
 def test_serve_wires_research_provider_from_in_process_key_without_requesting_network(
     research_database_url: str,
@@ -686,7 +730,7 @@ def test_research_streams_answer_from_accepted_published_evidence_with_public_ci
     assert response.headers["content-type"].startswith("text/event-stream")
     events = _sse_events(response.text)
     assert {payload["version"] for _, payload in events} == {
-        "research-sse-2026-08-15.v1"
+        "research-sse-2026-09-02.v2"
     }
     answer = "".join(
         str(payload["text"]) for event, payload in events if event == "answer.delta"
@@ -827,7 +871,7 @@ def test_research_accepts_only_formatting_differences_between_answer_and_support
         for event, payload in events
         if event == "answer.delta"
     )
-    assert answer == "Google 已正式发布 Gemini 3.6 Flash。\n该版本已正式可用。"
+    assert answer == "Google 已正式发布 Gemini 3.6 Flash。\n\n该版本已正式可用。"
     assert events[-1][1]["status"] == "answered"
 
 
@@ -866,13 +910,13 @@ def test_research_refuses_without_calling_provider_when_matches_are_not_public_k
     events = _sse_events(response.text)
     refusal = next(payload for event, payload in events if event == "refusal")
     assert refusal == {
-        "version": "research-sse-2026-08-15.v1",
+        "version": "research-sse-2026-09-02.v2",
         "reason": "insufficient-evidence",
         "message": "证据不足：已发布知识中没有足够证据回答这个问题。",
     }
     assert events[-1] == (
         "done",
-        {"version": "research-sse-2026-08-15.v1", "status": "refused"},
+        {"version": "research-sse-2026-09-02.v2", "status": "refused"},
     )
     assert provider.calls == []
 
@@ -968,7 +1012,7 @@ def test_research_streams_explicit_refusal_when_provider_abstains_from_retrieved
         "done",
     ]
     assert events[2][1] == {
-        "version": "research-sse-2026-08-15.v1",
+        "version": "research-sse-2026-09-02.v2",
         "reason": "provider-abstained",
         "message": "Provider 未能根据已检索证据生成受支持的答案。",
     }
