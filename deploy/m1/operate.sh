@@ -128,6 +128,144 @@ validate_image_revision() {
   }
 }
 
+validate_provider_qualification() {
+  release_file="$1"
+  qualification_file="$(release_value "$release_file" AI_INTEL_PROVIDER_QUALIFICATION_FILE)"
+  release_dir="$(release_value "$release_file" AI_INTEL_RELEASE_DIR)"
+  release_sha="$(release_value "$release_file" AI_INTEL_RELEASE)"
+  case "$qualification_file" in
+    /*) ;;
+    *) printf '%s\n' 'AI_INTEL_PROVIDER_QUALIFICATION_FILE must be an absolute path' >&2; exit 2;;
+  esac
+  test -f "$qualification_file" || {
+    printf '%s\n' 'live Research Provider qualification result is missing' >&2
+    exit 2
+  }
+  protocol_file="${release_dir}/src/ai_intel_agent/data/research_protocol.v1.json"
+  corpus_file="${release_dir}/src/ai_intel_agent/data/research_provider_qualification.v1.json"
+  candidates_file="${release_dir}/src/ai_intel_agent/data/model_routing_candidates.v1.json"
+  test -f "$protocol_file" && test -f "$corpus_file" && test -f "$candidates_file" || {
+    printf '%s\n' 'release qualification contract files are missing' >&2
+    exit 2
+  }
+  python3 - "$qualification_file" "$release_sha" "$protocol_file" "$corpus_file" "$candidates_file" <<'PY'
+import hashlib
+import json
+import sys
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+report_path, expected_revision, protocol_path, corpus_path, candidates_path = sys.argv[1:]
+
+
+def reject(message: str) -> None:
+    print(message, file=sys.stderr)
+    raise SystemExit(2)
+
+
+try:
+    report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+    protocol = json.loads(Path(protocol_path).read_text(encoding="utf-8"))
+    corpus = json.loads(Path(corpus_path).read_text(encoding="utf-8"))
+    candidates = json.loads(Path(candidates_path).read_text(encoding="utf-8"))
+    generated_at = datetime.fromisoformat(report["generated_at"].replace("Z", "+00:00"))
+    valid_until = datetime.fromisoformat(report["valid_until"].replace("Z", "+00:00"))
+    protocol_sha = hashlib.sha256(Path(protocol_path).read_bytes()).hexdigest()
+    corpus_sha = hashlib.sha256(Path(corpus_path).read_bytes()).hexdigest()
+    results = report["results"]
+    if not isinstance(results, list) or not results:
+        reject("live Research Provider qualification contains no observations")
+    expected_route = protocol["route_identifier"]
+    approved_model = next(
+        candidate["model_id"]
+        for candidate in candidates["candidates"]
+        if candidate["identifier"] == expected_route
+    )
+    expected_observations = sorted(
+        (case["identifier"], repetition, case["expected_status"])
+        for case in corpus["cases"]
+        for repetition in range(1, int(case["repetitions"]) + 1)
+    )
+    observed_observations = sorted(
+        (
+            result["case_identifier"],
+            int(result["repetition"]),
+            result["expected_status"],
+        )
+        for result in results
+    )
+except (AttributeError, KeyError, OSError, StopIteration, TypeError, ValueError) as error:
+    reject(f"live Research Provider qualification result is invalid: {type(error).__name__}")
+
+if report.get("schema_version") != "research-provider-qualification-report.v1":
+    reject("live Research Provider qualification schema is not approved")
+if report.get("status") != "passed" or report.get("execution_mode") != "live-provider":
+    reject("live Research Provider qualification did not pass")
+if report.get("target_kind") != "merged-revision":
+    reject("pull request Provider feedback cannot qualify a production release")
+if report.get("commit_sha") != expected_revision:
+    reject("live Research Provider qualification revision does not match the release")
+if report.get("protocol_sha256") != protocol_sha or report.get("corpus_sha256") != corpus_sha:
+    reject("live Research Provider qualification contract hash does not match the release")
+if (
+    report.get("protocol_version") != protocol.get("version")
+    or report.get("corpus_version") != corpus.get("version")
+    or report.get("route_identifier") != expected_route
+    or report.get("approved_model_id") != approved_model
+):
+    reject("live Research Provider qualification route or model is not approved")
+if generated_at.tzinfo is None or valid_until.tzinfo is None:
+    reject("live Research Provider qualification timestamps must include a timezone")
+expected_validity = int(corpus.get("validity_seconds", 0))
+if expected_validity < 1 or (valid_until - generated_at).total_seconds() != expected_validity:
+    reject("live Research Provider qualification validity does not match the corpus")
+maximum_attempts = report.get("maximum_provider_attempts")
+reserved_cost = report.get("worst_case_reserved_cost_usd")
+if (
+    not isinstance(maximum_attempts, int)
+    or maximum_attempts < len(results)
+    or not isinstance(reserved_cost, (int, float))
+    or reserved_cost <= 0
+    or reserved_cost > float(corpus.get("maximum_cost_usd", 0))
+):
+    reject("live Research Provider qualification budget is invalid")
+now = datetime.now(UTC)
+if generated_at > now + timedelta(minutes=5) or valid_until <= now:
+    reject("live Research Provider qualification is not currently valid")
+if observed_observations != expected_observations:
+    reject("live Research Provider qualification does not cover the approved corpus")
+if any(
+    not isinstance(result, dict)
+    or result.get("passed") is not True
+    or result.get("validated_returned_model_id") != report.get("approved_model_id")
+    or not isinstance(result.get("citation_count"), int)
+    or (
+        result.get("expected_status") == "answered"
+        and result.get("citation_count", 0) < 1
+    )
+    or (
+        result.get("expected_status") == "refused"
+        and result.get("citation_count", 0) != 0
+    )
+    for result in results
+):
+    reject("live Research Provider qualification contains a failed observation")
+
+print(
+    json.dumps(
+        {
+            "event": "provider-qualification",
+            "status": "passed",
+            "commit_sha": expected_revision,
+            "protocol_sha256": protocol_sha,
+            "corpus_sha256": corpus_sha,
+        },
+        separators=(",", ":"),
+    )
+)
+PY
+}
+
 validate_candidate_contract() {
   release_file="$1"
   grep -Eq '^AI_INTEL_SCHEDULE_BACKFILL_LIMIT=[1-5]$' "$release_file" || {
@@ -149,6 +287,7 @@ validate_candidate_contract() {
       exit 2
     }
   done
+  validate_provider_qualification "$release_file"
 }
 
 validate_candidate() {

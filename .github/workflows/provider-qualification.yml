@@ -1,0 +1,137 @@
+name: Live Provider qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_kind:
+        description: Qualify a merged revision or provide early PR HEAD feedback
+        required: true
+        default: merged-revision
+        type: choice
+        options:
+          - merged-revision
+          - pull-request-head
+      revision:
+        description: Exact commit SHA (required for merged-revision)
+        required: false
+        type: string
+      pull_request_number:
+        description: Open PR number (required for pull-request-head)
+        required: false
+        type: string
+  schedule:
+    - cron: "15 21 * * *"
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: live-provider-qualification
+  cancel-in-progress: false
+
+jobs:
+  qualification:
+    name: qualify selected revision against DeepSeek
+    runs-on: windows-latest
+    timeout-minutes: 15
+    environment: provider-acceptance
+    steps:
+      - name: Check out main safely
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: main
+          persist-credentials: false
+
+      - name: Select an exact qualification target
+        id: revision
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TARGET_KIND: ${{ inputs.target_kind }}
+          REQUESTED_REVISION: ${{ inputs.revision }}
+          PULL_REQUEST_NUMBER: ${{ inputs.pull_request_number }}
+        run: |
+          git fetch origin main
+          $targetKind = if ($env:GITHUB_EVENT_NAME -eq "workflow_dispatch") {
+            $env:REQUESTED_TARGET_KIND
+          } else {
+            "merged-revision"
+          }
+          if ($targetKind -eq "pull-request-head") {
+            $pullRequestNumber = $env:PULL_REQUEST_NUMBER
+            if ($pullRequestNumber -notmatch '^[1-9][0-9]*$') {
+              throw "PR HEAD qualification requires one open pull request number"
+            }
+            $pullRequest = gh api `
+              "repos/$env:GITHUB_REPOSITORY/pulls/$pullRequestNumber" |
+              ConvertFrom-Json
+            if ($pullRequest.state -ne "open") {
+              throw "PR HEAD qualification requires an open pull request"
+            }
+            $revision = [string]$pullRequest.head.sha
+            $pullRef = "pull/$pullRequestNumber/head"
+            git fetch origin $pullRef
+            $fetchedRevision = (git rev-parse FETCH_HEAD).Trim()
+            if ($fetchedRevision -ne $revision) {
+              throw "Fetched PR HEAD no longer matches GitHub metadata"
+            }
+          } elseif ($targetKind -eq "merged-revision") {
+            $revision = if ($env:GITHUB_EVENT_NAME -eq "workflow_dispatch") {
+              $env:REQUESTED_REVISION
+            } else {
+              (git rev-parse HEAD).Trim()
+            }
+            if ($revision -notmatch '^[0-9a-f]{40}$') {
+              throw "Provider qualification requires an exact lowercase commit SHA"
+            }
+            git merge-base --is-ancestor $revision origin/main
+            if ($LASTEXITCODE -ne 0) {
+              throw "Release qualification only accepts commits already merged into main"
+            }
+          } else {
+            throw "Unknown Provider qualification target kind"
+          }
+          if ($revision -notmatch '^[0-9a-f]{40}$') {
+            throw "Provider qualification requires an exact lowercase commit SHA"
+          }
+          git checkout --detach $revision
+          $checkedOut = (git rev-parse HEAD).Trim()
+          if ($checkedOut -ne $revision) {
+            throw "Checked-out revision does not match the requested commit"
+          }
+          "revision=$revision" >> $env:GITHUB_OUTPUT
+          "target_kind=$targetKind" >> $env:GITHUB_OUTPUT
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install locked runtime
+        run: uv sync --locked --python 3.12 --extra ch3
+
+      - name: Run the real Provider qualification gate
+        shell: pwsh
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          uv run ai-intel-agent evaluate-research-provider `
+            --revision "${{ steps.revision.outputs.revision }}" `
+            --target-kind "${{ steps.revision.outputs.target_kind }}" `
+            --output "reports/research-provider-qualification.json"
+
+      - name: Publish the safe qualification report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: research-provider-qualification-${{ steps.revision.outputs.target_kind }}-${{ steps.revision.outputs.revision }}
+          path: reports/research-provider-qualification.json
+          if-no-files-found: warn
+          retention-days: 14

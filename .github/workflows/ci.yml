@@ -31,7 +31,7 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked --python 3.12 --extra ch3 --extra dev
 
-      - name: Run tests
+      - name: Run deterministic tests (mocked providers only)
         run: uv run --extra dev pytest
 
       - name: Run lint

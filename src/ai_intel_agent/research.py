@@ -415,22 +415,29 @@ def interpret_query_intent(question: str) -> QueryIntent:
 class DeepSeekResearchProvider:
     """Stream strict Research JSON through the single M1-approved DeepSeek route."""
 
+    _MESSAGE_OVERHEAD_TOKEN_UPPER_BOUND = 1024
+
     def __init__(
         self,
         client: httpx.Client,
         *,
         api_key: str,
         budget: MeteredProviderBudget | None = None,
+        maximum_input_tokens: int | None = None,
         sleeper: Callable[[float], None] = sleep,
         clock: Callable[[], float] = monotonic,
     ) -> None:
         if not api_key.strip():
             raise ResearchError("DEEPSEEK_API_KEY is required for Research")
+        if maximum_input_tokens is not None and maximum_input_tokens < 1:
+            raise ValueError("Research Provider maximum input tokens must be positive")
         self._client = client
         self._api_key = api_key
         self._budget = budget
+        self._maximum_input_tokens = maximum_input_tokens
         self._sleeper = sleeper
         self._clock = clock
+        self._last_returned_model_id: str | None = None
         self._protocol = load_research_protocol()
         self._routing_protocol = load_protocol_configuration()
         configuration = load_candidate_configuration()
@@ -440,6 +447,7 @@ class DeepSeekResearchProvider:
         )
 
     def stream(self, evidence_set: ResearchEvidenceSet) -> Iterator[str]:
+        self._last_returned_model_id = None
         protocol = self._protocol
         intent = evidence_set.intent or interpret_query_intent(evidence_set.question)
         requirement_ids_by_evidence: dict[
@@ -530,6 +538,18 @@ class DeepSeekResearchProvider:
             ),
             "stream": True,
         }
+        if self._maximum_input_tokens is not None:
+            # A token cannot encode less than one UTF-8 byte; reserve additional
+            # space for the Provider's chat-message framing.
+            message_content_bytes = sum(
+                len(message["content"].encode("utf-8"))
+                for message in payload["messages"]
+            )
+            conservative_input_token_bound = (
+                message_content_bytes + self._MESSAGE_OVERHEAD_TOKEN_UPPER_BOUND
+            )
+            if conservative_input_token_bound > self._maximum_input_tokens:
+                raise ResearchBudgetExceeded("provider-input")
         provider_timeout_seconds = (
             evidence_set.provider_timeout_seconds
             if evidence_set.provider_timeout_seconds is not None
@@ -617,6 +637,11 @@ class DeepSeekResearchProvider:
             raise ResearchError("DeepSeek Research stream did not finish completely")
         if returned_models != {self._candidate.model_id}:
             raise ResearchError("DeepSeek returned model does not match approved route")
+        self._last_returned_model_id = self._candidate.model_id
+
+    @property
+    def last_returned_model_id(self) -> str | None:
+        return self._last_returned_model_id
 
 
 class PostgresResearchEvidenceMetadataLoader:

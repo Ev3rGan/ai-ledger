@@ -1,0 +1,49 @@
+{
+  "version": "research-provider-qualification-2026-09-02.v1",
+  "description": "Small production-shaped corpus for release qualification against the live Research Provider.",
+  "validity_seconds": 86400,
+  "maximum_input_tokens_per_request": 8192,
+  "maximum_cost_usd": 0.10,
+  "evidence_sets": {
+    "hugging-face-webgpu": [
+      {
+        "story_id": "11111111-1111-4111-8111-111111111111",
+        "story_stable_key": "hugging-face-webgpu-kernels-and-fleet",
+        "story_headline": "Hugging Face 发布 WebGPU 内核库与 Fleet 浏览器基准测试工具",
+        "claim_id": "22222222-2222-4222-8222-222222222222",
+        "claim_text": "Hugging Face 发布了用于 WebGPU 的 @huggingface/kernels 内核库，并发布了 Fleet 浏览器基准测试工具。",
+        "evidence_span_id": "33333333-3333-4333-8333-333333333333",
+        "evidence_text": "Hugging Face released the @huggingface/kernels library for WebGPU and the Fleet browser benchmarking tool.",
+        "evidence_role": "primary",
+        "evidence_relation": "supports",
+        "evidence_publisher": "Hugging Face"
+      }
+    ]
+  },
+  "cases": [
+    {
+      "identifier": "hugging-face-published-facts",
+      "question": "关于「Hugging Face 发布 WebGPU 内核库与 Fleet 浏览器基准测试工具」，已发布知识支持什么事实？",
+      "evidence_set": "hugging-face-webgpu",
+      "expected_status": "answered",
+      "required_answer_terms": ["Hugging Face", "WebGPU", "Fleet"],
+      "repetitions": 3
+    },
+    {
+      "identifier": "hugging-face-webgpu-publisher-paraphrase",
+      "question": "谁发布了 WebGPU 内核库？",
+      "evidence_set": "hugging-face-webgpu",
+      "expected_status": "answered",
+      "required_answer_terms": ["Hugging Face", "WebGPU"],
+      "repetitions": 3
+    },
+    {
+      "identifier": "unsupported-quantum-chip",
+      "question": "OpenAI 在 2030 年发布了什么量子芯片？",
+      "evidence_set": "hugging-face-webgpu",
+      "expected_status": "refused",
+      "required_answer_terms": [],
+      "repetitions": 1
+    }
+  ]
+}

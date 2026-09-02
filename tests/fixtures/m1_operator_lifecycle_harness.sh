@@ -55,6 +55,7 @@ write_release() {
   image_digit="$4"
   embedding_model_dir="$5"
   reranker_model_dir="$6"
+  qualification_file="$7"
   cat >"$release_file" <<EOF
 AI_INTEL_IMAGE=registry.example/ai-ledger@sha256:$(printf '%064d' 0 | tr 0 "$image_digit")
 AI_INTEL_RELEASE=$release_sha
@@ -74,6 +75,23 @@ AI_INTEL_BACKUP_RETENTION_DAYS=14
 AI_INTEL_EMBEDDING_MODEL_DIR=$embedding_model_dir
 AI_INTEL_RERANKER_MODEL_DIR=$reranker_model_dir
 AI_INTEL_RETRIEVAL_THREADS=2
+AI_INTEL_PROVIDER_QUALIFICATION_FILE=$qualification_file
+EOF
+}
+
+write_qualification() {
+  qualification_file="$1"
+  release_sha="$2"
+  release_dir="$3"
+  protocol_sha="$(sha256sum "$release_dir/src/ai_intel_agent/data/research_protocol.v1.json" | awk '{print $1}')"
+  corpus_sha="$(sha256sum "$release_dir/src/ai_intel_agent/data/research_provider_qualification.v1.json" | awk '{print $1}')"
+  generated_epoch="$(date -u +%s)"
+  generated_epoch="$((generated_epoch - 60))"
+  valid_until_epoch="$((generated_epoch + 86400))"
+  generated_at="$(date -u -d "@$generated_epoch" '+%Y-%m-%dT%H:%M:%SZ')"
+  valid_until="$(date -u -d "@$valid_until_epoch" '+%Y-%m-%dT%H:%M:%SZ')"
+  cat >"$qualification_file" <<EOF
+{"schema_version":"research-provider-qualification-report.v1","status":"passed","execution_mode":"live-provider","target_kind":"merged-revision","commit_sha":"$release_sha","route_identifier":"deepseek:v4-pro","approved_model_id":"deepseek-v4-pro","protocol_version":"fixture","protocol_sha256":"$protocol_sha","corpus_version":"fixture","corpus_sha256":"$corpus_sha","generated_at":"$generated_at","valid_until":"$valid_until","maximum_provider_attempts":14,"worst_case_reserved_cost_usd":0.062,"results":[{"case_identifier":"fixture","repetition":1,"expected_status":"answered","observed_status":"answered","passed":true,"failure_code":null,"citation_count":1,"validated_returned_model_id":"deepseek-v4-pro"}]}
 EOF
 }
 
@@ -86,23 +104,32 @@ new_fixture() {
   candidate_dir="$fixture/candidate-release"
   embedding_model_dir="$fixture/models/embedding"
   reranker_model_dir="$fixture/models/reranker"
+  current_qualification="$fixture/current-qualification.json"
+  candidate_qualification="$fixture/candidate-qualification.json"
   mkdir -p "$state_dir" "$fake_bin" \
     "$current_dir/deploy/m1" "$candidate_dir/deploy/m1" "$fixture/offsite" \
-    "$embedding_model_dir" "$reranker_model_dir"
+    "$embedding_model_dir" "$reranker_model_dir" \
+    "$current_dir/src/ai_intel_agent/data" "$candidate_dir/src/ai_intel_agent/data"
 
   printf '%s\n' "$current_release" >"$current_dir/.fake-head"
   printf '%s\n' "$candidate_release" >"$candidate_dir/.fake-head"
   for release_dir in "$current_dir" "$candidate_dir"; do
     printf '%s\n' 'services: {}' >"$release_dir/deploy/m1/production.compose.yml"
     printf '%s\n' 'public.example { respond 200 }' >"$release_dir/deploy/m1/Caddyfile"
+    printf '%s\n' '{"version":"fixture","route_identifier":"deepseek:v4-pro"}' >"$release_dir/src/ai_intel_agent/data/research_protocol.v1.json"
+    printf '%s\n' '{"version":"fixture-candidates","candidates":[{"identifier":"deepseek:v4-pro","model_id":"deepseek-v4-pro"}]}' >"$release_dir/src/ai_intel_agent/data/model_routing_candidates.v1.json"
+    printf '%s\n' '{"version":"fixture","validity_seconds":86400,"maximum_cost_usd":0.1,"cases":[{"identifier":"fixture","expected_status":"answered","repetitions":1}]}' >"$release_dir/src/ai_intel_agent/data/research_provider_qualification.v1.json"
   done
+
+  write_qualification "$current_qualification" "$current_release" "$current_dir"
+  write_qualification "$candidate_qualification" "$candidate_release" "$candidate_dir"
 
   current_file="$state_dir/current.env"
   candidate_file="$fixture/candidate.env"
   write_release "$current_file" "$current_release" "$current_dir" a \
-    "$embedding_model_dir" "$reranker_model_dir"
+    "$embedding_model_dir" "$reranker_model_dir" "$current_qualification"
   write_release "$candidate_file" "$candidate_release" "$candidate_dir" b \
-    "$embedding_model_dir" "$reranker_model_dir"
+    "$embedding_model_dir" "$reranker_model_dir" "$candidate_qualification"
   runtime_state="$fixture/runtime.state"
   printf 'release=%s\nsubnet=%s\nip_range=none\nowner=compose\nconnected=1\n' \
     "$current_release" "$legacy_subnet" >"$runtime_state"
@@ -128,6 +155,10 @@ EOF
   cat >"$fake_bin/flock" <<'EOF'
 #!/bin/sh
 exit 0
+EOF
+  cat >"$fake_bin/python3" <<'EOF'
+#!/bin/sh
+exec "$QUALIFICATION_TEST_PYTHON" "$@"
 EOF
   cat >"$fake_bin/docker" <<'EOF'
 #!/bin/sh
@@ -309,7 +340,9 @@ case " $* " in
     ;;
 esac
 EOF
-  chmod +x "$fake_bin/git" "$fake_bin/mountpoint" "$fake_bin/flock" "$fake_bin/docker"
+  chmod +x \
+    "$fake_bin/git" "$fake_bin/mountpoint" "$fake_bin/flock" "$fake_bin/python3" \
+    "$fake_bin/docker"
 
   export PATH="$fake_bin:/usr/bin:/bin"
   export AI_INTEL_STATE_DIR="$state_dir"
@@ -345,6 +378,40 @@ case_validate_no_side_effect() {
   assert_equal "$before" "$(cat "$runtime_state")" "validate changed the current runtime"
   grep -qx 'standalone:caddy-validate' "$FAKE_EVENT_LOG" || fail "validate did not use isolated Caddy validation"
   ! grep -q 'caddy-validate-project' "$FAKE_EVENT_LOG" || fail "validate used the project network"
+}
+
+case_qualification_failure_no_side_effect() {
+  for failure_mode in missing failed mocked target revision route model contract cost expired observation; do
+    new_fixture "qualification-$failure_mode"
+    case "$failure_mode" in
+      missing) rm "$candidate_qualification" ;;
+      failed) sed -i 's/"status":"passed"/"status":"failed"/' "$candidate_qualification" ;;
+      mocked) sed -i 's/"execution_mode":"live-provider"/"execution_mode":"mocked-provider"/' "$candidate_qualification" ;;
+      target) sed -i 's/"target_kind":"merged-revision"/"target_kind":"pull-request-head"/' "$candidate_qualification" ;;
+      revision) sed -i "s/$candidate_release/$current_release/" "$candidate_qualification" ;;
+      route) sed -i 's/"route_identifier":"deepseek:v4-pro"/"route_identifier":"unapproved:route"/' "$candidate_qualification" ;;
+      model) sed -i 's/"approved_model_id":"deepseek-v4-pro"/"approved_model_id":"unapproved-model"/' "$candidate_qualification" ;;
+      contract) printf '%s\n' '{"version":"changed","validity_seconds":86400}' >"$candidate_dir/src/ai_intel_agent/data/research_provider_qualification.v1.json" ;;
+      cost) sed -i 's/"worst_case_reserved_cost_usd":0.062/"worst_case_reserved_cost_usd":1.0/' "$candidate_qualification" ;;
+      expired)
+        sed -i \
+          's/"generated_at":"[^"]*"/"generated_at":"2000-01-01T00:00:00Z"/; s/"valid_until":"[^"]*"/"valid_until":"2000-01-02T00:00:00Z"/' \
+          "$candidate_qualification"
+        ;;
+      observation) sed -i 's/"passed":true/"passed":false/' "$candidate_qualification" ;;
+    esac
+    before_runtime="$(cat "$runtime_state")"
+    before_current="$(cat "$current_file")"
+    if run_operator upgrade "$candidate_file"; then
+      fail "upgrade unexpectedly accepted Provider qualification failure: $failure_mode"
+    fi
+    assert_equal "$before_runtime" "$(cat "$runtime_state")" "qualification failure changed runtime for $failure_mode"
+    assert_equal "$before_current" "$(cat "$current_file")" "qualification failure changed current record for $failure_mode"
+    [ ! -e "$state_dir/previous.env" ] || fail "qualification failure recorded previous release for $failure_mode"
+    for forbidden_event in backup detach-edge remove-edge up-postgres up-services; do
+      ! grep -q "$forbidden_event" "$FAKE_EVENT_LOG" || fail "qualification failure reached $forbidden_event for $failure_mode"
+    done
+  done
 }
 
 case_upgrade_success() {
@@ -506,6 +573,7 @@ case_rollback_failure_recovery() {
 run_case() {
   case "$1" in
     validate_no_side_effect) case_validate_no_side_effect ;;
+    qualification_failure_no_side_effect) case_qualification_failure_no_side_effect ;;
     preflight_failure_no_side_effect) case_preflight_failure_no_side_effect ;;
     upgrade_success) case_upgrade_success ;;
     upgrade_failure_recovery) case_upgrade_failure_recovery ;;
@@ -522,6 +590,7 @@ run_case() {
 if [ "$selected_case" = all ]; then
   for case_name in \
     validate_no_side_effect \
+    qualification_failure_no_side_effect \
     preflight_failure_no_side_effect \
     upgrade_success \
     upgrade_failure_recovery \
