@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: quality
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked --python 3.12 --extra ch3 --extra dev
+
+      - name: Run tests
+        run: uv run --extra dev pytest
+
+      - name: Run lint
+        run: uv run --extra dev ruff check .
+
+      - name: Run sample CLI
+        shell: pwsh
+        run: |
+          $script = @'
+          import os
+          import shutil
+          import subprocess
+          from uuid import uuid4
+
+          from pg0 import Pg0
+
+          server = Pg0(name=f"ai_ledger_ci_{uuid4().hex}")
+          server.start()
+          environment = dict(os.environ)
+          environment["AI_INTEL_DATABASE_URL"] = server.uri
+          executable = shutil.which("ai-intel-agent")
+          if executable is None:
+              raise RuntimeError("ai-intel-agent executable not found")
+          try:
+              subprocess.run([executable, "operator", "migrate"], env=environment, check=True)
+              subprocess.run(
+                  [executable, "run", "--sample", "--output", "reports/daily.md"],
+                  env=environment,
+                  check=True,
+              )
+          finally:
+              server.drop()
+          '@
+          uv run --extra dev python -c $script
