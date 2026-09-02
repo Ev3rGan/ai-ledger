@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import date
@@ -38,10 +39,16 @@ from ai_intel_agent.publication import (
 )
 from ai_intel_agent.research import (
     PersistentAnonymousResearchAllowance,
+    ResearchError,
     ResearchProvider,
     ResearchRepository,
+    ResearchTaskType,
+    interpret_query_intent,
     stream_research_events,
 )
+
+LOGGER = logging.getLogger(__name__)
+RESEARCH_QUESTION_MAX_CHARACTERS = 500
 
 EVIDENCE_STATE_LABELS: dict[EvidenceState, str] = {
     EvidenceState.SINGLE_SOURCE: "单一来源",
@@ -64,7 +71,10 @@ EVIDENCE_RELATION_LABELS: dict[EvidenceRelation, str] = {
 class ResearchQuestion(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    question: str = Field(min_length=1, max_length=500)
+    question: str = Field(
+        min_length=1,
+        max_length=RESEARCH_QUESTION_MAX_CHARACTERS,
+    )
 
 
 def create_app(
@@ -267,7 +277,16 @@ def create_app(
 
     @app.get("/research", response_class=HTMLResponse, name="research")
     def research() -> HTMLResponse:
-        return HTMLResponse(_render_page("Research", _render_research_page()))
+        try:
+            digest = repository.latest_digest()
+        except Exception as error:  # noqa: BLE001 - examples are best-effort UI data.
+            LOGGER.warning(
+                "Research examples unavailable: %s",
+                type(error).__name__,
+            )
+            digest = None
+        examples = _research_example_questions(digest)
+        return HTMLResponse(_render_page("Research", _render_research_page(examples)))
 
     @app.post("/research/answer", name="research_answer")
     def research_answer(payload: ResearchQuestion, request: Request) -> StreamingResponse:
@@ -563,7 +582,45 @@ def _safe_source_url(value: str) -> str | None:
     return value
 
 
-def _render_research_page() -> str:
+def _research_example_questions(digest: PublicDigest | None) -> tuple[str, ...]:
+    if digest is None:
+        return ()
+    questions: list[str] = []
+    for story in digest.stories:
+        if not any(
+            evidence.relation is EvidenceRelation.SUPPORTS
+            and evidence.role is not EvidenceRole.COMMUNITY
+            for claim in story.claims
+            for evidence in claim.evidence
+        ):
+            continue
+        question = f"关于「{story.headline}」，已发布知识支持什么事实？"
+        if len(question) > RESEARCH_QUESTION_MAX_CHARACTERS:
+            continue
+        try:
+            intent = interpret_query_intent(question)
+        except ResearchError:
+            continue
+        if intent.task_type is not ResearchTaskType.SIMPLE_LOOKUP:
+            continue
+        if question not in questions:
+            questions.append(question)
+        if len(questions) == 4:
+            break
+    return tuple(questions)
+
+
+def _render_research_examples(questions: tuple[str, ...]) -> str:
+    if not questions:
+        return '<p class="muted">当前没有可由已发布知识支持的示例问题。</p>'
+    return "".join(
+        f'<button class="research-example" type="button" '
+        f'data-question="{escape(question, quote=True)}">{escape(question)}</button>'
+        for question in questions
+    )
+
+
+def _render_research_page(examples: tuple[str, ...]) -> str:
     return r"""
 <header class="page-header">
   <p class="eyebrow">Published knowledge, cited</p>
@@ -597,12 +654,7 @@ def _render_research_page() -> str:
 </aside>
 <section aria-labelledby="research-examples-heading">
   <h2 id="research-examples-heading">试试这些问题</h2>
-  <div class="research-examples">
-    <button class="research-example" type="button" data-question="Anthropic 的年化营收运行率是多少？">Anthropic 的年化营收运行率是多少？</button>
-    <button class="research-example" type="button" data-question="比较 OpenAI 和 Anthropic 在模型发布方面的进展">比较 OpenAI 和 Anthropic 在模型发布方面的进展</button>
-    <button class="research-example" type="button" data-question="按时间线梳理 Gemini 模型的发布历程">按时间线梳理 Gemini 模型的发布历程</button>
-    <button class="research-example" type="button" data-question="模型发布后如何影响开发者部署？">模型发布后如何影响开发者部署？</button>
-  </div>
+  <div class="research-examples">""" + _render_research_examples(examples) + r"""</div>
 </section>
 <section class="research-panel" aria-labelledby="research-question-heading">
   <h2 id="research-question-heading">如何提问</h2>
