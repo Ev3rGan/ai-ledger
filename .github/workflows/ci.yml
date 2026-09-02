@@ -120,15 +120,76 @@ jobs:
       - provider-scope
     if: >-
       github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
       needs.quality.result == 'success' &&
       needs.provider-scope.outputs.required == 'true'
-    uses: ./.github/workflows/provider-qualification.yml
-    with:
-      pull_request_number: ${{ github.event.pull_request.number }}
-      revision: ${{ github.event.pull_request.head.sha }}
+    runs-on: windows-latest
+    timeout-minutes: 15
+    environment: provider-acceptance
     permissions:
       contents: read
       pull-requests: read
+    steps:
+      - name: Check out the exact PR HEAD
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify the current same-repository PR HEAD
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PULL_REQUEST_NUMBER: ${{ github.event.pull_request.number }}
+          REQUESTED_REVISION: ${{ github.event.pull_request.head.sha }}
+        run: |
+          $pullRequest = gh api `
+            "repos/$env:GITHUB_REPOSITORY/pulls/$env:PULL_REQUEST_NUMBER" |
+            ConvertFrom-Json
+          if ($pullRequest.state -ne "open") {
+            throw "Provider qualification requires an open pull request"
+          }
+          if ($pullRequest.head.repo.full_name -ne $env:GITHUB_REPOSITORY) {
+            throw "Provider qualification does not expose secrets to fork pull requests"
+          }
+          if ([string]$pullRequest.head.sha -ne $env:REQUESTED_REVISION) {
+            throw "Requested PR revision is stale"
+          }
+          if ((git rev-parse HEAD).Trim() -ne $env:REQUESTED_REVISION) {
+            throw "Checked-out revision does not match the current PR HEAD"
+          }
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install locked runtime
+        run: uv sync --locked --python 3.12 --extra ch3
+
+      - name: Run the one real Provider qualification gate
+        shell: pwsh
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          uv run ai-intel-agent evaluate-research-provider `
+            --revision "${{ github.event.pull_request.head.sha }}" `
+            --output "reports/research-provider-qualification.json"
+
+      - name: Publish the safe qualification report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: research-provider-qualification-pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: reports/research-provider-qualification.json
+          if-no-files-found: warn
+          retention-days: 14
 
   provider-acceptance:
     name: provider-acceptance

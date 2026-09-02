@@ -230,24 +230,18 @@ def test_live_qualification_command_writes_only_safe_sha_bound_results(
 
 def test_provider_facing_pull_requests_run_one_protected_live_gate() -> None:
     project_root = Path(__file__).parents[1]
-    workflow = (
-        project_root / ".github" / "workflows" / "provider-qualification.yml"
-    ).read_text(encoding="utf-8")
     deterministic_ci = (project_root / ".github" / "workflows" / "ci.yml").read_text(
         encoding="utf-8"
     )
 
-    assert "workflow_call:" in workflow
-    assert "workflow_dispatch:" in workflow
-    assert "pull_request_number:" in workflow
-    assert "pull/$pullRequestNumber/head" in workflow
-    assert "environment: provider-acceptance" in workflow
-    assert "secrets.DEEPSEEK_API_KEY" in workflow
-    assert "evaluate-research-provider" in workflow
-    assert "schedule:" not in workflow
-    assert "merged-revision" not in workflow
-    assert "push:" not in workflow
-    assert "uses: ./.github/workflows/provider-qualification.yml" in deterministic_ci
+    assert not (
+        project_root / ".github" / "workflows" / "provider-qualification.yml"
+    ).exists()
+    assert "environment: provider-acceptance" in deterministic_ci
+    assert "secrets.DEEPSEEK_API_KEY" in deterministic_ci
+    assert "evaluate-research-provider" in deterministic_ci
+    assert "pulls/$env:PULL_REQUEST_NUMBER" in deterministic_ci
+    assert "uses: ./.github/workflows/provider-qualification.yml" not in deterministic_ci
     assert "github.event.pull_request.head.sha" in deterministic_ci
     assert "name: provider-acceptance" in deterministic_ci
     assert "git diff --name-only" in deterministic_ci

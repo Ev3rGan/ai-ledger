@@ -78,13 +78,12 @@ contract and use the same ledger; neither can bypass the cap.
 ## Real Provider release qualification
 
 Deterministic CI deliberately uses mocked Providers and cannot qualify a release. The same CI
-classifies the files changed by every PR. A Provider-facing PR automatically calls the separate
-**Live Provider qualification** workflow after deterministic quality checks pass; an unrelated PR
-records that no paid qualification is required. The protected job resolves and fetches the exact
-open same-repository PR HEAD, waits for `provider-acceptance` approval, reads its
-`DEEPSEEK_API_KEY`, runs the versioned production-shaped Research corpus once against the real
-Provider, and uploads a safe report. Fork PRs never receive the secret. A manual dispatch for the
-current open PR HEAD is retained only as a retry path.
+classifies the files changed by every PR. A Provider-facing PR automatically runs the protected
+**live Provider qualification** job after deterministic quality checks pass; an unrelated PR
+records that no paid qualification is required. The job verifies the exact open same-repository PR
+HEAD, waits for `provider-acceptance` approval, reads its `DEEPSEEK_API_KEY`, runs the versioned
+production-shaped Research corpus once against the real Provider, and uploads a safe report. Fork
+PRs never receive the secret. Use GitHub Actions' failed-job retry for transient failures.
 
 This is the only pre-deployment real-Provider qualification stage. There is no second post-merge
 qualification and no scheduled Provider-drift run. Configure `provider-acceptance` for `main` and
