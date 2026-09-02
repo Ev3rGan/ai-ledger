@@ -109,4 +109,4 @@ This public repository documents interfaces and decisions, not secrets, private 
 
 ## License
 
-MIT
+Apache-2.0

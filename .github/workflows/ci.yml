@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      AI_INTEL_DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/ai_ledger
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ai_ledger
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ai_ledger"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked --python 3.12 --extra ch3 --extra dev
+
+      - name: Run tests
+        run: uv run --extra dev pytest
+
+      - name: Run lint
+        run: uv run --extra dev ruff check .
+
+      - name: Apply database migrations
+        run: uv run ai-intel-agent operator migrate
+
+      - name: Run sample CLI
+        run: uv run ai-intel-agent run --sample --output reports/daily.md

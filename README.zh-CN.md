@@ -109,4 +109,4 @@ Operator 命令、拓扑、验证与停止方式都由 runbook 承载；根 READ
 
 ## License
 
-MIT
+Apache-2.0
