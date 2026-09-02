@@ -153,7 +153,7 @@ import hashlib
 import json
 import re
 import sys
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 
 (
@@ -262,7 +262,7 @@ if (
     or reserved_cost > float(corpus.get("maximum_cost_usd", 0))
 ):
     reject("live Research Provider qualification budget is invalid")
-if generated_at > datetime.now(UTC) + timedelta(minutes=5):
+if generated_at > datetime.now(timezone.utc) + timedelta(minutes=5):
     reject("live Research Provider qualification timestamp is in the future")
 if observed_observations != expected_observations:
     reject("live Research Provider qualification does not cover the approved corpus")

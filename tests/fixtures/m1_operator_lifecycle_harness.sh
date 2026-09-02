@@ -180,6 +180,18 @@ exit 0
 EOF
   cat >"$fake_bin/python3" <<'EOF'
 #!/bin/sh
+if [ "${FAKE_PYTHON_HIDE_DATETIME_UTC:-}" = 1 ] && [ "${1:-}" = - ]; then
+  shift
+  exec "$QUALIFICATION_TEST_PYTHON" -c '
+import datetime
+import sys
+
+del datetime.UTC
+source = sys.stdin.read()
+sys.argv = ["-", *sys.argv[1:]]
+exec(compile(source, "<stdin>", "exec"), {"__name__": "__main__"})
+' "$@"
+fi
 exec "$QUALIFICATION_TEST_PYTHON" "$@"
 EOF
   cat >"$fake_bin/docker" <<'EOF'
@@ -402,6 +414,16 @@ case_validate_no_side_effect() {
   ! grep -q 'caddy-validate-project' "$FAKE_EVENT_LOG" || fail "validate used the project network"
 }
 
+case_validate_python310_compatible() {
+  new_fixture validate-python310
+  before="$(cat "$runtime_state")"
+  export FAKE_PYTHON_HIDE_DATETIME_UTC=1
+  if ! run_operator validate "$candidate_file"; then
+    fail "validate requires datetime.UTC, which is unavailable on Python 3.10"
+  fi
+  assert_equal "$before" "$(cat "$runtime_state")" "Python 3.10 validation changed the current runtime"
+}
+
 case_qualification_failure_no_side_effect() {
   for failure_mode in missing failed mocked revision source route model contract cost observation; do
     new_fixture "qualification-$failure_mode"
@@ -590,6 +612,7 @@ case_rollback_failure_recovery() {
 run_case() {
   case "$1" in
     validate_no_side_effect) case_validate_no_side_effect ;;
+    validate_python310_compatible) case_validate_python310_compatible ;;
     qualification_failure_no_side_effect) case_qualification_failure_no_side_effect ;;
     preflight_failure_no_side_effect) case_preflight_failure_no_side_effect ;;
     upgrade_success) case_upgrade_success ;;
@@ -607,6 +630,7 @@ run_case() {
 if [ "$selected_case" = all ]; then
   for case_name in \
     validate_no_side_effect \
+    validate_python310_compatible \
     qualification_failure_no_side_effect \
     preflight_failure_no_side_effect \
     upgrade_success \
