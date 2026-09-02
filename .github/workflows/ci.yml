@@ -12,24 +12,8 @@ permissions:
 jobs:
   quality:
     name: quality
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    env:
-      AI_INTEL_DATABASE_URL: postgresql+psycopg://postgres:postgres@127.0.0.1:5432/ai_ledger
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: ai_ledger
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres -d ai_ledger"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+    runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -53,8 +37,32 @@ jobs:
       - name: Run lint
         run: uv run --extra dev ruff check .
 
-      - name: Apply database migrations
-        run: uv run ai-intel-agent operator migrate
-
       - name: Run sample CLI
-        run: uv run ai-intel-agent run --sample --output reports/daily.md
+        shell: pwsh
+        run: |
+          $script = @'
+          import os
+          import shutil
+          import subprocess
+          from uuid import uuid4
+
+          from pg0 import Pg0
+
+          server = Pg0(name=f"ai_ledger_ci_{uuid4().hex}")
+          server.start()
+          environment = dict(os.environ)
+          environment["AI_INTEL_DATABASE_URL"] = server.uri
+          executable = shutil.which("ai-intel-agent")
+          if executable is None:
+              raise RuntimeError("ai-intel-agent executable not found")
+          try:
+              subprocess.run([executable, "operator", "migrate"], env=environment, check=True)
+              subprocess.run(
+                  [executable, "run", "--sample", "--output", "reports/daily.md"],
+                  env=environment,
+                  check=True,
+              )
+          finally:
+              server.drop()
+          '@
+          uv run --extra dev python -c $script
