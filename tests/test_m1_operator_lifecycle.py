@@ -31,6 +31,7 @@ def _bash_executable() -> Path:
     "case_name",
     (
         "validate_no_side_effect",
+        "validate_python310_compatible",
         "qualification_failure_no_side_effect",
         "preflight_failure_no_side_effect",
         "upgrade_success",
