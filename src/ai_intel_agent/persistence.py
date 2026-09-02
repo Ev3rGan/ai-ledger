@@ -1505,6 +1505,8 @@ class EditorialRepository:
     def _pending_editorial_story_batch_ids(
         session: Session,
         *,
+        window_start: datetime,
+        window_end: datetime,
         lock: bool = False,
     ) -> tuple[UUID, ...]:
         maximum_pending_stories = load_editorial_agent_protocol().maximum_pending_stories
@@ -1518,7 +1520,11 @@ class EditorialRepository:
                 CandidateRecord,
                 CandidateRecord.id == DocumentVersionRecord.candidate_id,
             )
-            .where(StoryRecord.review_state == StoryReviewState.UNREVIEWED.value)
+            .where(
+                StoryRecord.review_state == StoryReviewState.UNREVIEWED.value,
+                DocumentVersionRecord.published_at >= window_start,
+                DocumentVersionRecord.published_at < window_end,
+            )
             .order_by(
                 CandidateRecord.discovered_at.desc(),
                 CandidateRecord.canonical_url,
@@ -1553,7 +1559,12 @@ class EditorialRepository:
         if lock:
             source_statement = source_statement.with_for_update()
             scheduler_statement = scheduler_statement.with_for_update()
-        story_ids = self._pending_editorial_story_batch_ids(session, lock=lock)
+        story_ids = self._pending_editorial_story_batch_ids(
+            session,
+            window_start=window_start,
+            window_end=window_end,
+            lock=lock,
+        )
         if lock and story_ids:
             session.scalars(
                 select(StoryPresentationRecord.story_id)

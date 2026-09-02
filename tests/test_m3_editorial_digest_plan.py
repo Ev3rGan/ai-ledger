@@ -292,6 +292,7 @@ def _persist_pending_stories(
     *,
     story_count: int = 10,
     tie_newest_discovery: bool = False,
+    future_story_positions: frozenset[int] = frozenset(),
 ) -> None:
     engine = create_database_engine(database_url)
     publishers = ("Gemini", "TechCrunch", "Hugging Face", "QbitAI")
@@ -311,7 +312,11 @@ def _persist_pending_stories(
             evidence_id = _id(f"database-evidence:{position}")
             exact_text = f"{publisher} exact persisted Evidence {position}."
             body = f"{exact_text} Additional private source text."
-            published_at = first_published_at + timedelta(hours=position)
+            published_at = (
+                datetime(2026, 8, 21, 0, tzinfo=UTC) + timedelta(minutes=position)
+                if position in future_story_positions
+                else first_published_at + timedelta(hours=position)
+            )
             discovered_at = (
                 first_published_at + timedelta(hours=story_count - 1)
                 if tie_newest_discovery and position >= story_count - 2
@@ -1353,6 +1358,65 @@ def test_repository_prepares_and_approves_only_the_newest_twelve_story_batch(
         assert repository.story("persisted-story:13").review_state is StoryReviewState.ACCEPTED
     finally:
         engine.dispose()
+
+
+def test_cli_backfill_plan_filters_editorial_window_before_bounding_batch(
+    editorial_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _persist_pending_stories(
+        editorial_database_url,
+        story_count=17,
+        future_story_positions=frozenset(range(12, 17)),
+    )
+    publication_date = date(2026, 8, 21)
+    outside_window_keys = tuple(f"persisted-story:{position}" for position in range(12, 17))
+
+    monkeypatch.setenv("AI_INTEL_DATABASE_URL", editorial_database_url)
+    monkeypatch.setattr(
+        cli_module,
+        "_create_editorial_plan_provider",
+        lambda _engine, _client: _RecordingExcludeUnsupportedEditorialProvider(),
+        raising=False,
+    )
+    runner = CliRunner()
+
+    prepared = runner.invoke(
+        app,
+        ["digest", "plan", "prepare", "--date", publication_date.isoformat()],
+    )
+
+    assert prepared.exit_code == 0, prepared.output
+    assert "invalid-selection" not in prepared.output
+    assert "persisted-story:11" in prepared.output
+    assert all(stable_key not in prepared.output for stable_key in outside_window_keys)
+    output_fields = {
+        name: line.removeprefix(f"{name}: ")
+        for line in prepared.output.splitlines()
+        for name in ("Digest Plan", "Content hash")
+        if line.startswith(f"{name}: ")
+    }
+
+    approved = runner.invoke(
+        app,
+        [
+            "digest",
+            "plan",
+            "approve",
+            output_fields["Digest Plan"],
+            "--content-hash",
+            output_fields["Content hash"],
+            "--actor",
+            "backfill-operator",
+        ],
+    )
+    assert approved.exit_code == 0, approved.output
+    assert "published with 11 Stories" in approved.output
+
+    pending = runner.invoke(app, ["story", "list", "--state", "unreviewed"])
+    assert pending.exit_code == 0, pending.output
+    assert all(stable_key in pending.output for stable_key in outside_window_keys)
+    assert "persisted-story:11" not in pending.output
 
 
 def test_repository_refuses_approval_when_a_new_discovery_changes_the_selected_batch(
