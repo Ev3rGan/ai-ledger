@@ -621,6 +621,7 @@ def test_research_page_stays_available_when_dynamic_examples_cannot_be_loaded(
     (
         "比较 OpenAI 和 Anthropic 的模型发布进展",
         "模型" * 250,
+        "2026–2025 模型发布",
     ),
 )
 def test_research_page_hides_examples_that_are_not_valid_simple_lookup_questions(

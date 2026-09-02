@@ -39,6 +39,7 @@ from ai_intel_agent.publication import (
 )
 from ai_intel_agent.research import (
     PersistentAnonymousResearchAllowance,
+    ResearchError,
     ResearchProvider,
     ResearchRepository,
     ResearchTaskType,
@@ -594,11 +595,13 @@ def _research_example_questions(digest: PublicDigest | None) -> tuple[str, ...]:
         ):
             continue
         question = f"关于「{story.headline}」，已发布知识支持什么事实？"
-        if (
-            len(question) > RESEARCH_QUESTION_MAX_CHARACTERS
-            or interpret_query_intent(question).task_type
-            is not ResearchTaskType.SIMPLE_LOOKUP
-        ):
+        if len(question) > RESEARCH_QUESTION_MAX_CHARACTERS:
+            continue
+        try:
+            intent = interpret_query_intent(question)
+        except ResearchError:
+            continue
+        if intent.task_type is not ResearchTaskType.SIMPLE_LOOKUP:
             continue
         if question not in questions:
             questions.append(question)
