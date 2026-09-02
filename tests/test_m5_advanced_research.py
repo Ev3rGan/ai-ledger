@@ -353,7 +353,7 @@ def test_comparison_evidence_set_preserves_dimensions_claim_qualifiers_and_roles
         research_module.LOGGER.removeHandler(caplog.handler)
         research_module.LOGGER.disabled = logger_was_disabled
     assert next(payload for event, payload in events if event == "error")["code"] == (
-        "provider-failed"
+        "provider-output-rejected"
     )
     assert (
         "Comparison support cited Evidence from another entity-dimension requirement"

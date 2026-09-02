@@ -459,8 +459,8 @@ def _sse_events(response_text: str) -> list[tuple[str, dict[str, object]]]:
 def test_research_protocol_reuses_the_human_approved_m1_route() -> None:
     protocol = load_research_protocol()
 
-    assert protocol.version == "research-protocol-2026-08-22.v3"
-    assert protocol.prompt_version == "research-prompt-2026-08-22.v3"
+    assert protocol.version == "research-protocol-2026-09-02.v4"
+    assert protocol.prompt_version == "research-prompt-2026-09-02.v4"
     assert protocol.output_schema_version == "research-output-2026-08-22.v2"
     assert protocol.sse_contract_version == "research-sse-2026-08-15.v1"
     assert protocol.route_identifier == "deepseek:v4-pro"
@@ -551,6 +551,12 @@ def test_deepseek_research_provider_uses_streaming_without_tools_or_reasoning() 
 def test_research_page_explains_curated_capabilities_and_offers_fill_only_examples(
     research_database_url: str,
 ) -> None:
+    _persist_research_story(
+        research_database_url,
+        identity="example",
+        review_state=StoryReviewState.ACCEPTED,
+        digest_state=DigestState.PUBLISHED,
+    )
     with TestClient(create_app(research_database_url)) as client:
         response = client.get("/research")
 
@@ -573,11 +579,9 @@ def test_research_page_explains_curated_capabilities_and_offers_fill_only_exampl
     assert "时间线" in response.text
     assert "有界多跳" in response.text
     assert "检索降级" in response.text
-    assert response.text.count('class="research-example"') >= 4
-    assert "Anthropic 的年化营收运行率是多少？" in response.text
-    assert "比较 OpenAI 和 Anthropic 在模型发布方面的进展" in response.text
-    assert "按时间线梳理 Gemini 模型的发布历程" in response.text
-    assert "模型发布后如何影响开发者部署" in response.text
+    assert response.text.count('class="research-example"') == 1
+    assert "关于「Gemini 3.6 Flash 正式发布 · example」，已发布知识支持什么事实？" in response.text
+    assert "Anthropic 的年化营收运行率是多少？" not in response.text
     assert 'type="button"' in response.text
     assert "question.value = button.dataset.question" in response.text
     assert "question.focus()" in response.text
@@ -698,6 +702,133 @@ def test_research_streams_answer_from_accepted_published_evidence_with_public_ci
     assert f'id="claim-{claim_id}"' in story.text
     assert f'id="evidence-{evidence_id}"' in story.text
     assert len(provider.calls) == 1
+
+
+@pytest.mark.postgres
+def test_public_simple_lookup_uses_a_compact_provider_contract_and_returns_citations(
+    research_database_url: str,
+) -> None:
+    story_id, claim_id, evidence_id = _persist_research_story(
+        research_database_url,
+        identity="deepseek-simple",
+        review_state=StoryReviewState.ACCEPTED,
+        digest_state=DigestState.PUBLISHED,
+    )
+    output = json.dumps(
+        {
+            "answer": "Google 已正式发布 Gemini 3.6 Flash。",
+            "citations": [
+                {
+                    "story_id": str(story_id),
+                    "claim_id": str(claim_id),
+                    "evidence_span_id": str(evidence_id),
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )
+
+    def streamed_response(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        system_prompt = payload["messages"][0]["content"]
+        assert "exactly answer and citations" in system_prompt
+        assert "A concise paraphrase of supported Evidence is allowed" in system_prompt
+        assert "Abstain only when no supplied item directly supports" in system_prompt
+        chunk = json.dumps(
+            {
+                "model": "deepseek-v4-pro",
+                "choices": [
+                    {"delta": {"content": output}, "finish_reason": "stop"}
+                ],
+            },
+            ensure_ascii=False,
+        )
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "text/event-stream"},
+            content=f"data: {chunk}\n\ndata: [DONE]\n\n".encode(),
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(streamed_response)) as http_client:
+        provider = DeepSeekResearchProvider(
+            http_client,
+            api_key="fixture-deepseek-key",
+            sleeper=lambda _: None,
+        )
+        with TestClient(
+            create_app(research_database_url, research_provider=provider)
+        ) as client:
+            response = client.post(
+                "/research/answer",
+                json={"question": "Gemini 3.6 Flash 有什么更新？"},
+            )
+
+    events = _sse_events(response.text)
+    assert "".join(
+        str(payload["text"])
+        for event, payload in events
+        if event == "answer.delta"
+    ) == "Google 已正式发布 Gemini 3.6 Flash。"
+    assert next(payload for event, payload in events if event == "citation")[
+        "evidence_span_id"
+    ] == str(evidence_id)
+    assert events[-1][1]["status"] == "answered"
+
+
+@pytest.mark.postgres
+def test_research_accepts_only_formatting_differences_between_answer_and_support(
+    research_database_url: str,
+) -> None:
+    story_id, claim_id, evidence_id = _persist_research_story(
+        research_database_url,
+        identity="support-formatting",
+        review_state=StoryReviewState.ACCEPTED,
+        digest_state=DigestState.PUBLISHED,
+    )
+    citation = {
+        "story_id": str(story_id),
+        "claim_id": str(claim_id),
+        "evidence_span_id": str(evidence_id),
+    }
+    provider = FakeResearchProvider(
+        {
+            "answer": "Google 已正式发布 Gemini 3.6 Flash。\n\n该版本已正式可用。",
+            "support": [
+                {
+                    "statement": "Google 已正式发布 Gemini 3.6 Flash。",
+                    "citations": [citation],
+                    "requirement_ids": ["requirement-1"],
+                    "dimension": None,
+                    "time_semantic": None,
+                },
+                {
+                    "statement": "该版本已正式可用。",
+                    "citations": [citation],
+                    "requirement_ids": ["requirement-1"],
+                    "dimension": None,
+                    "time_semantic": None,
+                },
+            ],
+        }
+    )
+
+    with TestClient(
+        create_app(research_database_url, research_provider=provider)
+    ) as client:
+        response = client.post(
+            "/research/answer",
+            json={"question": "Gemini 3.6 Flash 有什么更新？"},
+        )
+
+    events = _sse_events(response.text)
+    answer = "".join(
+        str(payload["text"])
+        for event, payload in events
+        if event == "answer.delta"
+    )
+    assert answer == "Google 已正式发布 Gemini 3.6 Flash。\n该版本已正式可用。"
+    assert events[-1][1]["status"] == "answered"
 
 
 @pytest.mark.postgres
@@ -836,7 +967,11 @@ def test_research_streams_explicit_refusal_when_provider_abstains_from_retrieved
         "refusal",
         "done",
     ]
-    assert events[2][1]["reason"] == "insufficient-evidence"
+    assert events[2][1] == {
+        "version": "research-sse-2026-08-15.v1",
+        "reason": "provider-abstained",
+        "message": "Provider 未能根据已检索证据生成受支持的答案。",
+    }
     assert events[-1][1]["status"] == "refused"
     assert len(provider.calls) == 1
 
@@ -937,7 +1072,7 @@ def test_research_fails_closed_for_invalid_or_out_of_set_provider_output(
         assert not {"answer.delta", "citation"} & {event for event, _ in events}
         assert next(payload for event, payload in events if event == "error")[
             "code"
-        ] == "provider-failed"
+        ] == "provider-output-rejected"
         assert events[-1][1]["status"] == "failed"
 
 

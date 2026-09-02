@@ -176,6 +176,10 @@ class ResearchError(ValueError):
     pass
 
 
+class ResearchProviderOutputRejected(ResearchError):
+    pass
+
+
 class ResearchBudgetExceeded(ResearchError):
     def __init__(self, limit: str) -> None:
         super().__init__(f"Research execution budget exceeded: {limit}")
@@ -291,6 +295,7 @@ class ResearchProtocol:
     maximum_provider_output_characters: int
     execution_budgets: dict[str, dict[str, int]]
     system_prompt: str
+    simple_lookup_system_prompt: str
     user_prompt_template: str
     output_contract: dict[str, object]
     sse_events: tuple[str, ...]
@@ -496,7 +501,14 @@ class DeepSeekResearchProvider:
         payload = {
             "model": self._candidate.model_id,
             "messages": [
-                {"role": "system", "content": protocol.system_prompt},
+                {
+                    "role": "system",
+                    "content": (
+                        protocol.simple_lookup_system_prompt
+                        if intent.task_type is ResearchTaskType.SIMPLE_LOOKUP
+                        else protocol.system_prompt
+                    ),
+                },
                 {
                     "role": "user",
                     "content": protocol.user_prompt_template.format(
@@ -1339,27 +1351,44 @@ def stream_research_events(
         )
         yield "done", {"version": version, "status": "failed"}
         return
+    except ResearchProviderOutputRejected as error:
+        LOGGER.warning("Research Provider output rejected: %s", error)
+        yield (
+            "error",
+            {
+                "version": version,
+                "code": "provider-output-rejected",
+                "message": "Research Provider 输出未通过验证。",
+            },
+        )
+        yield "done", {"version": version, "status": "failed"}
+        return
     except Exception as error:  # noqa: BLE001 - external failures must fail closed.
-        if isinstance(error, ResearchError):
-            LOGGER.warning("Research Provider rejected: %s", error)
-        else:
-            LOGGER.warning(
-                "Research Provider failed with unexpected error type: %s",
-                type(error).__name__,
-            )
+        LOGGER.warning(
+            "Research Provider failed with unexpected error type: %s",
+            type(error).__name__,
+        )
         yield (
             "error",
             {
                 "version": version,
                 "code": "provider-failed",
-                "message": "Research Provider 输出未通过验证。",
+                "message": "Research Provider 当前不可用。",
             },
         )
         yield "done", {"version": version, "status": "failed"}
         return
 
     if answer is None:
-        yield from _insufficient_evidence_events(version)
+        yield (
+            "refusal",
+            {
+                "version": version,
+                "reason": "provider-abstained",
+                "message": "Provider 未能根据已检索证据生成受支持的答案。",
+            },
+        )
+        yield "done", {"version": version, "status": "refused"}
         return
 
     if intent.task_type is not ResearchTaskType.SIMPLE_LOOKUP:
@@ -1447,6 +1476,7 @@ def load_research_protocol() -> ResearchProtocol:
         "maximum_provider_output_characters",
         "execution_budgets",
         "system_prompt",
+        "simple_lookup_system_prompt",
         "user_prompt_template",
         "output_contract",
         "sse_events",
@@ -1572,27 +1602,36 @@ def _validated_provider_answer(
         if deadline is not None and clock() >= deadline:
             raise ResearchBudgetExceeded("elapsed-time")
         if not isinstance(part, str):
-            raise ResearchError("Provider stream chunks must be text")
+            raise ResearchProviderOutputRejected("Provider stream chunks must be text")
         characters += len(part)
         if characters > intent.budget.maximum_provider_output_characters:
-            raise ResearchError("Provider output exceeded its bounded size")
+            raise ResearchProviderOutputRejected(
+                "Provider output exceeded its bounded size"
+            )
         parts.append(part)
     try:
         payload = json.loads("".join(parts))
     except (json.JSONDecodeError, TypeError) as error:
-        raise ResearchError("Provider output is not valid JSON") from error
+        raise ResearchProviderOutputRejected(
+            "Provider output is not valid JSON"
+        ) from error
     if not isinstance(payload, dict):
-        raise ResearchError("Provider output keys do not match the Research contract")
+        raise ResearchProviderOutputRejected(
+            "Provider output keys do not match the Research contract"
+        )
 
     keys = set(payload)
-    if keys == set(protocol.output_contract["v2_required_keys"]):
-        return _validated_v2_provider_answer(payload, evidence_set, intent, protocol)
-    if (
-        intent.task_type is ResearchTaskType.SIMPLE_LOOKUP
-        and keys == set(protocol.output_contract["legacy_simple_required_keys"])
-    ):
-        return _validated_legacy_simple_answer(payload, evidence_set, protocol)
-    raise ResearchError("Provider output keys do not match the Research contract")
+    try:
+        if keys == set(protocol.output_contract["v2_required_keys"]):
+            return _validated_v2_provider_answer(payload, evidence_set, intent, protocol)
+        if (
+            intent.task_type is ResearchTaskType.SIMPLE_LOOKUP
+            and keys == set(protocol.output_contract["legacy_simple_required_keys"])
+        ):
+            return _validated_legacy_simple_answer(payload, evidence_set, protocol)
+        raise ResearchError("Provider output keys do not match the Research contract")
+    except ResearchError as error:
+        raise ResearchProviderOutputRejected(str(error)) from error
 
 
 def _validated_legacy_simple_answer(
@@ -1732,7 +1771,8 @@ def _validated_v2_provider_answer(
                 seen_citations.add(citation.citation_key)
                 citations.append(citation)
 
-    if answer_text != "\n".join(statements):
+    canonical_answer = _normalized_supported_answer("\n".join(statements))
+    if _normalized_supported_answer(answer_text) != canonical_answer:
         raise ResearchError("Provider answer does not match its supported statements")
     if set(requirements) != covered_requirements:
         raise ResearchError("Provider answer omitted a required evidence step")
@@ -1744,10 +1784,14 @@ def _validated_v2_provider_answer(
     if _advanced_answer_lacks_required_story_coverage(intent, cited_stories):
         raise ResearchError("Advanced Research collapsed distinct Stories")
     return ResearchAnswer(
-        text=answer_text,
+        text=canonical_answer,
         citations=tuple(citations),
         statements=tuple(supported_statements),
     )
+
+
+def _normalized_supported_answer(value: str) -> str:
+    return "\n".join(line.strip() for line in value.splitlines() if line.strip())
 
 
 def _validated_answer_text(value: object) -> str:
