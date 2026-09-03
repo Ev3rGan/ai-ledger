@@ -10,6 +10,12 @@ from pathlib import Path, PurePosixPath
 from typing import Literal
 from uuid import UUID
 
+from ai_intel_agent.accepted_knowledge import (
+    AcceptedKnowledgeHit,
+    AcceptedKnowledgeResult,
+    RetrievalQuery,
+    RetrievalTrace,
+)
 from ai_intel_agent.domain import EvidenceRelation, EvidenceRole
 from ai_intel_agent.model_routing_evaluation import (
     ModelCandidate,
@@ -17,10 +23,10 @@ from ai_intel_agent.model_routing_evaluation import (
     load_protocol_configuration,
 )
 from ai_intel_agent.research import (
-    QueryIntent,
     ResearchEvidence,
-    ResearchEvidenceSet,
+    ResearchEvidenceMetadata,
     ResearchProvider,
+    ResearchRepository,
     load_research_protocol,
     stream_research_events,
 )
@@ -52,6 +58,7 @@ class ResearchProviderQualificationCase:
     identifier: str
     question: str
     evidence: tuple[ResearchEvidence, ...]
+    retrieval_query: str
     expected_status: Literal["answered", "refused"]
     required_answer_terms: tuple[str, ...]
     repetitions: int
@@ -185,18 +192,64 @@ def qualified_source_sha256(
     return digest.hexdigest()
 
 
-class _QualificationRepository:
+class _QualificationRetrieval:
     def __init__(self, case: ResearchProviderQualificationCase) -> None:
         self._case = case
+        self.last_query: RetrievalQuery | None = None
 
-    def retrieve_intent(self, intent: QueryIntent, **_: object) -> ResearchEvidenceSet:
-        return ResearchEvidenceSet(
-            question=self._case.question,
-            evidence=self._case.evidence,
-            intent=intent,
-            retrieval_calls=1,
-            iterations=1,
+    def retrieve(self, query: RetrievalQuery) -> AcceptedKnowledgeResult:
+        self.last_query = query
+        hits = tuple(
+            AcceptedKnowledgeHit(
+                story_id=evidence.story_id,
+                story_stable_key=evidence.story_stable_key,
+                story_headline=evidence.story_headline,
+                claim_id=evidence.claim_id,
+                claim_text=evidence.claim_text,
+                evidence_span_id=evidence.evidence_span_id,
+                exact_text=evidence.exact_text,
+                chunk_id=None,
+            )
+            for evidence in self._case.evidence
         )
+        return AcceptedKnowledgeResult(
+            query=query,
+            hits=hits,
+            matching_story_ids=tuple(dict.fromkeys(hit.story_id for hit in hits)),
+            trace=RetrievalTrace(
+                lexical=(),
+                semantic=(),
+                entity=(),
+                fusion=(),
+                final=(),
+                faults=(),
+            ),
+        )
+
+
+class _QualificationMetadataLoader:
+    def __init__(self, case: ResearchProviderQualificationCase) -> None:
+        self._metadata = {
+            evidence.evidence_span_id: ResearchEvidenceMetadata(
+                evidence_role=evidence.evidence_role,
+                evidence_relation=evidence.evidence_relation,
+                evidence_publisher=evidence.evidence_publisher,
+                times=evidence.times,
+            )
+            for evidence in case.evidence
+        }
+
+    def load(
+        self,
+        evidence_span_ids: tuple[UUID, ...],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict[UUID, ResearchEvidenceMetadata]:
+        del timeout_seconds
+        return {
+            evidence_span_id: self._metadata[evidence_span_id]
+            for evidence_span_id in evidence_span_ids
+        }
 
 
 def load_research_provider_qualification_corpus() -> ResearchProviderQualificationCorpus:
@@ -215,6 +268,7 @@ def load_research_provider_qualification_corpus() -> ResearchProviderQualificati
                 identifier=item["identifier"],
                 question=item["question"],
                 evidence=evidence_sets[item["evidence_set"]],
+                retrieval_query=item["retrieval_query"],
                 expected_status=item["expected_status"],
                 required_answer_terms=tuple(item["required_answer_terms"]),
                 repetitions=int(item["repetitions"]),
@@ -327,10 +381,14 @@ def _run_case(
     repetition: int,
     candidate: ModelCandidate,
 ) -> ResearchProviderQualificationResult:
+    retrieval = _QualificationRetrieval(case)
     events = list(
         stream_research_events(
             case.question,
-            repository=_QualificationRepository(case),
+            repository=ResearchRepository(
+                retrieval=retrieval,
+                metadata_loader=_QualificationMetadataLoader(case),
+            ),
             provider=provider,
         )
     )
@@ -363,7 +421,9 @@ def _run_case(
     )
     returned_model = getattr(provider, "last_returned_model_id", None)
     failure_code: str | None = None
-    if error_code is not None:
+    if retrieval.last_query is None or retrieval.last_query.text != case.retrieval_query:
+        failure_code = "retrieval-query-mismatch"
+    elif error_code is not None:
         failure_code = error_code
     elif observed_status != case.expected_status:
         failure_code = (
@@ -379,7 +439,7 @@ def _run_case(
         failure_code = "required-fact-missing"
     elif case.expected_status == "refused" and (answer or citations):
         failure_code = "unexpected-supported-output"
-    elif returned_model != candidate.model_id:
+    elif case.expected_status == "answered" and returned_model != candidate.model_id:
         failure_code = "returned-model-unverified"
 
     return ResearchProviderQualificationResult(
@@ -391,7 +451,9 @@ def _run_case(
         failure_code=failure_code,
         citation_count=len(citations),
         validated_returned_model_id=(
-            returned_model if isinstance(returned_model, str) else None
+            returned_model
+            if case.expected_status == "answered" and isinstance(returned_model, str)
+            else None
         ),
     )
 
@@ -428,6 +490,7 @@ def _validate_corpus(corpus: ResearchProviderQualificationCorpus) -> None:
             not case.identifier.strip()
             or case.identifier in identifiers
             or not case.question.strip()
+            or not case.retrieval_query.strip()
             or not case.evidence
             or case.expected_status not in {"answered", "refused"}
             or case.repetitions < 1

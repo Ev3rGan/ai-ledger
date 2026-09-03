@@ -38,6 +38,7 @@ from ai_intel_agent.publication import (
     PublicStory,
 )
 from ai_intel_agent.research import (
+    RESEARCH_QUESTION_MAX_CHARACTERS,
     PersistentAnonymousResearchAllowance,
     ResearchError,
     ResearchProvider,
@@ -48,7 +49,6 @@ from ai_intel_agent.research import (
 )
 
 LOGGER = logging.getLogger(__name__)
-RESEARCH_QUESTION_MAX_CHARACTERS = 500
 
 EVIDENCE_STATE_LABELS: dict[EvidenceState, str] = {
     EvidenceState.SINGLE_SOURCE: "单一来源",

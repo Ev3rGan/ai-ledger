@@ -172,6 +172,45 @@ class RecordingReranker:
         )
 
 
+class TargetHeadlineReranker(RecordingReranker):
+    def rerank(
+        self,
+        query: str,
+        documents: Sequence[str],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> tuple[float, ...]:
+        del timeout_seconds
+        copied = tuple(documents)
+        self.calls.append((query, copied))
+        return tuple(
+            100.0 if "WebGPU 内核库" in text else float(index)
+            for index, text in enumerate(copied)
+        )
+
+
+class SemanticDistractorEmbeddingBackend:
+    def embed_documents(self, texts: Sequence[str]) -> tuple[tuple[float, ...], ...]:
+        return tuple(
+            self._vector(1 if "WebGPU kernel library" in text else 0)
+            for text in texts
+        )
+
+    def embed_query(
+        self,
+        text: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> tuple[float, ...]:
+        del text
+        del timeout_seconds
+        return self._vector(0)
+
+    @staticmethod
+    def _vector(coordinate: int) -> tuple[float, ...]:
+        return tuple(1.0 if index == coordinate else 0.0 for index in range(384))
+
+
 class UnavailableEmbeddingBackend:
     def embed_documents(self, texts: Sequence[str]) -> tuple[tuple[float, ...], ...]:
         raise RuntimeError("forced embedding outage")
@@ -1502,6 +1541,83 @@ def test_hybrid_retrieval_recovers_an_fts_miss_and_records_every_ranking_stage(
         target_evidence_id,
     )
     assert all(hit.chunk_id != hit.evidence_span_id for hit in result.hits)
+
+
+@pytest.mark.postgres
+def test_hybrid_rerank_pool_keeps_the_strongest_lexical_candidate(
+    m4_database_url: str,
+) -> None:
+    for index in range(12):
+        _persist_knowledge_story(
+            m4_database_url,
+            identity=f"semantic-pool-distractor-{index}",
+            body=f"Semantic distractor {index} about unrelated storage infrastructure.",
+        )
+    _, _, _, target_evidence_id = _persist_knowledge_story(
+        m4_database_url,
+        identity="lexical-pool-target",
+        body="Hugging Face released the WebGPU kernel library.",
+        headline="Hugging Face 发布 WebGPU 内核库",
+    )
+    embedding = SemanticDistractorEmbeddingBackend()
+    reranker = TargetHeadlineReranker()
+    engine = create_database_engine(m4_database_url)
+    try:
+        AcceptedKnowledgeIndexer(engine, embedding=embedding).rebuild()
+        result = AcceptedKnowledgeRetrieval(
+            engine,
+            embedding=embedding,
+            reranker=reranker,
+        ).retrieve(RetrievalQuery(text="Hugging Face 发布 WebGPU 内核库"))
+    finally:
+        engine.dispose()
+
+    assert target_evidence_id in {
+        candidate.evidence_span_id for candidate in result.trace.lexical
+    }
+    assert target_evidence_id not in {
+        candidate.evidence_span_id for candidate in result.trace.semantic
+    }
+    assert any("WebGPU 内核库" in document for document in reranker.calls[0][1])
+    assert result.hits[0].evidence_span_id == target_evidence_id
+
+
+@pytest.mark.postgres
+def test_stale_active_generation_disables_semantic_candidates_until_incremental_indexing(
+    m4_database_url: str,
+) -> None:
+    for index in range(12):
+        _persist_knowledge_story(
+            m4_database_url,
+            identity=f"stale-index-distractor-{index}",
+            body=f"Semantic distractor {index} about unrelated storage infrastructure.",
+        )
+    embedding = SemanticDistractorEmbeddingBackend()
+    engine = create_database_engine(m4_database_url)
+    try:
+        AcceptedKnowledgeIndexer(engine, embedding=embedding).rebuild()
+        _, _, _, target_evidence_id = _persist_knowledge_story(
+            m4_database_url,
+            identity="stale-index-target",
+            body="Hugging Face released the WebGPU kernel library.",
+            headline="Hugging Face 发布 WebGPU 内核库",
+        )
+        snapshot = retrieval_health_snapshot(engine)
+        result = AcceptedKnowledgeRetrieval(
+            engine,
+            embedding=embedding,
+            reranker=TargetHeadlineReranker(),
+        ).retrieve(RetrievalQuery(text="WebGPU"))
+    finally:
+        engine.dispose()
+
+    assert snapshot.documents_pending_index == 1
+    assert snapshot.hybrid_ready is False
+    assert result.trace.semantic == ()
+    assert result.hits[0].evidence_span_id == target_evidence_id
+    assert ("index", "index-stale") in {
+        (fault.stage, fault.code) for fault in result.trace.faults
+    }
 
 
 @pytest.mark.postgres

@@ -224,8 +224,10 @@ class FailingResearchProvider:
 class StaticAcceptedKnowledge:
     def __init__(self, hit: AcceptedKnowledgeHit) -> None:
         self.hit = hit
+        self.queries: list[RetrievalQuery] = []
 
     def retrieve(self, query: RetrievalQuery) -> AcceptedKnowledgeResult:
+        self.queries.append(query)
         return AcceptedKnowledgeResult(
             query=query,
             hits=(self.hit,),
@@ -239,6 +241,40 @@ class StaticAcceptedKnowledge:
                 faults=(),
             ),
         )
+
+
+@pytest.mark.parametrize(
+    ("question", "expected_query"),
+    (
+        (
+            (
+                "关于「Hugging Face 发布 WebGPU 内核库与 Fleet 浏览器基准测试工具」，"
+                "已发布知识支持什么事实？"
+            ),
+            "Hugging Face 发布 WebGPU 内核库与 Fleet 浏览器基准测试工具",
+        ),
+        ("谁发布了 WebGPU 内核库？", "WebGPU"),
+    ),
+)
+def test_simple_lookup_retrieves_by_the_specific_subject_instead_of_question_scaffolding(
+    question: str,
+    expected_query: str,
+) -> None:
+    hit = AcceptedKnowledgeHit(
+        story_id=_id("specific-subject:story"),
+        story_stable_key="hugging-face-webgpu",
+        story_headline="Hugging Face 发布 WebGPU 内核库",
+        claim_id=_id("specific-subject:claim"),
+        claim_text="Hugging Face 发布了 WebGPU 内核库。",
+        evidence_span_id=_id("specific-subject:evidence"),
+        exact_text="Hugging Face released a WebGPU kernel library.",
+        chunk_id=None,
+    )
+    retrieval = StaticAcceptedKnowledge(hit)
+
+    ResearchRepository(retrieval=retrieval).retrieve(question)
+
+    assert [query.text for query in retrieval.queries] == [expected_query]
 
 
 class RecordingResearchAllowance:

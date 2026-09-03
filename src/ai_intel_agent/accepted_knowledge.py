@@ -309,6 +309,7 @@ class RetrievalHealthSnapshot:
     embeddings_indexed: int
     index_fault_code: str | None
     stages: tuple[RetrievalRuntimeStageStatus, ...]
+    documents_pending_index: int = 0
 
     @property
     def hybrid_ready(self) -> bool:
@@ -323,6 +324,7 @@ class RetrievalHealthSnapshot:
             and self.chunks_indexed > 0
             and self.embeddings_indexed == self.chunks_indexed
             and self.index_fault_code is None
+            and self.documents_pending_index == 0
             and index is not None
             and index.index_id == self.active_index_id
             and index.state == "ready"
@@ -1064,6 +1066,18 @@ class AcceptedKnowledgeRetrieval:
                 and active_index.profile_sha256 == _profile_sha256(self._profile)
                 else None
             )
+            documents_pending_index = (
+                self._scalar_with_deadline(
+                    session,
+                    _documents_pending_index_statement(active_index_id),
+                    deadline,
+                )
+                if active_index_id is not None
+                else 0
+            )
+            index_projection_current = documents_pending_index == 0
+            if active_index_id is not None and not index_projection_current:
+                faults.append(RetrievalFault("index", "index-stale"))
             if active_index is not None and active_index_id is None:
                 faults.append(RetrievalFault("index", "profile-incompatible"))
             lexical = self._lexical_candidates(
@@ -1082,6 +1096,7 @@ class AcceptedKnowledgeRetrieval:
             semantic: tuple[_RetrievalCandidate, ...] = ()
             semantic_index_ready = (
                 active_index_id is not None
+                and index_projection_current
                 and active_index is not None
                 and active_index.fault_code is None
                 and active_index.chunks_indexed > 0
@@ -1117,7 +1132,9 @@ class AcceptedKnowledgeRetrieval:
                     )
             elif query.text.strip():
                 fault_code = (
-                    "embedding-index-incomplete"
+                    "embedding-index-stale"
+                    if active_index_id is not None and not index_projection_current
+                    else "embedding-index-incomplete"
                     if active_index_id is not None
                     and active_index is not None
                     and active_index.embeddings_indexed > 0
@@ -1129,7 +1146,9 @@ class AcceptedKnowledgeRetrieval:
                     "unavailable",
                     fault_code,
                     (
-                        "The active generation does not contain complete semantic vectors"
+                        "The active generation does not cover all accepted published documents"
+                        if fault_code == "embedding-index-stale"
+                        else "The active generation does not contain complete semantic vectors"
                         if fault_code == "embedding-index-incomplete"
                         else "The approved Embedding runtime is unavailable"
                     ),
@@ -1142,7 +1161,9 @@ class AcceptedKnowledgeRetrieval:
                     query.filters,
                     deadline,
                 )
-                if active_index_id is not None and query.text.strip()
+                if active_index_id is not None
+                and index_projection_current
+                and query.text.strip()
                 else ()
             )
             if not query.text.strip():
@@ -1161,7 +1182,9 @@ class AcceptedKnowledgeRetrieval:
         fused = _fuse_candidates(rankings, self._profile)
         catalog_request = not query.text.strip()
         rerank_candidates = (
-            fused if catalog_request else fused[: self._profile.retrieval.rerank_depth]
+            fused
+            if catalog_request
+            else _rerank_candidate_pool(fused, rankings, self._profile)
         )
         final = (
             rerank_candidates
@@ -1802,6 +1825,11 @@ def retrieval_health_snapshot(engine: Engine) -> RetrievalHealthSnapshot:
                 select(RetrievalRuntimeStateRecord).order_by(RetrievalRuntimeStateRecord.stage)
             )
         )
+        documents_pending_index = (
+            session.scalar(_documents_pending_index_statement(active.id))
+            if active is not None
+            else 0
+        )
     return RetrievalHealthSnapshot(
         active_index_id=active.id if active is not None else None,
         profile_id=active.profile_id if active is not None else None,
@@ -1811,6 +1839,7 @@ def retrieval_health_snapshot(engine: Engine) -> RetrievalHealthSnapshot:
         embeddings_indexed=active.embeddings_indexed if active is not None else 0,
         index_fault_code=active.fault_code if active is not None else None,
         stages=states,
+        documents_pending_index=documents_pending_index or 0,
     )
 
 
@@ -1923,6 +1952,30 @@ def _matching_story_ids(
     )
     seen = set(ranked)
     return ranked + tuple(story_id for story_id in lexical_story_ids if story_id not in seen)
+
+
+def _documents_pending_index_statement(index_id: UUID) -> Any:
+    indexed_document = (
+        select(RetrievalChunkRecord.id)
+        .where(
+            RetrievalChunkRecord.index_id == index_id,
+            RetrievalChunkRecord.document_version_id == DocumentVersionRecord.id,
+        )
+        .exists()
+    )
+    pending_documents = (
+        select(DocumentVersionRecord.id)
+        .join(
+            EvidenceSpanRecord,
+            EvidenceSpanRecord.document_version_id == DocumentVersionRecord.id,
+        )
+        .join(ClaimRecord, ClaimRecord.id == EvidenceSpanRecord.claim_id)
+        .join(StoryRecord, StoryRecord.id == ClaimRecord.story_id)
+        .where(*_accepted_evidence_conditions(), ~indexed_document)
+        .distinct()
+        .subquery()
+    )
+    return select(func.count()).select_from(pending_documents)
 
 
 def _accepted_evidence_conditions() -> tuple[Any, ...]:
@@ -2111,6 +2164,38 @@ def _fuse_candidates(
             ),
         )
     )
+
+
+def _rerank_candidate_pool(
+    fused: tuple[_RetrievalCandidate, ...],
+    rankings: Mapping[str, tuple[_RetrievalCandidate, ...]],
+    profile: AcceptedKnowledgeProfile,
+) -> tuple[_RetrievalCandidate, ...]:
+    selected = list(fused[: profile.retrieval.rerank_depth])
+    protected_ids: set[UUID] = set()
+    for channel in profile.fallback_channels:
+        channel_candidates = rankings[channel]
+        if not channel_candidates:
+            continue
+        candidate = channel_candidates[0]
+        candidate_id = candidate.evidence_span_id
+        protected_ids.add(candidate_id)
+        if any(item.evidence_span_id == candidate_id for item in selected):
+            continue
+        if len(selected) < profile.retrieval.rerank_depth:
+            selected.append(candidate)
+            continue
+        replacement = next(
+            (
+                index
+                for index in range(len(selected) - 1, -1, -1)
+                if selected[index].evidence_span_id not in protected_ids
+            ),
+            None,
+        )
+        if replacement is not None:
+            selected[replacement] = candidate
+    return tuple(selected)
 
 
 def _stage_candidates(

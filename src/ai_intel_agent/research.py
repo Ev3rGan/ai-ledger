@@ -75,6 +75,7 @@ FORBIDDEN_REASONING = re.compile(
     flags=re.IGNORECASE,
 )
 ANSWER_DELTA_CHARACTERS = 12
+RESEARCH_QUESTION_MAX_CHARACTERS = 500
 APPROVED_RESEARCH_ROUTE = "deepseek:v4-pro"
 ACCEPTED_PUBLISHED_SCOPE = "accepted-published-knowledge"
 YEAR_RANGE = re.compile(
@@ -155,6 +156,7 @@ ENTITY_STOPWORDS = frozenset(
         "Where",
         "Why",
         "Which",
+        "Who",
         "Can",
     }
 )
@@ -177,6 +179,10 @@ class ResearchError(ValueError):
 
 
 class ResearchProviderOutputRejected(ResearchError):
+    pass
+
+
+class ResearchProviderBudgetExhausted(ResearchError):
     pass
 
 
@@ -563,7 +569,9 @@ class DeepSeekResearchProvider:
                 raise ResearchBudgetExceeded("elapsed-time")
             attempts += 1
             if self._budget is not None and not self._budget.reserve():
-                raise ResearchError("Aggregate monthly Provider budget is exhausted")
+                raise ResearchProviderBudgetExhausted(
+                    "Aggregate monthly Provider budget is exhausted"
+                )
             try:
                 with self._client.stream(
                     "POST",
@@ -1397,6 +1405,17 @@ def stream_research_events(
                 "version": version,
                 "code": "provider-output-rejected",
                 "message": "Research Provider 输出未通过验证。",
+            },
+        )
+        yield "done", {"version": version, "status": "failed"}
+        return
+    except ResearchProviderBudgetExhausted:
+        yield (
+            "error",
+            {
+                "version": version,
+                "code": "provider-budget-exhausted",
+                "message": "Research Provider 月度预算已用尽。",
             },
         )
         yield "done", {"version": version, "status": "failed"}
@@ -2239,6 +2258,20 @@ def _retrieval_requirement_specs(
                 )
             )
         return ()
+    if intent.task_type is ResearchTaskType.SIMPLE_LOOKUP:
+        quoted_subject = QUOTED_ENTITY.search(intent.question)
+        if quoted_subject is not None:
+            query = quoted_subject.group(1).strip()
+        elif intent.entities:
+            query = " ".join(intent.entities)
+        else:
+            query = intent.question
+        return (
+            _RetrievalRequirementSpec(
+                label=intent.task_type.value,
+                query=query,
+            ),
+        )
     return (
         _RetrievalRequirementSpec(
             label=intent.task_type.value,

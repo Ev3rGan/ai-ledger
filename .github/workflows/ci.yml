@@ -94,11 +94,13 @@ jobs:
           $changed = @(git diff --name-only $env:BASE_SHA $env:HEAD_SHA -- `
             pyproject.toml `
             uv.lock `
+            src/ai_intel_agent/accepted_knowledge.py `
             src/ai_intel_agent/cli.py `
             src/ai_intel_agent/domain.py `
             src/ai_intel_agent/model_routing_evaluation.py `
             src/ai_intel_agent/research.py `
             src/ai_intel_agent/research_provider_qualification.py `
+            src/ai_intel_agent/web.py `
             src/ai_intel_agent/data/model_routing_candidates.v1.json `
             src/ai_intel_agent/data/model_routing_evaluation.v1.json `
             src/ai_intel_agent/data/model_routing_protocol.v1.json `

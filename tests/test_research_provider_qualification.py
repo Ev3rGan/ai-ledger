@@ -114,7 +114,7 @@ def test_mocked_provider_can_never_produce_release_qualification() -> None:
     )
     payload = qualification.as_dict()
 
-    assert provider.calls == 7
+    assert provider.calls == 6
     assert qualification.status == "non-qualifying"
     assert qualification.qualified_source_sha256 == "2" * 64
     assert all(result.passed for result in qualification.results)
