@@ -290,11 +290,30 @@ manual collection refuse a requested limit above that recorded value.
 Web container and therefore reads and writes the same PostgreSQL state that public Web and
 Research use. It does not add an operator HTTP route.
 
+For a single production Research diagnostic, run:
+
+```bash
+bash deploy/m1/operate.sh operator operator research answer --production \
+  'Who published the WebGPU kernel library?'
+```
+
+This command uses the current release's production PostgreSQL accepted knowledge, Retrieval
+backends, Research execution, DeepSeek route, output validation, and aggregate monthly Provider
+budget. It deliberately omits only the per-client anonymous daily allowance, so it neither consumes
+nor resets a visitor's allowance. Every Provider attempt still reserves the configured conservative
+cost in the shared PostgreSQL ledger and stops before HTTP when that budget is exhausted. The
+command accepts exactly one question, has the same 500-character input limit as public Research,
+and returns only the validated answer, public citation data, or the structured refusal/error. It has
+no batch, budget-bypass, API-key, anonymous-client, or raw-Provider-output option. A completed
+answer or structured refusal exits successfully; an execution result with `status: failed`
+prints its structured error and exits non-zero.
+
 Start each operation by saving the secret-free status JSON:
 
 ```bash
 bash deploy/m1/operate.sh operator operator status --production
 bash deploy/m1/operate.sh operator operator source-status --production
+bash deploy/m1/operate.sh operator operator retrieval status --production
 bash deploy/m1/operate.sh operator story list --state unreviewed
 ```
 
@@ -326,9 +345,15 @@ bash deploy/m1/operate.sh operator digest publish --date <Asia-Shanghai-date> \
   --introduction '<reviewed daily introduction>' \
   --story <first-key> --story <second-key> --story <...> \
   --actor m4-operator
+bash deploy/m1/operate.sh operator operator retrieval index --production
+bash deploy/m1/operate.sh operator operator retrieval status --production --require-hybrid
 ```
 
-After publication, rerun status and inspect the public HTTPS Home, linked Digest, every selected
+Research detects accepted published Documents that are newer than the active retrieval generation,
+reports `documents_pending_index`, and disables stale semantic/entity candidates while retaining the
+current PostgreSQL lexical projection. The incremental index command restores full Hybrid behavior
+without replacing the active profile. After publication and indexing, rerun status and inspect the
+public HTTPS Home, linked Digest, every selected
 Story's expandable Evidence and canonical source, Browse, RSS, and Research. The database and
 public projection, not CLI prose copied into an acceptance report, are the source of truth.
 

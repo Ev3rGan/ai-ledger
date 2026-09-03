@@ -5,6 +5,7 @@ import re
 import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -86,7 +87,14 @@ from ai_intel_agent.persistence import (
     upgrade_database,
 )
 from ai_intel_agent.pipeline import publish_sample_digest
-from ai_intel_agent.research import DeepSeekResearchProvider, ResearchError
+from ai_intel_agent.research import (
+    RESEARCH_QUESTION_MAX_CHARACTERS,
+    DeepSeekResearchProvider,
+    ResearchError,
+    ResearchProvider,
+    ResearchRepository,
+    stream_research_events,
+)
 from ai_intel_agent.research_provider_qualification import (
     QualificationAttemptBudget,
     ResearchProviderQualificationError,
@@ -142,12 +150,14 @@ digest_plan_app = typer.Typer(help="Prepare, inspect, and approve immutable Dige
 runtime_benchmark_app = typer.Typer(help="Capture and compare fixed Hong Kong runtime probes.")
 operator_app = typer.Typer(help="Private production operator commands.")
 operator_retrieval_app = typer.Typer(help="Manage accepted-knowledge Retrieval indexes.")
+operator_research_app = typer.Typer(help="Run private production Research diagnostics.")
 app.add_typer(story_app, name="story")
 app.add_typer(digest_app, name="digest")
 digest_app.add_typer(digest_plan_app, name="plan")
 app.add_typer(runtime_benchmark_app, name="benchmark-runtime")
 app.add_typer(operator_app, name="operator")
 operator_app.add_typer(operator_retrieval_app, name="retrieval")
+operator_app.add_typer(operator_research_app, name="research")
 console = Console()
 DEFAULT_OUTPUT = Path("reports/daily.md")
 DEFAULT_SOURCE_AUDIT_OUTPUT = Path("reports/source-activation-audit.md")
@@ -197,6 +207,44 @@ def _retrieval_backends_from_environment() -> ApprovedRetrievalBackends:
             ),
         )
     return load_approved_fastembed_backends(configuration)
+
+
+@dataclass(frozen=True)
+class _ProductionResearchRuntime:
+    engine: Engine
+    retrieval: AcceptedKnowledgeRetrieval
+    provider: ResearchProvider
+
+
+@contextmanager
+def _production_research_runtime(
+    configuration: M1WebConfiguration,
+    *,
+    backends: ApprovedRetrievalBackends | None = None,
+) -> Iterator[_ProductionResearchRuntime]:
+    active_backends = (
+        backends if backends is not None else _retrieval_backends_from_environment()
+    )
+    engine = create_database_engine(configuration.database.database_url)
+    try:
+        provider_budget = _persistent_provider_budget(engine, configuration.provider)
+        retrieval = AcceptedKnowledgeRetrieval(
+            engine,
+            embedding=active_backends.embedding,
+            reranker=active_backends.reranker,
+        )
+        with httpx.Client(timeout=60.0) as client:
+            yield _ProductionResearchRuntime(
+                engine=engine,
+                retrieval=retrieval,
+                provider=DeepSeekResearchProvider(
+                    client,
+                    api_key=configuration.provider.api_key,
+                    budget=provider_budget,
+                ),
+            )
+    finally:
+        engine.dispose()
 
 
 def _parse_retrieval_time_boundary(value: str | None, *, label: str) -> datetime | None:
@@ -407,6 +455,7 @@ def operator_retrieval_status(
             "profile_id": snapshot.profile_id,
             "profile_sha256": snapshot.profile_sha256,
             "documents_indexed": snapshot.documents_indexed,
+            "documents_pending_index": snapshot.documents_pending_index,
             "chunks_indexed": snapshot.chunks_indexed,
             "embeddings_indexed": snapshot.embeddings_indexed,
             "index_fault_code": snapshot.index_fault_code,
@@ -619,6 +668,64 @@ def operator_status(
     )
 
 
+@operator_research_app.command("answer")
+def operator_research_answer(
+    question: Annotated[str, typer.Argument(help="One accepted-knowledge Research question.")],
+    production: Annotated[
+        bool,
+        typer.Option("--production", help="Load the M1 Docker-secret contract."),
+    ] = False,
+) -> None:
+    """Run one Research question without consuming anonymous daily allowance."""
+    if not production:
+        raise typer.BadParameter("Private operator Research requires --production")
+    if len(question) > RESEARCH_QUESTION_MAX_CHARACTERS:
+        raise typer.BadParameter(
+            "Research question must not exceed "
+            f"{RESEARCH_QUESTION_MAX_CHARACTERS} characters"
+        )
+    try:
+        configuration = M1WebConfiguration.from_environment(os.environ)
+        with _production_research_runtime(configuration) as runtime:
+            repository = ResearchRepository(
+                runtime.engine,
+                retrieval=runtime.retrieval,
+            )
+            events = tuple(
+                stream_research_events(
+                    question,
+                    repository=repository,
+                    provider=runtime.provider,
+                )
+            )
+    except (OSError, ResearchError, ValueError) as error:
+        raise typer.BadParameter(str(error)) from error
+
+    answer = "".join(
+        str(data["text"])
+        for event, data in events
+        if event == "answer.delta"
+    )
+    citations = [data for event, data in events if event == "citation"]
+    refusal = next((data for event, data in events if event == "refusal"), None)
+    error = next((data for event, data in events if event == "error"), None)
+    done = next(data for event, data in reversed(events) if event == "done")
+    status = done["status"]
+    console.print_json(
+        data={
+            "release": os.environ.get("AI_INTEL_RELEASE"),
+            "access": "operator",
+            "status": status,
+            "answer": answer or None,
+            "citations": citations,
+            "refusal": refusal,
+            "error": error,
+        }
+    )
+    if status == "failed":
+        raise typer.Exit(code=1)
+
+
 @operator_app.command("source-status")
 def operator_source_status(
     production: Annotated[
@@ -743,50 +850,35 @@ def serve(
         )
         return
 
-    budget_engine = create_database_engine(database_url) if production else None
-    provider_budget = (
-        _persistent_provider_budget(budget_engine, service_configuration.provider)
-        if budget_engine is not None and service_configuration is not None
-        else None
-    )
+    if production and service_configuration is not None:
+        with _production_research_runtime(
+            service_configuration,
+            backends=retrieval_backends,
+        ) as runtime:
+            web_app = create_app(
+                database_url,
+                research_provider=runtime.provider,
+                anonymous_research_daily_limit=(
+                    service_configuration.anonymous_research_daily_limit
+                ),
+                anonymous_identity_salt=service_configuration.anonymous_identity_salt,
+                accepted_knowledge_retrieval=runtime.retrieval,
+            )
+            uvicorn.run(web_app, host=host, port=port, log_config=None)
+        return
+
     with httpx.Client(timeout=60.0) as client:
         try:
-            if provider_budget is None:
-                research_provider = DeepSeekResearchProvider(client, api_key=api_key)
-            else:
-                research_provider = DeepSeekResearchProvider(
-                    client,
-                    api_key=api_key,
-                    budget=provider_budget,
-                )
+            research_provider = DeepSeekResearchProvider(client, api_key=api_key)
         except ResearchError as error:
-            if budget_engine is not None:
-                budget_engine.dispose()
             raise typer.BadParameter(str(error)) from error
         web_app = create_app(
             database_url,
             research_provider=research_provider,
-            anonymous_research_daily_limit=(
-                service_configuration.anonymous_research_daily_limit
-                if service_configuration is not None
-                else None
-            ),
-            anonymous_identity_salt=(
-                service_configuration.anonymous_identity_salt
-                if service_configuration is not None
-                else None
-            ),
             retrieval_embedding=retrieval_backends.embedding,
             retrieval_reranker=retrieval_backends.reranker,
         )
-        try:
-            if production:
-                uvicorn.run(web_app, host=host, port=port, log_config=None)
-            else:
-                uvicorn.run(web_app, host=host, port=port)
-        finally:
-            if budget_engine is not None:
-                budget_engine.dispose()
+        uvicorn.run(web_app, host=host, port=port)
 
 
 @app.command("schedule-gemini")

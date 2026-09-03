@@ -433,6 +433,188 @@ def test_private_operator_status_reports_complete_operational_snapshot(
     assert "database_url" not in result.output
 
 
+def test_private_operator_research_returns_a_production_grounded_answer(
+    m1_database_url: str,
+    production_environment: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publish_sample_digest(m1_database_url)
+    provider = EvidenceEchoProvider()
+    release = "a" * 40
+    monkeypatch.setattr(
+        cli_module,
+        "DeepSeekResearchProvider",
+        lambda *_args, **_kwargs: provider,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "operator",
+            "research",
+            "answer",
+            "示例发布者的 AI Agent 会记录任务轨迹",
+            "--production",
+        ],
+        env={**production_environment, "AI_INTEL_RELEASE": release},
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["release"] == release
+    assert payload["access"] == "operator"
+    assert payload["status"] == "answered"
+    assert payload["answer"] == "AI Agent 会记录任务轨迹。"
+    assert len(payload["citations"]) == 1
+    assert payload["citations"][0]["story_url"].startswith("/stories/")
+    assert payload["refusal"] is None
+    assert payload["error"] is None
+    assert provider.calls == 1
+    assert "fixture-provider-key" not in result.output
+    assert "fixture-production-salt" not in result.output
+
+
+def test_private_operator_research_does_not_consume_anonymous_allowance(
+    m1_database_url: str,
+    production_environment: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publish_sample_digest(m1_database_url)
+    provider = EvidenceEchoProvider()
+    monkeypatch.setattr(
+        cli_module,
+        "DeepSeekResearchProvider",
+        lambda *_args, **_kwargs: provider,
+    )
+
+    operator_result = runner.invoke(
+        app,
+        [
+            "operator",
+            "research",
+            "answer",
+            "示例发布者的 AI Agent 会记录任务轨迹",
+            "--production",
+        ],
+        env=production_environment,
+    )
+
+    assert operator_result.exit_code == 0, operator_result.output
+    with TestClient(
+        create_app(
+            m1_database_url,
+            research_provider=provider,
+            anonymous_research_daily_limit=1,
+            anonymous_identity_salt=b"operator-bypass-regression-salt",
+        )
+    ) as client:
+        headers = {"X-AI-Anonymous-Client": "192.0.2.200"}
+        first_anonymous = client.post(
+            "/research/answer",
+            json={"question": "示例发布者的 AI Agent 会记录任务轨迹"},
+            headers=headers,
+        )
+        excess_anonymous = client.post(
+            "/research/answer",
+            json={"question": "示例发布者的 AI Agent 会记录任务轨迹"},
+            headers=headers,
+        )
+
+    assert _sse_events(first_anonymous.text)[-1][1]["status"] == "answered"
+    assert (
+        _sse_events(excess_anonymous.text)[1][1]["code"]
+        == "anonymous-allowance-exhausted"
+    )
+    assert provider.calls == 2
+
+
+def test_private_operator_research_does_not_add_an_admin_http_route(
+    m1_database_url: str,
+) -> None:
+    with TestClient(create_app(m1_database_url)) as client:
+        response = client.post(
+            "/admin/research",
+            json={"question": "示例问题"},
+        )
+
+    assert response.status_code == 404
+
+
+def test_private_operator_research_stops_before_http_when_provider_budget_is_exhausted(
+    m1_database_url: str,
+    production_environment: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publish_sample_digest(m1_database_url)
+    constrained_environment = {
+        **production_environment,
+        "AI_INTEL_PROVIDER_MONTHLY_BUDGET_CENTS": "100",
+        "AI_INTEL_PROVIDER_REQUEST_RESERVATION_CENTS": "100",
+    }
+    engine = create_database_engine(m1_database_url)
+    try:
+        assert PersistentMeteredProviderBudget(
+            engine,
+            monthly_limit_cents=100,
+            request_reservation_cents=100,
+        ).reserve()
+    finally:
+        engine.dispose()
+
+    requests: list[httpx.Request] = []
+
+    def unexpected_request(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(500, request=request)
+
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        cli_module.httpx,
+        "Client",
+        lambda **kwargs: real_client(
+            **kwargs,
+            transport=httpx.MockTransport(unexpected_request),
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "operator",
+            "research",
+            "answer",
+            "示例发布者的 AI Agent 会记录任务轨迹",
+            "--production",
+        ],
+        env=constrained_environment,
+    )
+
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "failed"
+    assert payload["error"]["code"] == "provider-budget-exhausted"
+    assert requests == []
+
+
+def test_private_operator_research_rejects_a_question_over_the_public_limit(
+    production_environment: dict[str, str],
+) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "operator",
+            "research",
+            "answer",
+            "问" * 501,
+            "--production",
+        ],
+        env=production_environment,
+    )
+
+    assert result.exit_code == 2
+    assert "Research question must not exceed 500 characters" in result.output
+
+
 def test_production_serve_wires_secret_files_and_persistent_allowance(
     m1_database_url: str,
     production_environment: dict[str, str],
