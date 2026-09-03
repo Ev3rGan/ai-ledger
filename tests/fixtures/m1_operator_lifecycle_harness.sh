@@ -113,7 +113,7 @@ PY
   generated_epoch="$((generated_epoch - 60))"
   generated_at="$(date -u -d "@$generated_epoch" '+%Y-%m-%dT%H:%M:%SZ')"
   cat >"$qualification_file" <<EOF
-{"schema_version":"research-provider-qualification-report.v1","status":"passed","execution_mode":"live-provider","commit_sha":"$qualified_revision","qualified_source_sha256":"$qualified_source_sha","route_identifier":"deepseek:v4-pro","approved_model_id":"deepseek-v4-pro","protocol_version":"fixture","protocol_sha256":"$protocol_sha","corpus_version":"fixture","corpus_sha256":"$corpus_sha","generated_at":"$generated_at","maximum_provider_attempts":14,"worst_case_reserved_cost_usd":0.062,"results":[{"case_identifier":"fixture","repetition":1,"expected_status":"answered","observed_status":"answered","passed":true,"failure_code":null,"citation_count":1,"validated_returned_model_id":"deepseek-v4-pro"}]}
+{"schema_version":"research-provider-qualification-report.v1","status":"passed","execution_mode":"live-provider","commit_sha":"$qualified_revision","qualified_source_sha256":"$qualified_source_sha","route_identifier":"deepseek:v4-pro","approved_model_id":"deepseek-v4-pro","protocol_version":"fixture","protocol_sha256":"$protocol_sha","corpus_version":"fixture","corpus_sha256":"$corpus_sha","generated_at":"$generated_at","maximum_provider_attempts":14,"worst_case_reserved_cost_usd":0.062,"results":[{"case_identifier":"fixture","repetition":1,"expected_status":"answered","observed_status":"answered","passed":true,"failure_code":null,"citation_count":1,"validated_returned_model_id":"deepseek-v4-pro"},{"case_identifier":"fixture-refused","repetition":1,"expected_status":"refused","observed_status":"refused","passed":true,"failure_code":null,"citation_count":0,"validated_returned_model_id":null}]}
 EOF
 }
 
@@ -140,7 +140,7 @@ new_fixture() {
     printf '%s\n' 'public.example { respond 200 }' >"$release_dir/deploy/m1/Caddyfile"
     printf '%s\n' '{"version":"fixture","route_identifier":"deepseek:v4-pro"}' >"$release_dir/src/ai_intel_agent/data/research_protocol.v1.json"
     printf '%s\n' '{"version":"fixture-candidates","candidates":[{"identifier":"deepseek:v4-pro","model_id":"deepseek-v4-pro"}]}' >"$release_dir/src/ai_intel_agent/data/model_routing_candidates.v1.json"
-    printf '%s\n' '{"version":"fixture","maximum_cost_usd":0.1,"qualified_source_paths":["src/ai_intel_agent/data/model_routing_candidates.v1.json","src/ai_intel_agent/data/research_protocol.v1.json","src/ai_intel_agent/data/research_provider_qualification.v1.json"],"cases":[{"identifier":"fixture","expected_status":"answered","repetitions":1}]}' >"$release_dir/src/ai_intel_agent/data/research_provider_qualification.v1.json"
+    printf '%s\n' '{"version":"fixture","maximum_cost_usd":0.1,"qualified_source_paths":["src/ai_intel_agent/data/model_routing_candidates.v1.json","src/ai_intel_agent/data/research_protocol.v1.json","src/ai_intel_agent/data/research_provider_qualification.v1.json"],"cases":[{"identifier":"fixture","expected_status":"answered","repetitions":1},{"identifier":"fixture-refused","expected_status":"refused","repetitions":1}]}' >"$release_dir/src/ai_intel_agent/data/research_provider_qualification.v1.json"
   done
 
   write_qualification "$current_qualification" "$current_release" "$current_dir"
@@ -425,7 +425,7 @@ case_validate_python310_compatible() {
 }
 
 case_qualification_failure_no_side_effect() {
-  for failure_mode in missing failed mocked revision source route model contract cost observation; do
+  for failure_mode in missing failed mocked revision source route model contract cost observation refused-model; do
     new_fixture "qualification-$failure_mode"
     case "$failure_mode" in
       missing) rm "$candidate_qualification" ;;
@@ -438,6 +438,7 @@ case_qualification_failure_no_side_effect() {
       contract) printf '%s\n' '{"version":"changed"}' >"$candidate_dir/src/ai_intel_agent/data/research_provider_qualification.v1.json" ;;
       cost) sed -i 's/"worst_case_reserved_cost_usd":0.062/"worst_case_reserved_cost_usd":1.0/' "$candidate_qualification" ;;
       observation) sed -i 's/"passed":true/"passed":false/' "$candidate_qualification" ;;
+      refused-model) sed -i 's/"validated_returned_model_id":null/"validated_returned_model_id":"deepseek-v4-pro"/' "$candidate_qualification" ;;
     esac
     before_runtime="$(cat "$runtime_state")"
     before_current="$(cat "$current_file")"
