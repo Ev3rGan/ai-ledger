@@ -269,7 +269,15 @@ if observed_observations != expected_observations:
 if any(
     not isinstance(result, dict)
     or result.get("passed") is not True
-    or result.get("validated_returned_model_id") != report.get("approved_model_id")
+    or (
+        result.get("expected_status") == "answered"
+        and result.get("validated_returned_model_id")
+        != report.get("approved_model_id")
+    )
+    or (
+        result.get("expected_status") == "refused"
+        and result.get("validated_returned_model_id") is not None
+    )
     or not isinstance(result.get("citation_count"), int)
     or (
         result.get("expected_status") == "answered"
