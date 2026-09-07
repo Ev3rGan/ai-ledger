@@ -5,6 +5,7 @@ import os
 import sys
 from collections.abc import Iterator
 from datetime import UTC, datetime
+from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
@@ -564,6 +565,11 @@ def test_deepseek_research_provider_uses_streaming_without_tools_or_reasoning() 
                 "choices": [
                     {"delta": {"content": output[20:]}, "finish_reason": "stop"}
                 ],
+                "usage": {
+                    "prompt_tokens": 100,
+                    "prompt_cache_hit_tokens": 20,
+                    "completion_tokens": 40,
+                },
             },
             ensure_ascii=False,
         )
@@ -574,16 +580,36 @@ def test_deepseek_research_provider_uses_streaming_without_tools_or_reasoning() 
             content=f"data: {first}\n\ndata: {second}\n\ndata: [DONE]\n\n".encode(),
         )
 
+    class Reservation:
+        actual_cost: Decimal | None = None
+
+        def settle_usd(self, actual_cost_usd: Decimal) -> None:
+            self.actual_cost = actual_cost_usd
+
+        def commit_reserved(self) -> None:
+            raise AssertionError("complete stream usage must settle the reservation")
+
+        def release(self) -> None:
+            raise AssertionError("a completed stream must not release its reservation")
+
+    reservation = Reservation()
+
+    class Budget:
+        def reserve(self) -> Reservation:
+            return reservation
+
     with httpx.Client(transport=httpx.MockTransport(streamed_response)) as client:
         provider = DeepSeekResearchProvider(
             client,
             api_key="fixture-deepseek-key",
+            budget=Budget(),
             sleeper=lambda _: None,
         )
         streamed_output = "".join(provider.stream(evidence_set))
 
     assert json.loads(streamed_output) == json.loads(output)
     assert provider.last_returned_model_id == "deepseek-v4-pro"
+    assert reservation.actual_cost == Decimal("0.00026488")
 
 
 @pytest.mark.postgres

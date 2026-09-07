@@ -257,7 +257,7 @@ def test_aggregate_provider_budget_persists_and_fails_before_http(
         return httpx.Response(500, request=request)
 
     try:
-        assert first_process_budget.reserve() is True
+        assert first_process_budget.reserve() is not None
         evidence = ResearchRepository(engine).retrieve("示例发布者的 AI Agent 会记录任务轨迹")
         with (
             httpx.Client(transport=httpx.MockTransport(unexpected_request)) as client,

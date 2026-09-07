@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
 import httpx
@@ -17,12 +18,25 @@ from ai_intel_agent.research import (
     ResearchEvidenceSet,
 )
 from ai_intel_agent.research_provider_qualification import (
+    QualificationAttemptBudget,
     load_research_provider_qualification_corpus,
     qualified_source_sha256,
     run_research_provider_qualification,
 )
 
 runner = CliRunner()
+
+
+def test_qualification_attempt_budget_implements_metered_reservation_contract() -> None:
+    budget = QualificationAttemptBudget(maximum_attempts=1)
+
+    reservation = budget.reserve()
+
+    assert reservation is not None
+    reservation.settle_usd(Decimal("0.001"))
+    reservation.commit_reserved()
+    reservation.release()
+    assert budget.reserve() is None
 
 
 def test_qualified_source_identity_is_stable_and_content_sensitive(

@@ -1,0 +1,18 @@
+{
+  "version": "provider-budget-pricing-2026-09-07.v1",
+  "pricing_checked_at": "2026-09-07",
+  "accounting_policy": "peak-rate-ceiling",
+  "pricing_source": "https://api-docs.deepseek.com/quick_start/pricing/",
+  "models": {
+    "deepseek-v4-flash": {
+      "cache_hit_per_million_usd": "0.014",
+      "cache_miss_per_million_usd": "0.44",
+      "output_per_million_usd": "1.32"
+    },
+    "deepseek-v4-pro": {
+      "cache_hit_per_million_usd": "0.044",
+      "cache_miss_per_million_usd": "1.32",
+      "output_per_million_usd": "3.96"
+    }
+  }
+}

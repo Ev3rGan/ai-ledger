@@ -1308,6 +1308,21 @@ def test_multi_hop_stops_retrieval_and_provider_at_the_elapsed_time_budget() -> 
 
 def test_deepseek_retries_share_one_remaining_elapsed_time_budget() -> None:
     requests: list[httpx.Request] = []
+    releases: list[bool] = []
+
+    class Reservation:
+        def settle_usd(self, actual_cost_usd: object) -> None:
+            raise AssertionError(f"failed response unexpectedly settled {actual_cost_usd}")
+
+        def commit_reserved(self) -> None:
+            raise AssertionError("failed response unexpectedly committed its hold")
+
+        def release(self) -> None:
+            releases.append(True)
+
+    class Budget:
+        def reserve(self) -> Reservation:
+            return Reservation()
 
     def retryable_failure(request: httpx.Request) -> httpx.Response:
         requests.append(request)
@@ -1332,6 +1347,7 @@ def test_deepseek_retries_share_one_remaining_elapsed_time_budget() -> None:
         provider = DeepSeekResearchProvider(
             client,
             api_key="fixture-provider-key",
+            budget=Budget(),
             sleeper=lambda _: None,
             clock=SequenceClock(0.0, 1.0, 46.0),
         )
@@ -1339,6 +1355,7 @@ def test_deepseek_retries_share_one_remaining_elapsed_time_budget() -> None:
             tuple(provider.stream(evidence_set))
 
     assert len(requests) == 1
+    assert releases == [True]
 
 
 def test_deepseek_comparison_payload_separates_retrieval_and_answer_time_semantics() -> None:

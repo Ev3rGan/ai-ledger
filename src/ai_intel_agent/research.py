@@ -58,6 +58,11 @@ from ai_intel_agent.persistence import (
     StoryRecord,
     reserve_database_acquisition_budget,
 )
+from ai_intel_agent.provider_budget import (
+    MeteredProviderBudget,
+    ProviderBudgetReservation,
+    settle_provider_response_usage,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -264,10 +269,6 @@ class QueryIntent:
 
 class ResearchProvider(Protocol):
     def stream(self, evidence_set: ResearchEvidenceSet) -> Iterator[str]: ...
-
-
-class MeteredProviderBudget(Protocol):
-    def reserve(self) -> bool: ...
 
 
 class ResearchAllowance(Protocol):
@@ -568,7 +569,8 @@ class DeepSeekResearchProvider:
             if remaining_seconds <= 0:
                 raise ResearchBudgetExceeded("elapsed-time")
             attempts += 1
-            if self._budget is not None and not self._budget.reserve():
+            reservation = self._budget.reserve() if self._budget is not None else None
+            if self._budget is not None and reservation is None:
                 raise ResearchProviderBudgetExhausted(
                     "Aggregate monthly Provider budget is exhausted"
                 )
@@ -588,64 +590,102 @@ class DeepSeekResearchProvider:
                         in self._routing_protocol.retry_policy.retry_status_codes
                         and attempts < self._routing_protocol.retry_policy.max_attempts
                     ):
+                        if reservation is not None:
+                            reservation.release()
                         self._sleeper(
                             self._routing_protocol.retry_policy.backoff_seconds[attempts - 1]
                         )
                         continue
                     if not response.is_success:
+                        if reservation is not None:
+                            reservation.release()
                         raise ResearchError(
                             f"DeepSeek Research request returned HTTP {response.status_code}"
                         )
                     if "text/event-stream" not in response.headers.get("content-type", ""):
+                        if reservation is not None:
+                            reservation.commit_reserved()
                         raise ResearchError("DeepSeek Research response was not an SSE stream")
-                    yield from self._stream_content(response)
+                    yield from self._stream_content(response, reservation=reservation)
                     return
             except httpx.RequestError as error:
+                if reservation is not None:
+                    reservation.release()
                 if attempts >= self._routing_protocol.retry_policy.max_attempts:
                     raise ResearchError("DeepSeek Research request failed") from error
                 self._sleeper(self._routing_protocol.retry_policy.backoff_seconds[attempts - 1])
         raise ResearchError("DeepSeek Research request did not complete")
 
-    def _stream_content(self, response: httpx.Response) -> Iterator[str]:
+    def _stream_content(
+        self,
+        response: httpx.Response,
+        *,
+        reservation: ProviderBudgetReservation | None,
+    ) -> Iterator[str]:
         returned_models: set[str] = set()
         finish_reason: object = None
         saw_done = False
-        for line in response.iter_lines():
-            if not line:
-                continue
-            if not line.startswith("data:"):
-                raise ResearchError("DeepSeek Research SSE frame is invalid")
-            data = line.removeprefix("data:").strip()
-            if data == "[DONE]":
-                saw_done = True
-                break
-            try:
-                chunk = json.loads(data)
-                returned_model = chunk.get("model")
-                choice = chunk["choices"][0]
-                delta = choice["delta"]
-            except (AttributeError, IndexError, KeyError, TypeError, json.JSONDecodeError) as error:
-                raise ResearchError("DeepSeek Research SSE payload is invalid") from error
-            if not isinstance(returned_model, str) or not returned_model:
-                raise ResearchError("DeepSeek Research stream omitted its returned model")
-            returned_models.add(returned_model)
-            if delta.get("reasoning_content"):
-                raise ResearchError("DeepSeek Research returned prohibited reasoning")
-            unexpected_delta_keys = set(delta) - {"content", "role", "reasoning_content"}
-            if unexpected_delta_keys:
-                raise ResearchError("DeepSeek Research returned an unexpected delta")
-            content = delta.get("content")
-            if content is not None:
-                if not isinstance(content, str):
-                    raise ResearchError("DeepSeek Research content delta is invalid")
-                yield content
-            if choice.get("finish_reason") is not None:
-                finish_reason = choice["finish_reason"]
-        if not saw_done or finish_reason != "stop":
-            raise ResearchError("DeepSeek Research stream did not finish completely")
-        if returned_models != {self._candidate.model_id}:
-            raise ResearchError("DeepSeek returned model does not match approved route")
-        self._last_returned_model_id = self._candidate.model_id
+        usage: object = None
+        settled = False
+        try:
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                if not line.startswith("data:"):
+                    raise ResearchError("DeepSeek Research SSE frame is invalid")
+                data = line.removeprefix("data:").strip()
+                if data == "[DONE]":
+                    saw_done = True
+                    break
+                try:
+                    chunk = json.loads(data)
+                    returned_model = chunk.get("model")
+                    choice = chunk["choices"][0]
+                    delta = choice["delta"]
+                except (
+                    AttributeError,
+                    IndexError,
+                    KeyError,
+                    TypeError,
+                    json.JSONDecodeError,
+                ) as error:
+                    raise ResearchError("DeepSeek Research SSE payload is invalid") from error
+                if chunk.get("usage") is not None:
+                    usage = chunk["usage"]
+                if not isinstance(returned_model, str) or not returned_model:
+                    raise ResearchError("DeepSeek Research stream omitted its returned model")
+                returned_models.add(returned_model)
+                if delta.get("reasoning_content"):
+                    raise ResearchError("DeepSeek Research returned prohibited reasoning")
+                unexpected_delta_keys = set(delta) - {
+                    "content",
+                    "role",
+                    "reasoning_content",
+                }
+                if unexpected_delta_keys:
+                    raise ResearchError("DeepSeek Research returned an unexpected delta")
+                content = delta.get("content")
+                if content is not None:
+                    if not isinstance(content, str):
+                        raise ResearchError("DeepSeek Research content delta is invalid")
+                    yield content
+                if choice.get("finish_reason") is not None:
+                    finish_reason = choice["finish_reason"]
+            if not saw_done or finish_reason != "stop":
+                raise ResearchError("DeepSeek Research stream did not finish completely")
+            if returned_models != {self._candidate.model_id}:
+                raise ResearchError("DeepSeek returned model does not match approved route")
+            if reservation is not None:
+                settle_provider_response_usage(
+                    reservation,
+                    model_id=self._candidate.model_id,
+                    usage=usage,
+                )
+            settled = True
+            self._last_returned_model_id = self._candidate.model_id
+        finally:
+            if reservation is not None and not settled:
+                reservation.commit_reserved()
 
     @property
     def last_returned_model_id(self) -> str | None:
