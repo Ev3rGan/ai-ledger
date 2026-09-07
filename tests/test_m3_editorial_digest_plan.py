@@ -461,6 +461,80 @@ def _persist_pending_stories(
         engine.dispose()
 
 
+def test_repository_excludes_retired_unreferenced_source_health(
+    editorial_database_url: str,
+) -> None:
+    _persist_pending_stories(editorial_database_url)
+    engine = create_database_engine(editorial_database_url)
+    retired_source_id = _id("retired-source:ai-business")
+    observed_at = datetime(2026, 8, 20, 13, tzinfo=UTC)
+    try:
+        with Session(engine) as session, session.begin():
+            run_id = session.scalar(select(CollectionRunRecord.id).limit(1))
+            assert run_id is not None
+            session.add(
+                SourceDefinitionRecord(
+                    id=retired_source_id,
+                    name="aibusiness.com",
+                    publisher="AI Business",
+                    entry_point="https://aibusiness.com/",
+                    audit_version="retired-source-fixture.v1",
+                    activation_conclusion="approved",
+                    collection_schedule="retired",
+                    discovery_method="retired fixture",
+                    language="en",
+                    topic_scope=[Topic.MODELS.value],
+                    access_constraints=[],
+                    extraction_adapter="retired",
+                    health_policy="retired",
+                    cursor="retired",
+                    storage_policy="retired",
+                    public_excerpt_policy="retired",
+                    public_excerpt_max_characters=0,
+                    pause_conditions=[],
+                    canonical_url_prefixes=["https://aibusiness.com/"],
+                    acceptance_group="legacy",
+                    contribution_role="Legacy",
+                    evidence_eligibility="never",
+                    body_eligibility="retired",
+                    pause_state="active",
+                    expected_contribution="retired",
+                    overlap_rationale="retired",
+                )
+            )
+            session.flush()
+            session.add(
+                SourceProfileStateRecord(
+                    source_definition_id=retired_source_id,
+                    recent_result="access-blocked",
+                    cursor_value=None,
+                    health="degraded",
+                    consecutive_failures=20,
+                    last_collection_run_id=run_id,
+                    updated_at=observed_at,
+                    pause_state="active",
+                )
+            )
+
+        provider = _RecordingExcludeUnsupportedEditorialProvider()
+        EditorialRepository(engine).prepare_digest_plan(
+            date(2026, 8, 21),
+            provider=provider,
+            prepared_at=observed_at,
+        )
+
+        assert len(provider.contexts) == 1
+        source_health_ids = {
+            item.source_definition_id for item in provider.contexts[0].source_health
+        }
+        assert source_health_ids == {
+            _id(f"database-source:{position}") for position in range(4)
+        }
+        assert retired_source_id not in source_health_ids
+    finally:
+        engine.dispose()
+
+
 def _inflate_withdrawn_research_prefix(database_url: str) -> None:
     """Put more withdrawn matches ahead of the visible legacy Story than the old cap."""
     engine = create_database_engine(database_url)

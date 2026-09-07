@@ -80,7 +80,7 @@ from ai_intel_agent.editorial import (
 from ai_intel_agent.editorial import (
     prepare_digest_plan as build_digest_plan,
 )
-from ai_intel_agent.source_portfolio import SourcePortfolioDefinition
+from ai_intel_agent.source_portfolio import SourcePortfolioDefinition, load_source_universe
 from alembic import command
 
 
@@ -1545,19 +1545,10 @@ class EditorialRepository:
         lock: bool = False,
     ) -> EditorialContext:
         window_start, window_end = editorial_window_for(publication_date)
-        source_statement = (
-            select(SourceProfileStateRecord, SourceDefinitionRecord)
-            .join(
-                SourceDefinitionRecord,
-                SourceDefinitionRecord.id == SourceProfileStateRecord.source_definition_id,
-            )
-            .order_by(SourceDefinitionRecord.id)
-        )
         scheduler_statement = select(SchedulerStatusRecord).where(
             SchedulerStatusRecord.scheduler_key == SchedulerStatusRepository._KEY
         )
         if lock:
-            source_statement = source_statement.with_for_update()
             scheduler_statement = scheduler_statement.with_for_update()
         story_ids = self._pending_editorial_story_batch_ids(
             session,
@@ -1581,6 +1572,25 @@ class EditorialRepository:
                     .with_for_update()
                 ).all()
         stories = tuple(self._story(session, story_id) for story_id in story_ids)
+        visible_source_definition_ids = {
+            profile.id for profile in load_source_universe()
+        }
+        visible_source_definition_ids.update(
+            story.source_definition_id
+            for story in stories
+            if story.source_definition_id is not None
+        )
+        source_statement = (
+            select(SourceProfileStateRecord, SourceDefinitionRecord)
+            .join(
+                SourceDefinitionRecord,
+                SourceDefinitionRecord.id == SourceProfileStateRecord.source_definition_id,
+            )
+            .where(SourceDefinitionRecord.id.in_(visible_source_definition_ids))
+            .order_by(SourceDefinitionRecord.id)
+        )
+        if lock:
+            source_statement = source_statement.with_for_update()
         source_health = tuple(
             SourceHealthInspection(
                 source_definition_id=definition.id,

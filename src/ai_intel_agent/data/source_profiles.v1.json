@@ -1,5 +1,5 @@
 {
-  "version": "mvp-v2-1-m2-source-universe-2026-08-19.v2",
+  "version": "mvp-v2-1-m2-source-universe-2026-09-07.v3",
   "active_set_version": "mvp-v2-1-m2-active-source-universe-2026-08-19.v2",
   "profiles": [
     {
@@ -448,7 +448,7 @@
       "key": "simon-willison-ai",
       "host": "simonwillison.net",
       "publisher": "Simon Willison",
-      "entry_point": "https://simonwillison.net/tags/ai/atom/everything/",
+      "entry_point": "https://simonwillison.net/tags/ai.atom",
       "adapter": "analyst-feed",
       "enabled": true,
       "acceptance_group": "supplemental",
