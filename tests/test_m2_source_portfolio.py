@@ -386,6 +386,45 @@ def test_versioned_source_universe_has_exact_approved_groups_and_domain_policies
         releases.settings["repositories"][0]["release_body_eligible"] = False
 
 
+def test_simon_willison_uses_the_current_ai_tag_atom_feed() -> None:
+    profile = next(
+        profile
+        for profile in load_source_universe()
+        if profile.key == "simon-willison-ai"
+    )
+    payload = b"""<feed xmlns="http://www.w3.org/2005/Atom">
+      <title>Simon Willison's Weblog: AI</title>
+      <entry><title>AI note</title><id>https://simonwillison.net/2026/Sep/7/ai-note/</id>
+      <link href="https://simonwillison.net/2026/Sep/7/ai-note/" rel="alternate" />
+      <updated>2026-09-07T02:00:00Z</updated><summary>Analyst excerpt.</summary></entry>
+    </feed>"""
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/atom+xml"},
+            content=payload,
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond), trust_env=False) as client:
+        result = HttpSourcePortfolioAdapter(client, resolver=StaticResolver()).acquire(
+            profile,
+            observed_at=datetime(2026, 9, 7, 4, 0, tzinfo=UTC),
+            backfill_limit=5,
+            known_paper_identities=frozenset(),
+            known_signal_targets=frozenset(),
+        )
+
+    assert profile.entry_point == "https://simonwillison.net/tags/ai.atom"
+    assert [request.url.path for request in requests] == ["/tags/ai.atom"]
+    assert len(result.items) == 1
+    assert result.items[0].status is SourceItemStatus.SIGNAL_ONLY
+    assert result.items[0].evidence_eligible is False
+    assert result.items[0].document_version is None
+
+
 def test_arxiv_is_throttled_abstract_only_and_version_deduplicated() -> None:
     profile = next(profile for profile in load_source_universe() if profile.key == "arxiv-ai")
     payload = b"""<feed xmlns="http://www.w3.org/2005/Atom">
