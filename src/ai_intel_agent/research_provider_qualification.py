@@ -4,6 +4,7 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from hashlib import sha256
 from importlib.resources import files
 from pathlib import Path, PurePosixPath
@@ -39,6 +40,19 @@ class ResearchProviderQualificationError(ValueError):
     pass
 
 
+class QualificationAttemptReservation:
+    """Count one bounded qualification attempt without maintaining a spend ledger."""
+
+    def settle_usd(self, actual_cost_usd: Decimal) -> None:
+        pass
+
+    def commit_reserved(self) -> None:
+        pass
+
+    def release(self) -> None:
+        pass
+
+
 class QualificationAttemptBudget:
     def __init__(self, maximum_attempts: int) -> None:
         if maximum_attempts < 1:
@@ -46,11 +60,11 @@ class QualificationAttemptBudget:
         self._maximum_attempts = maximum_attempts
         self._reserved = 0
 
-    def reserve(self) -> bool:
+    def reserve(self) -> QualificationAttemptReservation | None:
         if self._reserved >= self._maximum_attempts:
-            return False
+            return None
         self._reserved += 1
-        return True
+        return QualificationAttemptReservation()
 
 
 @dataclass(frozen=True)
