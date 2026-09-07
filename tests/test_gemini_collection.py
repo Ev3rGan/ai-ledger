@@ -4,6 +4,7 @@ import json
 import os
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from decimal import Decimal
 from hashlib import sha256
 from ipaddress import IPv4Address
 from pathlib import Path
@@ -153,16 +154,36 @@ def test_deepseek_draft_constrains_live_output_to_three_short_evidence_claims() 
             },
         )
 
+    class Reservation:
+        actual_cost: Decimal | None = None
+
+        def settle_usd(self, actual_cost_usd: Decimal) -> None:
+            self.actual_cost = actual_cost_usd
+
+        def commit_reserved(self) -> None:
+            raise AssertionError("valid Provider usage must not commit the full reservation")
+
+        def release(self) -> None:
+            raise AssertionError("successful Provider usage must not release its reservation")
+
+    reservation = Reservation()
+
+    class Budget:
+        def reserve(self) -> Reservation:
+            return reservation
+
     with httpx.Client(transport=httpx.MockTransport(live_output_contract)) as client:
         prepared = DeepSeekGeminiDraftProvider(
             client,
             api_key="fixture-deepseek-key",
+            budget=Budget(),
             sleeper=lambda _: None,
         ).prepare(document)
 
     assert prepared.headline == output["headline"]
     assert len(prepared.claims) == 3
     assert load_gemini_draft_protocol().maximum_claims == 3
+    assert reservation.actual_cost == Decimal("0.0008448")
 
 
 @pytest.fixture

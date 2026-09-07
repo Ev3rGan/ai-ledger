@@ -65,13 +65,14 @@ services which need a mounted secret; each service receives only its own require
 Do not print their contents during setup or acceptance.
 
 Set `AI_INTEL_PROVIDER_MONTHLY_BUDGET_CENTS` no higher than `50000`. This is the
-application's conservative reservation ceiling; actual-spend controls remain at the Provider
-account boundary. Set `AI_INTEL_PROVIDER_REQUEST_RESERVATION_CENTS` to exactly `100` cents.
-That is the conservative upper bound for one request under the current Provider price and
-configured maximum tokens. Web and Scheduler atomically reserve that amount in the same
-PostgreSQL monthly ledger before every request attempt. The ledger never
-refunds a reservation, so retries and failed calls remain safely counted and all production
-metered calls stop before the configured aggregate cap can be exceeded.
+application's internal estimated-spend ceiling; the Provider invoice remains authoritative.
+Set `AI_INTEL_PROVIDER_REQUEST_RESERVATION_CENTS` to exactly `100` cents. That amount is a
+temporary concurrency hold, not booked spend. Web and Scheduler atomically acquire it before
+HTTP, replace it with a micro-USD estimate from the response's prompt/cache/completion token usage
+at the versioned peak price, and release it when no metered response was produced. Missing or
+invalid usage fails closed by booking the full hold. The migration preserves the previous fixed
+reservation counter as `legacy_reserved_cents` for audit but excludes it from the active ceiling,
+because it did not represent actual spend.
 The file-backed `collect-gemini` and `collect-sources` operator commands detect this production
 contract and use the same ledger; neither can bypass the cap.
 
@@ -300,8 +301,9 @@ bash deploy/m1/operate.sh operator operator research answer --production \
 This command uses the current release's production PostgreSQL accepted knowledge, Retrieval
 backends, Research execution, DeepSeek route, output validation, and aggregate monthly Provider
 budget. It deliberately omits only the per-client anonymous daily allowance, so it neither consumes
-nor resets a visitor's allowance. Every Provider attempt still reserves the configured conservative
-cost in the shared PostgreSQL ledger and stops before HTTP when that budget is exhausted. The
+nor resets a visitor's allowance. Every Provider attempt still acquires the configured temporary
+hold in the shared PostgreSQL ledger and stops before HTTP when settled spend plus live holds reach
+the cap. Successful responses settle from Provider usage; unmetered failures release the hold. The
 command accepts exactly one question, has the same 500-character input limit as public Research,
 and returns only the validated answer, public citation data, or the structured refusal/error. It has
 no batch, budget-bypass, API-key, anonymous-client, or raw-Provider-output option. A completed

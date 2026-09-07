@@ -53,6 +53,10 @@ from ai_intel_agent.persistence import (
     GeminiDraftRepository,
     create_database_engine,
 )
+from ai_intel_agent.provider_budget import (
+    MeteredProviderBudget,
+    settle_provider_response_usage,
+)
 
 RELEASE_NOTES_URL = "https://ai.google.dev/gemini-api/docs/changelog"
 SOURCE_CONTRACT_VERSION = "gemini-api-release-notes-2026-08-14.v1"
@@ -109,10 +113,6 @@ class GeminiReleaseNotesFetcher(Protocol):
 
 class GeminiDraftProvider(Protocol):
     def prepare(self, document: DocumentVersion) -> PreparedDraft: ...
-
-
-class MeteredProviderBudget(Protocol):
-    def reserve(self) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -447,7 +447,8 @@ class DeepSeekGeminiDraftProvider:
         attempts = 0
         while attempts < self._routing_protocol.retry_policy.max_attempts:
             attempts += 1
-            if self._budget is not None and not self._budget.reserve():
+            reservation = self._budget.reserve() if self._budget is not None else None
+            if self._budget is not None and reservation is None:
                 raise DraftPreparationError(
                     "Aggregate monthly Provider budget is exhausted"
                 )
@@ -461,6 +462,8 @@ class DeepSeekGeminiDraftProvider:
                     json=payload,
                 )
             except httpx.RequestError as error:
+                if reservation is not None:
+                    reservation.release()
                 if attempts >= self._routing_protocol.retry_policy.max_attempts:
                     raise DraftPreparationError("DeepSeek draft request failed") from error
                 self._sleeper(
@@ -473,11 +476,15 @@ class DeepSeekGeminiDraftProvider:
                 or attempts >= self._routing_protocol.retry_policy.max_attempts
             ):
                 break
+            if reservation is not None:
+                reservation.release()
             self._sleeper(
                 self._routing_protocol.retry_policy.backoff_seconds[attempts - 1]
             )
         latency_ms = round((perf_counter() - started) * 1000)
         if not response.is_success:
+            if reservation is not None:
+                reservation.release()
             raise DraftPreparationError(
                 f"DeepSeek draft request returned HTTP {response.status_code}"
             )
@@ -489,15 +496,25 @@ class DeepSeekGeminiDraftProvider:
             returned_model_id = response_body.get("model")
             usage = response_body.get("usage") or {}
         except (IndexError, KeyError, TypeError, ValueError) as error:
+            if reservation is not None:
+                reservation.commit_reserved()
             raise DraftPreparationError("DeepSeek draft response shape is invalid") from error
-        if finish_reason != "stop" or not isinstance(content, str):
-            raise DraftPreparationError("DeepSeek draft response did not finish completely")
         if (
             not isinstance(returned_model_id, str)
             or not returned_model_id.strip()
             or returned_model_id != self._candidate.model_id
         ):
+            if reservation is not None:
+                reservation.commit_reserved()
             raise DraftPreparationError("DeepSeek returned model does not match approved route")
+        if reservation is not None:
+            settle_provider_response_usage(
+                reservation,
+                model_id=self._candidate.model_id,
+                usage=usage,
+            )
+        if finish_reason != "stop" or not isinstance(content, str):
+            raise DraftPreparationError("DeepSeek draft response did not finish completely")
         headline, claims = _parse_prepared_draft(
             content,
             document.body,

@@ -4,16 +4,18 @@ import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
+from decimal import ROUND_CEILING, Decimal
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Protocol
-from uuid import NAMESPACE_URL, UUID, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from alembic.config import Config
 from dotenv import load_dotenv
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     CheckConstraint,
     Computed,
@@ -616,13 +618,51 @@ class MeteredProviderBudgetRecord(Base):
     __tablename__ = "metered_provider_budget"
     __table_args__ = (
         CheckConstraint(
-            "reserved_cents >= 1 AND reserved_cents <= 50000",
-            name="ck_metered_provider_budget_range",
+            "legacy_reserved_cents >= 0 AND legacy_reserved_cents <= 50000",
+            name="ck_metered_provider_budget_legacy_range",
+        ),
+        CheckConstraint(
+            "spent_microusd >= 0",
+            name="ck_metered_provider_budget_spent_nonnegative",
+        ),
+        CheckConstraint(
+            "held_microusd >= 0",
+            name="ck_metered_provider_budget_held_nonnegative",
         ),
     )
 
     billing_month: Mapped[date] = mapped_column(Date, primary_key=True)
-    reserved_cents: Mapped[int] = mapped_column(Integer)
+    legacy_reserved_cents: Mapped[int] = mapped_column(Integer)
+    spent_microusd: Mapped[int] = mapped_column(BigInteger, default=0)
+    held_microusd: Mapped[int] = mapped_column(BigInteger, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class MeteredProviderReservationRecord(Base):
+    __tablename__ = "metered_provider_reservations"
+    __table_args__ = (
+        CheckConstraint(
+            "reserved_microusd > 0",
+            name="ck_metered_provider_reservation_positive",
+        ),
+        CheckConstraint(
+            "settled_microusd IS NULL OR settled_microusd >= 0",
+            name="ck_metered_provider_reservation_settled_nonnegative",
+        ),
+        CheckConstraint(
+            "state IN ('pending', 'settled', 'released')",
+            name="ck_metered_provider_reservation_state",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
+    billing_month: Mapped[date] = mapped_column(
+        ForeignKey("metered_provider_budget.billing_month")
+    )
+    reserved_microusd: Mapped[int] = mapped_column(BigInteger)
+    settled_microusd: Mapped[int | None] = mapped_column(BigInteger)
+    state: Mapped[str] = mapped_column(String(16))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
@@ -857,7 +897,7 @@ class AnonymousResearchAllowanceRepository:
 
 
 class MeteredProviderBudgetRepository:
-    """Reserve a conservative request cost under the aggregate USD 500 cap."""
+    """Hold request capacity, then atomically replace it with measured spend."""
 
     MAXIMUM_MONTHLY_CENTS = 50_000
 
@@ -870,7 +910,7 @@ class MeteredProviderBudgetRepository:
         billing_month: date,
         reservation_cents: int,
         monthly_limit_cents: int,
-    ) -> bool:
+    ) -> UUID | None:
         if billing_month.day != 1:
             raise ValueError("Provider budget month must be the first day of a month")
         if not 1 <= monthly_limit_cents <= self.MAXIMUM_MONTHLY_CENTS:
@@ -879,34 +919,153 @@ class MeteredProviderBudgetRepository:
             raise ValueError("Provider request reservation must fit the monthly budget")
 
         now = datetime.now(UTC)
-        statement = (
+        reservation_microusd = reservation_cents * 10_000
+        monthly_limit_microusd = monthly_limit_cents * 10_000
+        reservation_id = uuid4()
+        ensure_month = (
             insert(MeteredProviderBudgetRecord)
             .values(
                 billing_month=billing_month,
-                reserved_cents=reservation_cents,
+                legacy_reserved_cents=0,
+                spent_microusd=0,
+                held_microusd=0,
                 updated_at=now,
             )
-            .on_conflict_do_update(
-                index_elements=[MeteredProviderBudgetRecord.billing_month],
-                set_={
-                    "reserved_cents": (
-                        MeteredProviderBudgetRecord.reserved_cents + reservation_cents
-                    ),
-                    "updated_at": now,
-                },
-                where=(
-                    MeteredProviderBudgetRecord.reserved_cents
-                    <= monthly_limit_cents - reservation_cents
-                ),
+            .on_conflict_do_nothing(
+                index_elements=[MeteredProviderBudgetRecord.billing_month]
             )
-            .returning(MeteredProviderBudgetRecord.reserved_cents)
+        )
+        reserve_capacity = (
+            update(MeteredProviderBudgetRecord)
+            .where(
+                MeteredProviderBudgetRecord.billing_month == billing_month,
+                MeteredProviderBudgetRecord.spent_microusd
+                + MeteredProviderBudgetRecord.held_microusd
+                <= monthly_limit_microusd - reservation_microusd,
+            )
+            .values(
+                held_microusd=(
+                    MeteredProviderBudgetRecord.held_microusd
+                    + reservation_microusd
+                ),
+                updated_at=now,
+            )
+            .returning(MeteredProviderBudgetRecord.held_microusd)
         )
         with Session(self._engine) as session, session.begin():
-            return session.scalar(statement) is not None
+            session.execute(ensure_month)
+            if session.scalar(reserve_capacity) is None:
+                return None
+            session.add(
+                MeteredProviderReservationRecord(
+                    id=reservation_id,
+                    billing_month=billing_month,
+                    reserved_microusd=reservation_microusd,
+                    settled_microusd=None,
+                    state="pending",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        return reservation_id
+
+    def settle(
+        self,
+        reservation_id: UUID,
+        *,
+        settled_microusd: int,
+        state: str,
+    ) -> None:
+        if settled_microusd < 0:
+            raise ValueError("Provider settled cost cannot be negative")
+        if state not in {"settled", "released"}:
+            raise ValueError("Provider reservation state is invalid")
+        now = datetime.now(UTC)
+        with Session(self._engine) as session, session.begin():
+            reservation = session.scalar(
+                select(MeteredProviderReservationRecord)
+                .where(MeteredProviderReservationRecord.id == reservation_id)
+                .with_for_update()
+            )
+            if reservation is None:
+                raise ValueError("Provider reservation does not exist")
+            if reservation.state != "pending":
+                return
+            session.execute(
+                update(MeteredProviderBudgetRecord)
+                .where(
+                    MeteredProviderBudgetRecord.billing_month
+                    == reservation.billing_month
+                )
+                .values(
+                    held_microusd=(
+                        MeteredProviderBudgetRecord.held_microusd
+                        - reservation.reserved_microusd
+                    ),
+                    spent_microusd=(
+                        MeteredProviderBudgetRecord.spent_microusd
+                        + settled_microusd
+                    ),
+                    updated_at=now,
+                )
+            )
+            reservation.settled_microusd = settled_microusd
+            reservation.state = state
+            reservation.updated_at = now
+
+
+class PersistentProviderBudgetReservation:
+    def __init__(
+        self,
+        repository: MeteredProviderBudgetRepository,
+        reservation_id: UUID,
+        reservation_microusd: int,
+    ) -> None:
+        self._repository = repository
+        self._reservation_id = reservation_id
+        self._reservation_microusd = reservation_microusd
+        self._closed = False
+
+    def settle_usd(self, actual_cost_usd: Decimal) -> None:
+        if self._closed:
+            return
+        if not actual_cost_usd.is_finite() or actual_cost_usd < 0:
+            raise ValueError("Provider settled USD cost must be finite and nonnegative")
+        settled_microusd = int(
+            (actual_cost_usd * Decimal(1_000_000)).to_integral_value(
+                rounding=ROUND_CEILING
+            )
+        )
+        self._repository.settle(
+            self._reservation_id,
+            settled_microusd=settled_microusd,
+            state="settled",
+        )
+        self._closed = True
+
+    def commit_reserved(self) -> None:
+        if self._closed:
+            return
+        self._repository.settle(
+            self._reservation_id,
+            settled_microusd=self._reservation_microusd,
+            state="settled",
+        )
+        self._closed = True
+
+    def release(self) -> None:
+        if self._closed:
+            return
+        self._repository.settle(
+            self._reservation_id,
+            settled_microusd=0,
+            state="released",
+        )
+        self._closed = True
 
 
 class PersistentMeteredProviderBudget:
-    """Fail before each metered request once its conservative USD cap is spent."""
+    """Fail before HTTP when settled spend plus live request holds reaches the cap."""
 
     def __init__(
         self,
@@ -921,12 +1080,19 @@ class PersistentMeteredProviderBudget:
         self._request_reservation_cents = request_reservation_cents
         self._today = today or (lambda: datetime.now(UTC).date())
 
-    def reserve(self) -> bool:
+    def reserve(self) -> PersistentProviderBudgetReservation | None:
         observed_date = self._today()
-        return self._repository.reserve(
+        reservation_id = self._repository.reserve(
             billing_month=observed_date.replace(day=1),
             reservation_cents=self._request_reservation_cents,
             monthly_limit_cents=self._monthly_limit_cents,
+        )
+        if reservation_id is None:
+            return None
+        return PersistentProviderBudgetReservation(
+            self._repository,
+            reservation_id,
+            self._request_reservation_cents * 10_000,
         )
 
 

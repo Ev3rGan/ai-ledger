@@ -33,6 +33,10 @@ from ai_intel_agent.model_routing_evaluation import (
     load_candidate_configuration,
     load_protocol_configuration,
 )
+from ai_intel_agent.provider_budget import (
+    MeteredProviderBudget,
+    settle_provider_response_usage,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -167,10 +171,6 @@ class EditorialPlanProvider(Protocol):
     def prepare(self, context: EditorialContext) -> EditorialPlanProposal: ...
 
 
-class EditorialProviderBudget(Protocol):
-    def reserve(self) -> bool: ...
-
-
 @dataclass(frozen=True)
 class EditorialAgentProtocol:
     version: str
@@ -191,7 +191,7 @@ class DeepSeekEditorialPlanProvider:
         client: httpx.Client,
         *,
         api_key: str,
-        budget: EditorialProviderBudget | None = None,
+        budget: MeteredProviderBudget | None = None,
         sleeper: Callable[[float], None] = sleep,
     ) -> None:
         if not api_key.strip():
@@ -258,7 +258,8 @@ class DeepSeekEditorialPlanProvider:
         last_output_error: EditorialStateError | None = None
         while attempts < self._routing_protocol.retry_policy.max_attempts:
             attempts += 1
-            if self._budget is not None and not self._budget.reserve():
+            reservation = self._budget.reserve() if self._budget is not None else None
+            if self._budget is not None and reservation is None:
                 raise EditorialStateError("Aggregate monthly Provider budget is exhausted")
             messages = list(base_messages)
             if last_output_error is not None:
@@ -284,6 +285,8 @@ class DeepSeekEditorialPlanProvider:
                     json=request_payload,
                 )
             except httpx.RequestError as error:
+                if reservation is not None:
+                    reservation.release()
                 if attempts >= self._routing_protocol.retry_policy.max_attempts:
                     raise EditorialStateError("Editorial Agent Provider request failed") from error
                 self._sleeper(self._routing_protocol.retry_policy.backoff_seconds[attempts - 1])
@@ -294,10 +297,14 @@ class DeepSeekEditorialPlanProvider:
                     in self._routing_protocol.retry_policy.retry_status_codes
                     and attempts < self._routing_protocol.retry_policy.max_attempts
                 ):
+                    if reservation is not None:
+                        reservation.release()
                     self._sleeper(
                         self._routing_protocol.retry_policy.backoff_seconds[attempts - 1]
                     )
                     continue
+                if reservation is not None:
+                    reservation.release()
                 raise EditorialStateError(
                     f"Editorial Agent Provider returned HTTP {response.status_code}"
                 )
@@ -314,16 +321,27 @@ class DeepSeekEditorialPlanProvider:
                 content = choice["message"]["content"]
                 finish_reason = choice["finish_reason"]
                 returned_model = response_body["model"]
+                usage = response_body.get("usage") or {}
                 if isinstance(content, str):
                     content_characters = len(content)
             except (IndexError, KeyError, TypeError, ValueError):
+                if reservation is not None:
+                    reservation.commit_reserved()
                 output_error = EditorialStateError(
                     "Editorial Agent Provider response shape is invalid"
                 )
             else:
                 if returned_model != self._candidate.model_id:
+                    if reservation is not None:
+                        reservation.commit_reserved()
                     raise EditorialStateError(
                         "Editorial Agent Provider returned an unapproved model"
+                    )
+                if reservation is not None:
+                    settle_provider_response_usage(
+                        reservation,
+                        model_id=self._candidate.model_id,
+                        usage=usage,
                     )
                 if finish_reason != "stop" or not isinstance(content, str):
                     output_error = EditorialStateError(

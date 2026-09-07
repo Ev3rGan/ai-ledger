@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
@@ -15,6 +16,12 @@ from ai_intel_agent.persistence import (
     PersistentMeteredProviderBudget,
     create_database_engine,
     database_url_for_alembic_config,
+)
+from ai_intel_agent.provider_budget import (
+    ProviderTokenUsage,
+    estimate_provider_usage_usd,
+    load_provider_budget_pricing,
+    provider_token_usage,
 )
 from alembic import command
 
@@ -85,6 +92,42 @@ def _seed_0011_budget(database_url: str) -> Config:
     return config
 
 
+def test_budget_uses_versioned_peak_prices_and_normalized_provider_usage() -> None:
+    pricing = load_provider_budget_pricing()
+    usage = provider_token_usage(
+        {
+            "prompt_tokens": 100,
+            "prompt_cache_hit_tokens": 20,
+            "completion_tokens": 40,
+        }
+    )
+
+    assert pricing.version == "provider-budget-pricing-2026-09-07.v1"
+    assert pricing.accounting_policy == "peak-rate-ceiling"
+    assert usage == ProviderTokenUsage(100, 20, 40)
+    assert estimate_provider_usage_usd("deepseek-v4-pro", usage) == Decimal(
+        "0.00026488"
+    )
+
+
+def test_invalid_or_missing_provider_usage_cannot_be_treated_as_zero_cost() -> None:
+    assert provider_token_usage({}) is None
+    assert provider_token_usage(
+        {
+            "prompt_tokens": 10,
+            "prompt_cache_hit_tokens": 11,
+            "completion_tokens": 1,
+        }
+    ) is None
+    assert provider_token_usage(
+        {
+            "prompt_tokens": 10,
+            "prompt_tokens_details": "invalid",
+            "completion_tokens": 1,
+        }
+    ) is None
+
+
 def test_committed_provider_budget_contract_uses_50000_cap() -> None:
     project_root = Path(__file__).resolve().parents[1]
     expected_contracts = {
@@ -109,7 +152,8 @@ def test_committed_provider_budget_contract_uses_50000_cap() -> None:
         "docs/mvp-production-runbook.md": (
             "Set `AI_INTEL_PROVIDER_MONTHLY_BUDGET_CENTS` no higher than `50000`.",
             "AI_INTEL_PROVIDER_REQUEST_RESERVATION_CENTS` to exactly `100` cents.",
-            "The ledger never\nrefunds a reservation",
+            "temporary concurrency hold, not booked spend",
+            "legacy_reserved_cents",
         ),
     }
 
@@ -178,7 +222,7 @@ def test_populated_0008_budget_migrates_to_11500_hard_cap(
 
 
 @pytest.mark.postgres
-def test_existing_11500_budget_can_reserve_to_50000_without_refunds(
+def test_legacy_reservations_do_not_count_as_actual_spend_after_upgrade(
     budget_hotfix_database_url: str,
 ) -> None:
     config = _seed_0011_budget(budget_hotfix_database_url)
@@ -192,18 +236,98 @@ def test_existing_11500_budget_can_reserve_to_50000_without_refunds(
         today=lambda: date(2026, 8, 20),
     )
     try:
-        assert all(budget.reserve() for _ in range(385))
-        assert budget.reserve() is False
+        reservation = budget.reserve()
+        assert reservation is not None
+        reservation.release()
         with engine.connect() as connection:
-            assert connection.scalar(
+            row = connection.execute(
                 text(
                     """
-                    SELECT reserved_cents
+                    SELECT legacy_reserved_cents, spent_microusd, held_microusd
                     FROM metered_provider_budget
                     WHERE billing_month = DATE '2026-08-01'
                     """
                 )
-            ) == 50_000
+            ).one()
+        assert row.legacy_reserved_cents == 11_500
+        assert row.spent_microusd == 0
+        assert row.held_microusd == 0
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.postgres
+def test_low_actual_spend_does_not_exhaust_budget_after_696_requests(
+    budget_hotfix_database_url: str,
+) -> None:
+    config = _alembic_config(budget_hotfix_database_url)
+    command.upgrade(config, "head")
+    engine = create_database_engine(budget_hotfix_database_url)
+    budget = PersistentMeteredProviderBudget(
+        engine,
+        monthly_limit_cents=50_000,
+        request_reservation_cents=100,
+        today=lambda: date(2026, 9, 7),
+    )
+    try:
+        # The attached Provider statement reports CNY 10.45 for 696 requests.
+        # USD 0.0021/request is a deliberately rounded-up reproduction input.
+        for _ in range(696):
+            reservation = budget.reserve()
+            assert reservation is not None
+            reservation.settle_usd(Decimal("0.0021"))
+
+        next_reservation = budget.reserve()
+        assert next_reservation is not None
+        next_reservation.release()
+
+        with engine.connect() as connection:
+            row = connection.execute(
+                text(
+                    """
+                    SELECT spent_microusd, held_microusd
+                    FROM metered_provider_budget
+                    WHERE billing_month = DATE '2026-09-01'
+                    """
+                )
+            ).one()
+        assert row.spent_microusd == 1_461_600
+        assert row.held_microusd == 0
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.postgres
+def test_failed_requests_release_temporary_provider_budget_holds(
+    budget_hotfix_database_url: str,
+) -> None:
+    config = _alembic_config(budget_hotfix_database_url)
+    command.upgrade(config, "head")
+    engine = create_database_engine(budget_hotfix_database_url)
+    budget = PersistentMeteredProviderBudget(
+        engine,
+        monthly_limit_cents=100,
+        request_reservation_cents=100,
+        today=lambda: date(2026, 9, 7),
+    )
+    try:
+        for _ in range(501):
+            reservation = budget.reserve()
+            assert reservation is not None
+            reservation.release()
+
+        with engine.connect() as connection:
+            row = connection.execute(
+                text(
+                    """
+                    SELECT spent_microusd, held_microusd
+                    FROM metered_provider_budget
+                    WHERE billing_month = DATE '2026-09-01'
+                    """
+                )
+            ).one()
+        assert row.spent_microusd == 0
+        assert row.held_microusd == 0
     finally:
         engine.dispose()
 
@@ -296,33 +420,36 @@ def test_populated_0011_budget_migrates_to_50000_hard_cap(
     engine = create_database_engine(budget_hotfix_database_url)
     try:
         with engine.connect() as connection:
-            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0012"
-            assert connection.scalar(
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0013"
+            row = connection.execute(
                 text(
                     """
-                    SELECT reserved_cents
+                    SELECT legacy_reserved_cents, spent_microusd, held_microusd
                     FROM metered_provider_budget
                     WHERE billing_month = DATE '2026-08-01'
                     """
                 )
-            ) == 11_500
+            ).one()
+            assert row.legacy_reserved_cents == 11_500
+            assert row.spent_microusd == 0
+            assert row.held_microusd == 0
 
         with engine.begin() as connection:
             connection.execute(
                 text(
                     """
                     UPDATE metered_provider_budget
-                    SET reserved_cents = 50000
+                    SET legacy_reserved_cents = 50000
                     WHERE billing_month = DATE '2026-08-01'
                     """
                 )
             )
 
-        for invalid_reserved_cents in (0, 50_001):
+        for invalid_reserved_cents in (-1, 50_001):
             with (
                 pytest.raises(
                     DBAPIError,
-                    match="ck_metered_provider_budget_range",
+                    match="ck_metered_provider_budget_legacy_range",
                 ),
                 engine.begin() as connection,
             ):
@@ -330,7 +457,7 @@ def test_populated_0011_budget_migrates_to_50000_hard_cap(
                     text(
                         """
                         UPDATE metered_provider_budget
-                        SET reserved_cents = :reserved_cents
+                        SET legacy_reserved_cents = :reserved_cents
                         WHERE billing_month = DATE '2026-08-01'
                         """
                     ),
@@ -341,7 +468,7 @@ def test_populated_0011_budget_migrates_to_50000_hard_cap(
             assert connection.scalar(
                 text(
                     """
-                    SELECT reserved_cents
+                    SELECT legacy_reserved_cents
                     FROM metered_provider_budget
                     WHERE billing_month = DATE '2026-08-01'
                     """
@@ -357,6 +484,7 @@ def test_50000_budget_downgrade_is_fail_closed_and_restores_0011_constraint(
 ) -> None:
     config = _seed_0011_budget(budget_hotfix_database_url)
     command.upgrade(config, "head")
+    command.downgrade(config, "0012")
     engine = create_database_engine(budget_hotfix_database_url)
     try:
         with engine.begin() as connection:

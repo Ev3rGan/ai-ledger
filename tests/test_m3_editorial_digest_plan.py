@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -79,6 +80,32 @@ from ai_intel_agent.persistence import (
 from ai_intel_agent.publication import PublicPublicationRepository
 from ai_intel_agent.web import create_app
 from alembic import command
+
+
+@dataclass
+class _RecordingProviderReservation:
+    actual_cost: Decimal | None = None
+    committed: bool = False
+    released: bool = False
+
+    def settle_usd(self, actual_cost_usd: Decimal) -> None:
+        self.actual_cost = actual_cost_usd
+
+    def commit_reserved(self) -> None:
+        self.committed = True
+
+    def release(self) -> None:
+        self.released = True
+
+
+class _RecordingProviderBudget:
+    def __init__(self) -> None:
+        self.reservations: list[_RecordingProviderReservation] = []
+
+    def reserve(self) -> _RecordingProviderReservation:
+        reservation = _RecordingProviderReservation()
+        self.reservations.append(reservation)
+        return reservation
 
 
 def _id(name: str) -> UUID:
@@ -1235,17 +1262,11 @@ def test_versioned_editorial_provider_protocol_is_strict_and_uses_no_live_networ
                         "message": {"content": json.dumps(provider_output, ensure_ascii=False)},
                     }
                 ],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 200},
             },
         )
 
-    class Budget:
-        calls = 0
-
-        def reserve(self) -> bool:
-            self.calls += 1
-            return True
-
-    budget = Budget()
+    budget = _RecordingProviderBudget()
     with httpx.Client(transport=httpx.MockTransport(respond)) as client:
         proposal = DeepSeekEditorialPlanProvider(
             client,
@@ -1261,7 +1282,8 @@ def test_versioned_editorial_provider_protocol_is_strict_and_uses_no_live_networ
     assert protocol.maximum_pending_stories == 12
     assert protocol.maximum_output_tokens == 4096
     assert protocol.version == "editorial-digest-plan-2026-08-26.v2"
-    assert budget.calls == 1
+    assert len(budget.reservations) == 1
+    assert budget.reservations[0].actual_cost == Decimal("0.000924")
     assert len(observed_requests) == 1
     assert observed_requests[0]["max_tokens"] == 4096
 
@@ -1353,17 +1375,11 @@ def test_editorial_provider_retries_invalid_successful_response(
                         "message": {"content": json.dumps(output, ensure_ascii=False)},
                     }
                 ],
+                "usage": {"prompt_tokens": 50, "completion_tokens": 40},
             },
         )
 
-    class Budget:
-        calls = 0
-
-        def reserve(self) -> bool:
-            self.calls += 1
-            return True
-
-    budget = Budget()
+    budget = _RecordingProviderBudget()
     with httpx.Client(transport=httpx.MockTransport(respond)) as client:
         proposal = DeepSeekEditorialPlanProvider(
             client,
@@ -1373,7 +1389,11 @@ def test_editorial_provider_retries_invalid_successful_response(
         ).prepare(context)
 
     assert proposal.stories == fake_proposal.stories
-    assert budget.calls == 2
+    assert len(budget.reservations) == 2
+    assert all(
+        reservation.actual_cost == Decimal("0.0002244")
+        for reservation in budget.reservations
+    )
     assert len(observed_requests) == 2
     retry_messages = observed_requests[1]["messages"]
     assert expected_retry_error in retry_messages[-1]["content"]
@@ -2284,7 +2304,7 @@ def test_0009_to_0010_upgrade_preserves_predecessor_state_and_runs_cli_seam(
                     )
                     == "succeeded"
                 )
-                assert session.scalar(text("SELECT version_num FROM alembic_version")) == "0012"
+                assert session.scalar(text("SELECT version_num FROM alembic_version")) == "0013"
                 assert (
                     session.scalar(
                         text(
