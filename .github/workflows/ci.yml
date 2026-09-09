@@ -186,7 +186,7 @@ jobs:
 
       - name: Publish the safe qualification report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: research-provider-qualification-pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
           path: reports/research-provider-qualification.json
