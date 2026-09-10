@@ -3,13 +3,7 @@ from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 PUBLIC_DEMO_URL = "https://bench-tencent-hk.ai-ledger.cn/"
-ROADMAP_ISSUES = {
-    70: "Repository productization and design-decision archive",
-    71: "Focused source portfolio",
-    72: "Editorial Agent Digest Plan",
-    73: "MiniLM Hybrid Retrieval and mMARCO",
-    74: "Comparison, timeline, and multi-hop Research",
-}
+MILESTONE_ISSUES = (70, 71, 72, 73, 74)
 GUIDE_PATHS = (
     "docs/guide/README.md",
     "docs/guide/01-product-loop.md",
@@ -41,34 +35,34 @@ def test_bilingual_readmes_share_stable_product_portal_structure() -> None:
     readmes = {
         "README.md": (
             "[English](README.md)",
-            "[简体中文](README.zh-CN.md)",
-            (
-                "## Product Loop",
-                "## Public Surfaces",
-                "## What Works Today",
-                "## Roadmap",
-                "## Learn the Project",
-                "## Documentation Map",
-                "## Repository Tree",
-                "## Quick Start",
-                "## Scope and Safety",
+                "[简体中文](README.zh-CN.md)",
+                (
+                    "## 🌱 Why AI Ledger",
+                    "## ✨ What works today",
+                    "## 🚀 Explore the product",
+                    "## ⚡ Run a deterministic sample",
+                    "## 🧭 How information becomes public knowledge",
+                    "## 🛡️ Trust and operating boundaries",
+                    "## 📚 Documentation",
+                    "## 🧪 Development",
+                    "## License",
+                ),
             ),
-        ),
         "README.zh-CN.md": (
             "[English](README.md)",
-            "[简体中文](README.zh-CN.md)",
-            (
-                "## 产品闭环",
-                "## 公共页面",
-                "## 当前可用能力",
-                "## 路线图",
-                "## 学习本项目",
-                "## 文档地图",
-                "## 仓库结构",
-                "## 快速开始",
-                "## 范围与安全边界",
+                "[简体中文](README.zh-CN.md)",
+                (
+                    "## 🌱 为什么需要 AI Ledger",
+                    "## ✨ 当前可用能力",
+                    "## 🚀 体验产品",
+                    "## ⚡ 运行确定性样例",
+                    "## 🧭 信息如何成为公共知识",
+                    "## 🛡️ 信任与运行边界",
+                    "## 📚 文档",
+                    "## 🧪 开发",
+                    "## License",
+                ),
             ),
-        ),
     }
 
     for relative_path, (english_link, chinese_link, headings) in readmes.items():
@@ -79,39 +73,46 @@ def test_bilingual_readmes_share_stable_product_portal_structure() -> None:
         assert tuple(readme.index(heading) for heading in headings) == tuple(
             sorted(readme.index(heading) for heading in headings)
         )
-        assert readme.count("```") == 2
+        assert readme.count("```") == 8
 
     assert _markdown_link_targets(_read("README.md")) == _markdown_link_targets(
         _read("README.zh-CN.md")
     )
 
 
-def test_bilingual_roadmaps_link_the_same_issues_and_tell_status_truth() -> None:
+def test_bilingual_milestone_links_defer_current_health_to_ci() -> None:
     english = _read("README.md")
     chinese = _read("README.zh-CN.md")
-    roadmap_sections = (
-        _section(english, "## Roadmap", "## Learn the Project"),
-        _section(chinese, "## 路线图", "## 学习本项目"),
+    capability_sections = (
+        _section(english, "## ✨ What works today", "## 🚀 Explore the product"),
+        _section(chinese, "## ✨ 当前可用能力", "## 🚀 体验产品"),
     )
 
-    for issue_number, title in ROADMAP_ISSUES.items():
+    for issue_number in MILESTONE_ISSUES:
         issue_url = f"https://github.com/Ev3rGan/ai-ledger/issues/{issue_number}"
-        for roadmap in roadmap_sections:
-            assert issue_url in roadmap
-            assert title in roadmap
+        for section in capability_sections:
+            assert issue_url in section
 
-    english_roadmap, chinese_roadmap = roadmap_sections
-    assert english_roadmap.count("| Delivered |") == 5
-    assert chinese_roadmap.count("| 已交付 |") == 5
-    assert (
-        "All five milestones have crossed their release gates and are available in the "
-        "official Demo."
-        in english_roadmap
-    )
-    assert "五个里程碑均已跨过发布门禁，并在官方演示站点可用。" in chinese_roadmap
-    for roadmap in roadmap_sections:
-        assert "[x]" not in roadmap.casefold()
-        assert "~~" not in roadmap
+    english_capabilities, chinese_capabilities = capability_sections
+    assert "M1–M5 product scopes and release records" in english_capabilities
+    assert "M1–M5 的产品范围与发布记录" in chinese_capabilities
+    assert "Current build health is reported by [CI]" in english_capabilities
+    assert "当前构建健康度以 [CI]" in chinese_capabilities
+    for section in capability_sections:
+        assert "M1-M4" not in section
+        assert "[x]" not in section.casefold()
+        assert "~~" not in section
+
+
+def test_bilingual_sample_quickstart_states_its_postgres_boundary() -> None:
+    english = _read("README.md")
+    chinese = _read("README.zh-CN.md")
+
+    assert "persists its publication to the configured PostgreSQL database" in english
+    assert "持久化到已配置的 PostgreSQL" in chinese
+    for readme in (english, chinese):
+        assert "AI_INTEL_DATABASE_URL" in readme
+        assert "uv run ai-intel-agent run --sample --output reports\\daily.md" in readme
 
 
 def test_learning_guide_and_documentation_map_are_complete() -> None:
