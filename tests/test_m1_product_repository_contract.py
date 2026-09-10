@@ -35,34 +35,34 @@ def test_bilingual_readmes_share_stable_product_portal_structure() -> None:
     readmes = {
         "README.md": (
             "[English](README.md)",
-                "[简体中文](README.zh-CN.md)",
-                (
-                    "## 🌱 Why AI Ledger",
-                    "## ✨ What works today",
-                    "## 🚀 Explore the product",
-                    "## ⚡ Run a deterministic sample",
-                    "## 🧭 How information becomes public knowledge",
-                    "## 🛡️ Trust and operating boundaries",
-                    "## 📚 Documentation",
-                    "## 🧪 Development",
-                    "## License",
-                ),
+            "[简体中文](README.zh-CN.md)",
+            (
+                "## 🌱 Why AI Ledger",
+                "## ✨ What works today",
+                "## 🚀 Explore the product",
+                "## ⚡ Run a deterministic sample",
+                "## 🧭 How information becomes public knowledge",
+                "## 🛡️ Trust and operating boundaries",
+                "## 📚 Documentation",
+                "## 🧪 Development",
+                "## License",
             ),
+        ),
         "README.zh-CN.md": (
             "[English](README.md)",
-                "[简体中文](README.zh-CN.md)",
-                (
-                    "## 🌱 为什么需要 AI Ledger",
-                    "## ✨ 当前可用能力",
-                    "## 🚀 体验产品",
-                    "## ⚡ 运行确定性样例",
-                    "## 🧭 信息如何成为公共知识",
-                    "## 🛡️ 信任与运行边界",
-                    "## 📚 文档",
-                    "## 🧪 开发",
-                    "## License",
-                ),
+            "[简体中文](README.zh-CN.md)",
+            (
+                "## 🌱 为什么需要 AI Ledger",
+                "## ✨ 当前可用能力",
+                "## 🚀 体验产品",
+                "## ⚡ 运行确定性样例",
+                "## 🧭 信息如何成为公共知识",
+                "## 🛡️ 信任与运行边界",
+                "## 📚 文档",
+                "## 🧪 开发",
+                "## License",
             ),
+        ),
     }
 
     for relative_path, (english_link, chinese_link, headings) in readmes.items():
