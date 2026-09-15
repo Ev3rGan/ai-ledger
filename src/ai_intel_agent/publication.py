@@ -38,6 +38,7 @@ PUBLIC_EVIDENCE_EXCERPT_MAX_CHARACTERS = 280
 @dataclass(frozen=True)
 class PublicEvidence:
     id: UUID
+    source_id: UUID
     exact_text: str
     role: EvidenceRole
     relation: EvidenceRelation
@@ -63,11 +64,10 @@ class PublicClaim:
             return EvidenceState.CONFLICT
 
         corroborating_sources = {
-            item.canonical_url
+            item.source_id
             for item in non_community
             if item.relation is EvidenceRelation.SUPPORTS
             and item.role in (EvidenceRole.PRIMARY, EvidenceRole.INDEPENDENT)
-            and item.canonical_url is not None
         }
         independently_confirmed = len(corroborating_sources) > 1 and any(
             item.role is EvidenceRole.INDEPENDENT for item in non_community
@@ -97,10 +97,12 @@ class PublicStory:
 
     @property
     def what_happened(self) -> PublicClaim | None:
+        """Map the first position-ordered Claim to the lead factual section."""
         return self.claims[0] if self.claims else None
 
     @property
     def key_changes(self) -> tuple[PublicClaim, ...]:
+        """Map remaining position-ordered Claims to the additional changes section."""
         return self.claims[1:]
 
 
@@ -274,6 +276,7 @@ class PublicContent:
                 EvidenceSpanRecord.exact_text,
                 EvidenceSpanRecord.role,
                 EvidenceSpanRecord.relation,
+                evidence_candidate.id.label("evidence_source_id"),
                 evidence_candidate.canonical_url,
                 evidence_candidate.publisher,
             )
@@ -387,6 +390,7 @@ class PublicContent:
                 claim.evidence.append(
                     PublicEvidence(
                         id=row.evidence_id,
+                        source_id=row.evidence_source_id,
                         exact_text=bounded_public_evidence_excerpt(row.exact_text),
                         role=EvidenceRole(row.role),
                         relation=EvidenceRelation(row.relation),
@@ -435,6 +439,8 @@ def _non_empty_text(value: str | None) -> str | None:
 
 def _public_http_url(value: str | None) -> str | None:
     if value is None:
+        return None
+    if value != value.strip() or any(ord(character) < 32 or ord(character) == 127 for character in value):
         return None
     parsed = urlsplit(value)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:

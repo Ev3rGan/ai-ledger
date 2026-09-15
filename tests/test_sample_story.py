@@ -22,6 +22,7 @@ from ai_intel_agent.domain import (
     DigestState,
     EvidenceRelation,
     EvidenceRole,
+    EvidenceState,
     StoryReviewState,
 )
 from ai_intel_agent.editorial import DigestPublicationContract
@@ -41,7 +42,7 @@ from ai_intel_agent.persistence import (
     upgrade_database,
 )
 from ai_intel_agent.pipeline import persist_sample_story, publish_sample_digest
-from ai_intel_agent.publication import PublicContent
+from ai_intel_agent.publication import PublicContent, _public_http_url
 from ai_intel_agent.sample import build_sample_story
 from ai_intel_agent.web import create_app
 
@@ -289,6 +290,37 @@ def test_public_content_degrades_historical_fields_without_exposing_private_data
 
 
 @pytest.mark.postgres
+def test_story_without_claims_has_one_combined_content_empty_state(
+    postgres_url: str, empty_database
+) -> None:
+    sample = build_sample_story()
+    SampleStoryRepository(empty_database).persist(sample)
+
+    with Session(empty_database) as session:
+        session.execute(
+            delete(TraceRecord).where(TraceRecord.evidence_span_id == sample.evidence_span.id)
+        )
+        session.execute(
+            delete(EvidenceSpanRecord).where(EvidenceSpanRecord.id == sample.evidence_span.id)
+        )
+        session.execute(delete(ClaimRecord).where(ClaimRecord.id == sample.claim.id))
+        _publish_story_record(
+            session,
+            story_id=sample.story.id,
+            publication_date=date(2026, 8, 12),
+        )
+        session.commit()
+
+    with TestClient(create_app(postgres_url)) as client:
+        response = client.get("/stories/sample-story-v1")
+
+    assert response.status_code == 200
+    assert response.text.count("暂无可公开的事实与关键变化") == 1
+    assert "暂无可公开的事件说明" not in response.text
+    assert "暂无更多可公开的关键变化" not in response.text
+
+
+@pytest.mark.postgres
 def test_public_content_preserves_partial_presentation_without_public_evidence(
     postgres_url: str, empty_database
 ) -> None:
@@ -385,6 +417,21 @@ def test_public_templates_autoescape_every_persisted_story_field(
     assert markup not in response.text
     assert "&lt;script data-private=&#34;story&#34;&gt;" in response.text
     assert 'href="https://example.com/?next=&#34;&gt;&lt;script&gt;' in response.text
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "https://example.com/a\nb",
+        "https://example.com/a\tb",
+        "https://example.com/a\x00b",
+        " https://example.com/a",
+    ),
+)
+def test_public_http_url_rejects_control_characters_and_surrounding_whitespace(
+    value: str,
+) -> None:
+    assert _public_http_url(value) is None
 
 
 @pytest.mark.postgres
@@ -945,6 +992,48 @@ def test_two_independent_sources_are_multi_source_for_the_same_claim(
     assert story.status_code == 200
     assert 'data-evidence-state="multi-source"' in story.text
     assert "多来源" in story.text
+
+
+@pytest.mark.postgres
+def test_link_filtering_does_not_change_claim_evidence_state(
+    postgres_url: str, empty_database
+) -> None:
+    original_sample = build_sample_story()
+    primary_url = "ftp://primary.example.com/fact"
+    sample = replace(
+        original_sample,
+        candidate=replace(original_sample.candidate, canonical_url=primary_url),
+        document_version=replace(original_sample.document_version, source_url=primary_url),
+    )
+    SampleStoryRepository(empty_database).persist(sample)
+
+    with Session(empty_database) as session:
+        session.execute(
+            update(EvidenceSpanRecord)
+            .where(EvidenceSpanRecord.id == sample.evidence_span.id)
+            .values(role=EvidenceRole.INDEPENDENT.value)
+        )
+        _insert_evidence_source(
+            session,
+            claim_id=sample.claim.id,
+            canonical_url="ftp://independent.example.com/confirmation",
+            publisher="独立确认者",
+            evidence_text="独立确认了相同的 Claim",
+            role=EvidenceRole.INDEPENDENT,
+        )
+        _publish_story_record(
+            session,
+            story_id=sample.story.id,
+            publication_date=date(2026, 8, 13),
+        )
+        session.commit()
+
+    story = PublicContent(empty_database).published_story("sample-story-v1")
+
+    assert story is not None
+    assert story.what_happened is not None
+    assert all(evidence.canonical_url is None for evidence in story.what_happened.evidence)
+    assert story.what_happened.evidence_state is EvidenceState.MULTI_SOURCE
 
 
 @pytest.mark.postgres

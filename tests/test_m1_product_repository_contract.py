@@ -1,5 +1,8 @@
 import re
+import shutil
+import subprocess
 from pathlib import Path
+from zipfile import ZipFile
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 PUBLIC_DEMO_URL = "https://bench-tencent-hk.ai-ledger.cn/"
@@ -11,6 +14,19 @@ GUIDE_PATHS = (
     "docs/guide/03-repository-tour.md",
     "docs/guide/04-agent-human-boundaries.md",
     "docs/guide/05-retrieval-and-research.md",
+)
+PUBLIC_TEMPLATE_PATHS = (
+    "ai_intel_agent/templates/archive.html",
+    "ai_intel_agent/templates/base.html",
+    "ai_intel_agent/templates/browse.html",
+    "ai_intel_agent/templates/components.html",
+    "ai_intel_agent/templates/digest.html",
+    "ai_intel_agent/templates/fragments/entry_points.html",
+    "ai_intel_agent/templates/fragments/story_cards.html",
+    "ai_intel_agent/templates/home.html",
+    "ai_intel_agent/templates/research.html",
+    "ai_intel_agent/templates/rss.html",
+    "ai_intel_agent/templates/story.html",
 )
 
 
@@ -233,3 +249,22 @@ def test_current_docs_retire_direct_publication_and_classify_legacy_flows() -> N
     assert "18 enabled Source Profiles" in production_runbook
     assert "No legacy flow is deleted by Issue #119" in " ".join(inventory.split())
     assert "#120" in inventory
+
+
+def test_built_wheel_contains_every_public_template(tmp_path: Path) -> None:
+    uv = shutil.which("uv")
+    assert uv is not None, "uv is required to verify the distributable wheel"
+    subprocess.run(
+        (uv, "build", "--wheel", "--out-dir", str(tmp_path)),
+        cwd=REPOSITORY_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    wheels = tuple(tmp_path.glob("*.whl"))
+    assert len(wheels) == 1
+
+    with ZipFile(wheels[0]) as wheel:
+        packaged_files = set(wheel.namelist())
+
+    assert set(PUBLIC_TEMPLATE_PATHS) <= packaged_files
