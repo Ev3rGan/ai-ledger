@@ -192,9 +192,11 @@ def create_app(
                 page_name="story",
                 title=story.headline,
                 story=story,
-                evidence_state_labels=EVIDENCE_STATE_LABELS,
-                evidence_role_labels=EVIDENCE_ROLE_LABELS,
-                evidence_relation_labels=EVIDENCE_RELATION_LABELS,
+                evidence_labels={
+                    "states": EVIDENCE_STATE_LABELS,
+                    "roles": EVIDENCE_ROLE_LABELS,
+                    "relations": EVIDENCE_RELATION_LABELS,
+                },
             )
         )
 

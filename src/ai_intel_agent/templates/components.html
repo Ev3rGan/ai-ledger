@@ -9,18 +9,18 @@
 </article>
 {%- endmacro %}
 
-{% macro claim_item(claim, label, evidence_state_labels, evidence_role_labels, evidence_relation_labels) -%}
+{% macro claim_item(claim, label, evidence_labels) -%}
 <section class="key-fact" id="claim-{{ claim.id }}" data-evidence-state="{{ claim.evidence_state.value }}">
   <h3>{{ label }}</h3>
   <p>{{ claim.text }}</p>
   {% if claim.evidence %}
   <details class="source-details">
     <summary>来源与 Evidence</summary>
-    <p class="source-meta">{{ evidence_state_labels[claim.evidence_state] }}</p>
+    <p class="source-meta">{{ evidence_labels.states[claim.evidence_state] }}</p>
     {% for evidence in claim.evidence %}
     <div class="evidence-item">
       <blockquote id="evidence-{{ evidence.id }}">{{ evidence.exact_text }}</blockquote>
-      <p class="source-meta">{{ evidence.publisher }} · {{ evidence_role_labels[evidence.role] }} · {{ evidence_relation_labels[evidence.relation] }}</p>
+      <p class="source-meta">{{ evidence.publisher }} · {{ evidence_labels.roles[evidence.role] }} · {{ evidence_labels.relations[evidence.relation] }}</p>
       {% if evidence.canonical_url %}<p><a href="{{ evidence.canonical_url }}" rel="noopener noreferrer">查看 {{ evidence.publisher }} 原文</a></p>{% endif %}
     </div>
     {% endfor %}

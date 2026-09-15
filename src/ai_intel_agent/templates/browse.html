@@ -1,5 +1,4 @@
 {% extends "base.html" %}
-{% from "components.html" import story_card %}
 {% block content %}
 <header class="page-header"><p class="eyebrow">Published knowledge</p><h1>Browse</h1><p class="lede">按关键词、发布者、主题和原始发布日期查找已发布内容。</p></header>
 <section id="browse-app" data-vue-mount="browse" aria-label="Browse 交互边界">
@@ -11,6 +10,6 @@
     <button type="submit">筛选</button>
   </form>
   <p class="muted">找到 {{ stories|length }} 条 Story</p>
-  {% if stories %}<div class="story-grid">{% for story in stories %}{{ story_card(story, story_url(story.stable_key)) }}{% endfor %}</div>{% else %}<p class="empty-state">没有符合这些条件的已发布 Story。</p>{% endif %}
+  {% if stories %}<div class="story-grid">{% include "fragments/story_cards.html" %}</div>{% else %}<p class="empty-state">没有符合这些条件的已发布 Story。</p>{% endif %}
 </section>
 {% endblock %}
