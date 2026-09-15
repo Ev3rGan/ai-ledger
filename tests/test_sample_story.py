@@ -289,6 +289,51 @@ def test_public_content_degrades_historical_fields_without_exposing_private_data
 
 
 @pytest.mark.postgres
+def test_public_content_preserves_partial_presentation_without_public_evidence(
+    postgres_url: str, empty_database
+) -> None:
+    sample = build_sample_story()
+    SampleStoryRepository(empty_database).persist(sample)
+
+    with Session(empty_database) as session:
+        presentation = session.get(StoryPresentationRecord, sample.story.id)
+        assert presentation is not None
+        expected_summary = presentation.summary
+        expected_why_it_matters = presentation.why_it_matters
+        session.execute(
+            delete(TraceRecord).where(
+                TraceRecord.evidence_span_id == sample.evidence_span.id
+            )
+        )
+        session.execute(
+            delete(EvidenceSpanRecord).where(
+                EvidenceSpanRecord.id == sample.evidence_span.id
+            )
+        )
+        _publish_story_record(
+            session,
+            story_id=sample.story.id,
+            publication_date=date(2026, 8, 12),
+        )
+        session.commit()
+
+    story = PublicContent(empty_database).published_story("sample-story-v1")
+    assert story is not None
+    assert story.lead == expected_summary
+    assert story.why_it_matters == expected_why_it_matters
+    assert story.what_happened is not None
+    assert story.what_happened.evidence == ()
+
+    with TestClient(create_app(postgres_url)) as client:
+        response = client.get("/stories/sample-story-v1")
+
+    assert response.status_code == 200
+    assert expected_summary in response.text
+    assert expected_why_it_matters in response.text
+    assert "证据不足：尚无可公开的来源依据" in response.text
+
+
+@pytest.mark.postgres
 def test_public_templates_autoescape_every_persisted_story_field(
     postgres_url: str, empty_database
 ) -> None:

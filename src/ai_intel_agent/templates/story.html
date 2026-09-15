@@ -17,6 +17,6 @@
     {% for claim in story.key_changes %}{{ claim_item(claim, "变化 " ~ loop.index, evidence_state_labels, evidence_role_labels, evidence_relation_labels) }}{% else %}<p class="empty-state">暂无更多可公开的关键变化。</p>{% endfor %}
   </section>
   <section class="importance" aria-labelledby="importance-heading"><h2 id="importance-heading">为什么重要</h2>{% if story.why_it_matters %}<p>{{ story.why_it_matters }}</p>{% else %}<p>暂无可公开的影响说明。</p>{% endif %}</section>
-  <details class="source-details"><summary>来源与依据（Evidence）总览</summary><p class="source-meta">来源信息按已发布 Story 的持久化来源原样呈现。</p>{% if story.source_url %}<a class="source-link" href="{{ story.source_url }}" rel="noopener noreferrer">阅读 {{ story.publisher }} 原文</a>{% else %}<p class="source-meta">暂无安全的公开来源链接。</p>{% endif %}</details>
+  <details class="source-details"><summary>来源与依据（Evidence）总览</summary><p class="source-meta">来源信息按已发布 Story 的持久化来源原样呈现。</p>{% if story.canonical_url %}<a class="source-link" href="{{ story.canonical_url }}" rel="noopener noreferrer">阅读 {{ story.publisher }} 原文</a>{% else %}<p class="source-meta">暂无安全的公开来源链接。</p>{% endif %}</details>
 </article>
 {% endblock %}

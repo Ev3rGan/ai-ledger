@@ -21,7 +21,7 @@
     <div class="evidence-item">
       <blockquote id="evidence-{{ evidence.id }}">{{ evidence.exact_text }}</blockquote>
       <p class="source-meta">{{ evidence.publisher }} · {{ evidence_role_labels[evidence.role] }} · {{ evidence_relation_labels[evidence.relation] }}</p>
-      {% if evidence.source_url %}<p><a href="{{ evidence.source_url }}" rel="noopener noreferrer">查看 {{ evidence.publisher }} 原文</a></p>{% endif %}
+      {% if evidence.canonical_url %}<p><a href="{{ evidence.canonical_url }}" rel="noopener noreferrer">查看 {{ evidence.publisher }} 原文</a></p>{% endif %}
     </div>
     {% endfor %}
   </details>

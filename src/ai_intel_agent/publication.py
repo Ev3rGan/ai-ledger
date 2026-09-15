@@ -41,13 +41,8 @@ class PublicEvidence:
     exact_text: str
     role: EvidenceRole
     relation: EvidenceRelation
-    source_url: str | None
+    canonical_url: str | None
     publisher: str
-
-    @property
-    def canonical_url(self) -> str | None:
-        """Keep the legacy projection name while exposing only a safe public URL."""
-        return self.source_url
 
 
 @dataclass(frozen=True)
@@ -68,11 +63,11 @@ class PublicClaim:
             return EvidenceState.CONFLICT
 
         corroborating_sources = {
-            item.source_url
+            item.canonical_url
             for item in non_community
             if item.relation is EvidenceRelation.SUPPORTS
             and item.role in (EvidenceRole.PRIMARY, EvidenceRole.INDEPENDENT)
-            and item.source_url is not None
+            and item.canonical_url is not None
         }
         independently_confirmed = len(corroborating_sources) > 1 and any(
             item.role is EvidenceRole.INDEPENDENT for item in non_community
@@ -92,7 +87,7 @@ class PublicStory:
     primary_topic: Topic | None
     secondary_topics: tuple[Topic, ...]
     publisher: str
-    source_url: str | None
+    canonical_url: str | None
     original_published_at: datetime | None
     claims: tuple[PublicClaim, ...]
 
@@ -107,11 +102,6 @@ class PublicStory:
     @property
     def key_changes(self) -> tuple[PublicClaim, ...]:
         return self.claims[1:]
-
-    @property
-    def canonical_url(self) -> str | None:
-        """Keep the legacy projection name while exposing only a safe public URL."""
-        return self.source_url
 
 
 @dataclass(frozen=True)
@@ -400,7 +390,7 @@ class PublicContent:
                         exact_text=bounded_public_evidence_excerpt(row.exact_text),
                         role=EvidenceRole(row.role),
                         relation=EvidenceRelation(row.relation),
-                        source_url=_public_http_url(row.canonical_url),
+                        canonical_url=_public_http_url(row.canonical_url),
                         publisher=row.publisher,
                     )
                 )
@@ -415,7 +405,7 @@ class PublicContent:
                 primary_topic=story.primary_topic,
                 secondary_topics=story.secondary_topics,
                 publisher=story.publisher,
-                source_url=_public_http_url(story.canonical_url),
+                canonical_url=_public_http_url(story.canonical_url),
                 original_published_at=story.original_published_at,
                 claims=tuple(
                     PublicClaim(

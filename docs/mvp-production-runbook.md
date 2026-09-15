@@ -246,13 +246,14 @@ groups, plus one disabled authorization-required profile. Treat
 current source-count authorities; the four URLs above remain a bounded historical acceptance set.
 
 Do not run `collect-sources`, start a live backfill, or let the M2 Scheduler reach a collection
-slot until the supervisor explicitly authorizes the applicable live-acceptance gate. After authorization,
-use only the four historical live-probe Source Profiles and record URLs, response status/behavior,
-counters, and identifiers—not raw fetched bodies or credentials. Verify TechCrunch discovery uses
-only its AI category Feed; one forced source failure leaves useful results from the other sources; and a
-same-key replay plus a new-key unchanged-cursor run creates no duplicates. Run
+slot until the supervisor explicitly authorizes the applicable live-acceptance gate. Do not rerun
+the historical four-feed probe as current activation policy. After authorization, use the enabled
+versioned Source Profiles and record URLs, response status/behavior, counters, and identifiers—not
+raw fetched bodies or credentials. Verify each source follows its versioned discovery and body
+policy; one forced source failure leaves useful results from the other sources; and a same-key
+replay plus a new-key unchanged-cursor run creates no duplicates. Run
 `operator source-status --production` before and after collection and preserve the M1 acceptance
-record above. A missing real Feed/article observation, real budgeted Provider draft, idempotency
+record above as history only. A missing real source observation, real budgeted Provider draft, idempotency
 proof, source-isolation proof, or exact Candidate-to-Evidence provenance leaves M2 live acceptance
 incomplete.
 
