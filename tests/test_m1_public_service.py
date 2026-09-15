@@ -751,7 +751,7 @@ def test_production_caddy_proxy_emits_https_absolute_rss_links(
         lambda *_: None,
     )
     monkeypatch.setattr(web_module, "create_database_engine", lambda _: engine)
-    monkeypatch.setattr(web_module, "PublicPublicationRepository", lambda _: repository)
+    monkeypatch.setattr(web_module, "PublicContent", lambda _: repository)
     monkeypatch.setattr(sys.modules["uvicorn"], "run", run_server)
 
     result = runner.invoke(

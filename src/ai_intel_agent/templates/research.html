@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block content %}
+<header class="page-header"><p class="eyebrow">Published knowledge, cited</p><h1>Research</h1><p class="lede">在已发布 Hybrid 知识中完成简单查找、比较、时间线与有界多跳，并沿引用返回具体事实与原始来源。</p></header>
+<section aria-labelledby="research-capabilities"><h2 id="research-capabilities">支持什么</h2><div class="capability-grid">
+  <article class="capability-card"><h3>已发布知识</h3><p>仅检索已接受且已发布的知识；Hybrid 降级时保留明确的检索降级状态，草稿和已拒绝内容不会进入答案。</p></article>
+  <article class="capability-card"><h3>简单查找与比较</h3><p>简单查找回答一个受支持事实；比较会保留请求维度、Claim 限定和不同 Evidence Role。</p></article>
+  <article class="capability-card"><h3>时间线与有界多跳</h3><p>时间线区分事件、来源发布、发现、编辑与 Digest 发布时间；有界多跳只执行有限检索调用。</p></article>
+  <article class="capability-card"><h3>可追溯引用与明确拒答</h3><p>每个材料性陈述引用公开 Story、Claim 与 Evidence；证据不足时会明确拒答。</p></article>
+</div></section>
+<aside class="boundary-note"><h2>边界提示</h2><p>Research 不会联网搜索；它只回答当前公开知识库能够支持的问题。</p></aside>
+<section id="research-app" data-vue-mount="research" aria-label="Research 交互边界">
+  <section aria-labelledby="research-examples-heading"><h2 id="research-examples-heading">试试这些问题</h2><div class="research-examples">{% for question in examples %}<button class="research-example" type="button" data-question="{{ question }}">{{ question }}</button>{% else %}<p class="muted">当前没有可由已发布知识支持的示例问题。</p>{% endfor %}</div></section>
+  <section class="research-panel" aria-labelledby="research-question-heading"><h2 id="research-question-heading">如何提问</h2><p>选择一个示例或输入一个具体问题；示例只会填入文本框，提交仍由你决定。</p>
+    <form id="research-form"><label for="research-question">你的问题</label><textarea id="research-question" maxlength="500" rows="4" required></textarea><button type="submit">查找答案</button></form>
+    <div class="research-results" aria-live="polite"><p id="research-status" role="status"></p><p id="research-answer"></p><p id="research-refusal"></p><ul id="research-citations"></ul></div>
+  </section>
+</section>
+<script>
+(() => {
+  const form = document.getElementById("research-form");
+  const question = document.getElementById("research-question");
+  const examples = document.querySelectorAll(".research-example");
+  const status = document.getElementById("research-status");
+  const answer = document.getElementById("research-answer");
+  const refusal = document.getElementById("research-refusal");
+  const citations = document.getElementById("research-citations");
+  for (const button of examples) button.addEventListener("click", () => { question.value = button.dataset.question; question.focus(); });
+  function handleEvent(block) {
+    let event = ""; let data = "";
+    for (const line of block.split("\n")) { if (line.startsWith("event: ")) event = line.slice(7); if (line.startsWith("data: ")) data += line.slice(6); }
+    if (!event || !data) return;
+    const payload = JSON.parse(data);
+    if (event === "status") {
+      const progress = {"retrieving":"正在解释问题并检索…","retrieval-degraded":"检索降级：正在使用已声明的 fallback…","evidence-assembled":"Evidence Set 已汇总…","generating":"正在生成有依据的答案…","verifying-citations":"正在校验引用…"};
+      status.textContent = payload.state === "generating" && payload.retrieval_degraded ? "检索已降级；正在生成有依据的答案…" : progress[payload.state] || "Research 正在处理…";
+    } else if (event === "answer.delta") answer.textContent += payload.text;
+    else if (event === "citation") {
+      const item = document.createElement("li"); const link = document.createElement("a"); link.href = payload.evidence_url;
+      const roleLabels = {"primary":"第一方证据","independent":"独立证据","secondary":"二手证据"};
+      const timeSemanticLabels = {
+        "event": "事件时间",
+        "source-publication": "来源发布时间",
+        "discovery": "发现时间",
+        "editorial": "编辑时间",
+        "digest-publication": "Digest 发布时间",
+      };
+      const role = roleLabels[payload.evidence_role] || "公开证据";
+      const statements = (payload.statement_support || []).map((support) => { const timeLabel = timeSemanticLabels[support.time_semantic]; return `陈述 ${support.statement_index}${timeLabel ? `（${timeLabel}）` : ""}`; }).join("、");
+      link.textContent = `${statements} — ${payload.story_title} — ${payload.claim_text} — ${role} — ${payload.evidence_text}`; item.appendChild(link); citations.appendChild(item);
+    } else if (event === "refusal" || event === "error") refusal.textContent = payload.message;
+    else if (event === "done") status.textContent = payload.status === "answered" ? "回答完成" : "已结束";
+  }
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault(); answer.textContent = ""; refusal.textContent = ""; citations.replaceChildren(); status.textContent = "正在连接…";
+    try {
+      const response = await fetch("/research/answer", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({question:question.value})});
+      if (!response.ok || !response.body) throw new Error("Research request failed");
+      const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = "";
+      while (true) { const {value,done} = await reader.read(); buffer += decoder.decode(value || new Uint8Array(), {stream:!done}); let boundary; while ((boundary = buffer.indexOf("\n\n")) >= 0) { handleEvent(buffer.slice(0,boundary)); buffer = buffer.slice(boundary + 2); } if (done) break; }
+    } catch (_) { status.textContent = "请求失败"; refusal.textContent = "Research 服务当前不可用。"; }
+  });
+})();
+</script>
+{% endblock %}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import replace
 from datetime import UTC, date, datetime
 from hashlib import sha256
@@ -11,7 +12,7 @@ from xml.etree import ElementTree
 import pytest
 from fastapi.testclient import TestClient
 from pg0 import Pg0
-from sqlalchemy import func, insert, select, text, update
+from sqlalchemy import delete, func, insert, select, text, update
 from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm import Session
 from typer.testing import CliRunner
@@ -33,12 +34,14 @@ from ai_intel_agent.persistence import (
     DocumentVersionRecord,
     EvidenceSpanRecord,
     SampleStoryRepository,
+    StoryPresentationRecord,
     StoryRecord,
     TraceRecord,
     create_database_engine,
     upgrade_database,
 )
 from ai_intel_agent.pipeline import persist_sample_story, publish_sample_digest
+from ai_intel_agent.publication import PublicContent
 from ai_intel_agent.sample import build_sample_story
 from ai_intel_agent.web import create_app
 
@@ -187,6 +190,156 @@ def _insert_evidence_source(
             relation=relation.value,
         )
     )
+
+
+@pytest.mark.postgres
+def test_every_public_page_is_complete_server_rendered_html_without_javascript(
+    postgres_url: str, empty_database
+) -> None:
+    publish_sample_digest(postgres_url)
+    pages = (
+        ("/", "home", "AI Agent 用任务轨迹支持结果复现"),
+        ("/digests/2026-08-12", "digest", "今日重点"),
+        ("/archive", "archive", "2026-08-12 AI Digest"),
+        ("/stories/sample-story-v1", "story", "发生了什么"),
+        ("/browse", "browse", "AI Agent 用任务轨迹支持结果复现"),
+        ("/research", "research", "Research 不会联网搜索"),
+        ("/rss", "rss", "/rss.xml"),
+    )
+
+    with TestClient(create_app(postgres_url)) as client:
+        responses = tuple(
+            (page_name, expected_text, client.get(path))
+            for path, page_name, expected_text in pages
+        )
+
+    for page_name, expected_text, response in responses:
+        html_without_scripts = re.sub(
+            r"<script\b.*?</script>",
+            "",
+            response.text,
+            flags=re.DOTALL,
+        )
+        assert response.status_code == 200
+        assert response.text.startswith("<!doctype html>")
+        assert f'data-public-page="{page_name}"' in response.text
+        assert expected_text in html_without_scripts
+
+    rendered_by_name = {page_name: response.text for page_name, _, response in responses}
+    assert 'data-vue-mount="browse"' in rendered_by_name["browse"]
+    assert 'data-vue-mount="research"' in rendered_by_name["research"]
+
+
+@pytest.mark.postgres
+def test_public_content_degrades_historical_fields_without_exposing_private_data(
+    postgres_url: str, empty_database
+) -> None:
+    private_body = "PRIVATE_DOCUMENT_BODY_NOT_FOR_PUBLICATION"
+    internal_prompt = "PRIVATE_INTERNAL_PROMPT"
+    operator_identity = "PRIVATE_OPERATOR_IDENTITY"
+    original_sample = build_sample_story()
+    document_body = f"{original_sample.document_version.body}\n{private_body}"
+    sample = replace(
+        original_sample,
+        document_version=replace(
+            original_sample.document_version,
+            body=document_body,
+            content_hash=sha256(document_body.encode("utf-8")).hexdigest(),
+        ),
+        trace=replace(
+            original_sample.trace,
+            attributes={"system_prompt": internal_prompt, "operator": operator_identity},
+        ),
+    )
+    SampleStoryRepository(empty_database).persist(sample)
+
+    with Session(empty_database) as session:
+        session.execute(
+            delete(StoryPresentationRecord).where(
+                StoryPresentationRecord.story_id == sample.story.id
+            )
+        )
+        _publish_story_record(
+            session,
+            story_id=sample.story.id,
+            publication_date=date(2026, 8, 12),
+        )
+        session.commit()
+
+    story = PublicContent(empty_database).published_story("sample-story-v1")
+    assert story is not None
+    assert story.lead is None
+    assert story.why_it_matters is None
+    assert story.what_happened is not None
+    assert story.key_changes == ()
+    assert not hasattr(story, "document_body")
+    assert not hasattr(story, "operator")
+    assert not hasattr(story, "internal_prompt")
+
+    with TestClient(create_app(postgres_url)) as client:
+        response = client.get("/stories/sample-story-v1")
+
+    assert response.status_code == 200
+    assert "暂无可公开的导语" in response.text
+    assert "暂无可公开的影响说明" in response.text
+    assert "暂无更多可公开的关键变化" in response.text
+    assert private_body not in response.text
+    assert internal_prompt not in response.text
+    assert operator_identity not in response.text
+
+
+@pytest.mark.postgres
+def test_public_templates_autoescape_every_persisted_story_field(
+    postgres_url: str, empty_database
+) -> None:
+    markup = '<script data-private="story">alert("unsafe")</script>'
+    unsafe_url = 'https://example.com/?next="><script>alert("url")</script>'
+    original_sample = build_sample_story()
+    sample = replace(
+        original_sample,
+        candidate=replace(
+            original_sample.candidate,
+            canonical_url=unsafe_url,
+            publisher=markup,
+        ),
+        document_version=replace(
+            original_sample.document_version,
+            source_url=unsafe_url,
+            body=markup,
+            content_hash=sha256(markup.encode("utf-8")).hexdigest(),
+        ),
+        story=replace(original_sample.story, headline=markup),
+        claim=replace(original_sample.claim, text=markup),
+        evidence_span=replace(
+            original_sample.evidence_span,
+            exact_text=markup,
+            start_offset=0,
+            end_offset=len(markup),
+            text_hash=sha256(markup.encode("utf-8")).hexdigest(),
+        ),
+    )
+    SampleStoryRepository(empty_database).persist(sample)
+
+    with Session(empty_database) as session:
+        session.execute(
+            update(StoryPresentationRecord)
+            .where(StoryPresentationRecord.story_id == sample.story.id)
+            .values(summary=markup, why_it_matters=markup)
+        )
+        _publish_story_record(
+            session,
+            story_id=sample.story.id,
+            publication_date=date(2026, 8, 12),
+        )
+        session.commit()
+
+    with TestClient(create_app(postgres_url)) as client:
+        response = client.get("/stories/sample-story-v1")
+
+    assert response.status_code == 200
+    assert markup not in response.text
+    assert "&lt;script data-private=&#34;story&#34;&gt;" in response.text
+    assert 'href="https://example.com/?next=&#34;&gt;&lt;script&gt;' in response.text
 
 
 @pytest.mark.postgres

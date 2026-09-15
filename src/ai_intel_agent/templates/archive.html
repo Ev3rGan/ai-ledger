@@ -1,0 +1,6 @@
+{% extends "base.html" %}
+{% from "components.html" import story_card %}
+{% block content %}
+<header class="page-header"><p class="eyebrow">Published history</p><h1>Digest archive</h1><p class="lede">浏览仍公开可见的历史 Digest。</p></header>
+{% for digest in digests %}<section class="archive-entry"><h2><a href="/digests/{{ digest.publication_date.isoformat() }}">{{ digest.publication_date.isoformat() }} AI Digest</a></h2>{% if digest.introduction %}<p class="lede">{{ digest.introduction }}</p>{% endif %}<div class="story-grid">{% for story in digest.stories %}{{ story_card(story, story_url(story.stable_key)) }}{% endfor %}</div></section>{% else %}<p class="empty-state">暂无已发布 Digest。</p>{% endfor %}
+{% endblock %}

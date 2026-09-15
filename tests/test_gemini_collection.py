@@ -300,6 +300,13 @@ def test_collect_gemini_cli_keeps_one_story_when_source_revision_changes(
     assert "document_versions_created=0" in third.output
     assert "drafts_created=0" in third.output
     assert len(provider_calls) == 1
+    provider_messages = provider_calls[0]["messages"]
+    assert [message["role"] for message in provider_messages] == ["system", "user"]
+    system_prompt = provider_messages[0]["content"]
+    assert "exactly headline and claims" in system_prompt
+    assert "normalized Simplified Chinese" in system_prompt
+    assert "consistent terminology" in system_prompt
+    assert "one coherent editorial voice" in system_prompt
 
     engine = create_database_engine(gemini_database_url)
     try:
@@ -371,7 +378,7 @@ def test_collect_gemini_cli_keeps_one_story_when_source_revision_changes(
     } == {"deepseek:v4-pro"}
     assert {
         trace.attributes["prompt_version"] for trace in traces
-    } == {"gemini-draft-prompt-2026-08-18.v2"}
+    } == {"gemini-draft-prompt-2026-09-15.v3"}
     assert {
         trace.attributes["routing_evaluation_version"] for trace in traces
     } == {"model-routing-evaluation-2026-08-12.v1"}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from sqlalchemy import Select, exists, func, select
@@ -40,8 +41,13 @@ class PublicEvidence:
     exact_text: str
     role: EvidenceRole
     relation: EvidenceRelation
-    canonical_url: str
+    source_url: str | None
     publisher: str
+
+    @property
+    def canonical_url(self) -> str | None:
+        """Keep the legacy projection name while exposing only a safe public URL."""
+        return self.source_url
 
 
 @dataclass(frozen=True)
@@ -62,10 +68,11 @@ class PublicClaim:
             return EvidenceState.CONFLICT
 
         corroborating_sources = {
-            item.canonical_url
+            item.source_url
             for item in non_community
             if item.relation is EvidenceRelation.SUPPORTS
             and item.role in (EvidenceRole.PRIMARY, EvidenceRole.INDEPENDENT)
+            and item.source_url is not None
         }
         independently_confirmed = len(corroborating_sources) > 1 and any(
             item.role is EvidenceRole.INDEPENDENT for item in non_community
@@ -85,9 +92,26 @@ class PublicStory:
     primary_topic: Topic | None
     secondary_topics: tuple[Topic, ...]
     publisher: str
-    canonical_url: str
+    source_url: str | None
     original_published_at: datetime | None
     claims: tuple[PublicClaim, ...]
+
+    @property
+    def lead(self) -> str | None:
+        return _non_empty_text(self.summary)
+
+    @property
+    def what_happened(self) -> PublicClaim | None:
+        return self.claims[0] if self.claims else None
+
+    @property
+    def key_changes(self) -> tuple[PublicClaim, ...]:
+        return self.claims[1:]
+
+    @property
+    def canonical_url(self) -> str | None:
+        """Keep the legacy projection name while exposing only a safe public URL."""
+        return self.source_url
 
 
 @dataclass(frozen=True)
@@ -123,8 +147,8 @@ class _StoryBuilder:
     claims_by_id: dict[UUID, _ClaimBuilder] = field(default_factory=dict)
 
 
-class PublicPublicationRepository:
-    """Read the bounded public projection of published Digests."""
+class PublicContent:
+    """Own the bounded, public-safe projection consumed by every public surface."""
 
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
@@ -376,7 +400,7 @@ class PublicPublicationRepository:
                         exact_text=bounded_public_evidence_excerpt(row.exact_text),
                         role=EvidenceRole(row.role),
                         relation=EvidenceRelation(row.relation),
-                        canonical_url=row.canonical_url,
+                        source_url=_public_http_url(row.canonical_url),
                         publisher=row.publisher,
                     )
                 )
@@ -391,7 +415,7 @@ class PublicPublicationRepository:
                 primary_topic=story.primary_topic,
                 secondary_topics=story.secondary_topics,
                 publisher=story.publisher,
-                canonical_url=story.canonical_url,
+                source_url=_public_http_url(story.canonical_url),
                 original_published_at=story.original_published_at,
                 claims=tuple(
                     PublicClaim(
@@ -410,3 +434,23 @@ def bounded_public_evidence_excerpt(exact_text: str) -> str:
     if len(exact_text) <= PUBLIC_EVIDENCE_EXCERPT_MAX_CHARACTERS:
         return exact_text
     return exact_text[: PUBLIC_EVIDENCE_EXCERPT_MAX_CHARACTERS - 1] + "…"
+
+
+def _non_empty_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _public_http_url(value: str | None) -> str | None:
+    if value is None:
+        return None
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return value
+
+
+# Compatibility name for internal callers migrating to the unified PublicContent boundary.
+PublicPublicationRepository = PublicContent

@@ -1,0 +1,6 @@
+{% extends "base.html" %}
+{% block content %}
+<header class="page-header"><p class="eyebrow">Follow every edition</p><h1>RSS 订阅</h1><p class="lede">RSS 是供阅读器订阅的机器可读更新流。每次发布 Digest 后，你的阅读器都能收到新一期及其 Story。</p></header>
+<section class="subscription-card" aria-labelledby="rss-address-heading"><h2 id="rss-address-heading">订阅地址</h2><p>将下面的地址复制到你的 RSS 阅读器。直接打开时看到 XML 文本是正常的。</p><code class="rss-address">/rss.xml</code><a class="primary-action" href="/rss.xml">打开机器可读 RSS</a></section>
+<nav class="rss-actions" aria-label="RSS 后续路径"><a href="/">返回 Digest</a><a href="/browse">前往 Browse</a></nav>
+{% endblock %}

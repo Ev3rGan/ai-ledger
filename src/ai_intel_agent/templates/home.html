@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% from "components.html" import story_card %}
+{% block content %}
+{% if digest %}
+<section class="hero">
+  <p class="eyebrow">AI Intelligence</p><h1>今日 AI Digest</h1>
+  <p class="digest-date">{{ digest.publication_date.isoformat() }}</p>
+  {% if digest.introduction %}<p class="lede">{{ digest.introduction }}</p>{% endif %}
+  <a class="primary-action" href="/digests/{{ digest.publication_date.isoformat() }}">阅读完整 Digest</a>
+</section>
+<section aria-labelledby="coverage-heading"><h2 id="coverage-heading">来源覆盖</h2><ul class="badge-list">{% for publisher in publishers %}<li class="badge">{{ publisher }}</li>{% endfor %}</ul></section>
+<section aria-labelledby="latest-heading"><h2 id="latest-heading">今日重点</h2><div class="story-grid">{% for story in digest.stories %}{{ story_card(story, story_url(story.stable_key)) }}{% endfor %}</div></section>
+<section aria-labelledby="recent-heading"><h2 id="recent-heading">近期 Digest</h2><ul class="digest-list">{% for item in recent_digests %}<li><a href="/digests/{{ item.publication_date.isoformat() }}">{{ item.publication_date.isoformat() }}</a></li>{% else %}<li>暂无更早的 Digest。</li>{% endfor %}</ul></section>
+{% else %}
+<section class="hero"><p class="eyebrow">AI Intelligence</p><h1>今日 AI Digest</h1><p>暂无已发布 Digest。</p></section>
+{% endif %}
+{% include "fragments/entry_points.html" %}
+{% endblock %}

@@ -17,6 +17,7 @@ Start with the repository [English README](../README.md) or [简体中文 README
 - [Domain model](../CONTEXT.md): the vocabulary for Source Definitions, Documents, Stories, Claims, Evidence Spans, Digests, and Research.
 - [Architecture decisions](adr/): current collection, evidence, retrieval, Research, production, and publication boundaries.
 - [Design decisions and Future Work](adr/README.md): approved pre-ticket choices for the v2.1-v2.2 roadmap and their revisit triggers.
+- [Legacy-flow inventory](legacy-flow-inventory.md): evidence-led retain, repair, archive, verify, and deletion-candidate decisions.
 
 ## Research and Evaluation
 

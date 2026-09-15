@@ -197,3 +197,39 @@ def test_current_runtime_and_runbooks_do_not_advertise_retired_source_profile() 
     for relative_path in current_product_paths:
         content = _read(relative_path).casefold()
         assert all(phrase not in content for phrase in forbidden_current_portfolio_phrases)
+
+
+def test_current_docs_retire_direct_publication_and_classify_legacy_flows() -> None:
+    english = _read("README.md")
+    chinese = _read("README.zh-CN.md")
+    local_runbook = _read("docs/mvp-local-runbook.md")
+    production_runbook = _read("docs/mvp-production-runbook.md")
+    inventory = _read("docs/legacy-flow-inventory.md")
+
+    assert "exact, immutable Digest Plan" in english
+    assert "exact、immutable Digest Plan" in chinese
+
+    for document in (local_runbook, production_runbook):
+        assert "digest plan prepare" in document
+        assert "digest plan approve" in document
+
+    for runbook in (local_runbook, production_runbook):
+        assert "\nuv run ai-intel-agent story accept " not in runbook
+        assert "\nuv run ai-intel-agent story reject " not in runbook
+        assert "\nuv run ai-intel-agent digest publish " not in runbook
+        assert "\nbash deploy/m1/operate.sh operator story accept " not in runbook
+        assert "\nbash deploy/m1/operate.sh operator story reject " not in runbook
+        assert "\nbash deploy/m1/operate.sh operator digest publish " not in runbook
+
+    for classification in (
+        "Retain",
+        "Repair",
+        "Archive",
+        "Verify before deletion",
+        "Deletion candidate",
+    ):
+        assert classification in inventory
+
+    assert "18 enabled Source Profiles" in production_runbook
+    assert "No legacy flow is deleted by Issue #119" in " ".join(inventory.split())
+    assert "#120" in inventory

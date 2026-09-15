@@ -23,7 +23,7 @@
 | Discovery | Source Profile 边界、Feed 元数据、cursor | Candidate |
 | Acquisition | canonical identity、访问约束、文章正文质量 | Document Version |
 | Drafting | 有预算且版本锁定的 DeepSeek route；只生成草稿 | Story、Claim、Evidence Span 草稿 |
-| Editorial | Operator 检查证据并接受/拒绝；预览排序后显式发布 | 已接受 Story、published Digest、Audit Event |
+| Editorial | Editorial Agent 准备不可变 Digest Plan；Operator 检查证据并批准该精确版本一次 | 已接受 Story、published Digest、Audit Event |
 | Public projection | 只读取已发布知识 | Home、Digest、Story、Browse、RSS |
 | Research | 只检索已接受且已发布的支持性 Evidence Span；无证据时拒答 | SSE answer 与 Story/Claim/Evidence Span citation |
 

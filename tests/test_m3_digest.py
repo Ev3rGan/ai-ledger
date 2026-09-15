@@ -463,7 +463,8 @@ def test_0006_published_story_remains_visible_after_0007_upgrade_without_backfil
             headline in response.text for response in (home, digest, story, browse, rss)
         )
         assert "关键事实" in story.text
-        assert "为什么重要" not in story.text
+        assert "为什么重要" in story.text
+        assert "暂无可公开的影响说明" in story.text
 
         engine = create_database_engine(server.uri)
         try:

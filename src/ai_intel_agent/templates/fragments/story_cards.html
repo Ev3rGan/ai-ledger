@@ -1,0 +1,2 @@
+{% from "components.html" import story_card %}
+{% for story in stories %}{{ story_card(story, story_url(story.stable_key)) }}{% endfor %}
