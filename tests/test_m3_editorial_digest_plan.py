@@ -13,13 +13,17 @@ import pytest
 from alembic.config import Config
 from fastapi.testclient import TestClient
 from pg0 import Pg0
-from sqlalchemy import event, select, text, update
+from sqlalchemy import event, func, select, text, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 from typer.testing import CliRunner
 
 import ai_intel_agent.cli as cli_module
 import ai_intel_agent.editorial as editorial_module
+from ai_intel_agent.accepted_knowledge import (
+    AcceptedKnowledgeIndexer,
+    ApprovedRetrievalBackends,
+)
 from ai_intel_agent.cli import app
 from ai_intel_agent.domain import (
     Candidate,
@@ -55,6 +59,7 @@ from ai_intel_agent.editorial import (
     prepare_digest_plan,
     restore_digest_plan,
 )
+from ai_intel_agent.index_followup import RetrievalIndexFollowUpWorker
 from ai_intel_agent.persistence import (
     CandidateRecord,
     ClaimRecord,
@@ -65,8 +70,10 @@ from ai_intel_agent.persistence import (
     DigestStoryRecord,
     DigestWithdrawalRecord,
     DocumentVersionRecord,
+    EditorialDayOutcomeRecord,
     EditorialRepository,
     EvidenceSpanRecord,
+    RetrievalIndexRecord,
     SampleStoryRepository,
     SchedulerStatusRepository,
     SourceCandidateResultRecord,
@@ -321,27 +328,34 @@ def _persist_pending_stories(
     story_count: int = 10,
     tie_newest_discovery: bool = False,
     future_story_positions: frozenset[int] = frozenset(),
+    batch: str = "",
+    source_day: date = date(2026, 8, 20),
 ) -> None:
     engine = create_database_engine(database_url)
     publishers = ("Gemini", "TechCrunch", "Hugging Face", "QbitAI")
-    source_ids = tuple(_id(f"database-source:{position}") for position in range(4))
-    run_id = _id("database-run")
-    observed_at = datetime(2026, 8, 20, 12, tzinfo=UTC)
+    scope = f"{batch}:" if batch else ""
+    source_ids = tuple(_id(f"{scope}database-source:{position}") for position in range(4))
+    run_id = _id(f"{scope}database-run")
+    observed_at = datetime.combine(source_day, datetime.min.time(), UTC) + timedelta(hours=12)
     persisted: list[tuple[UUID, UUID, UUID]] = []
     try:
         repository = SampleStoryRepository(engine)
-        first_published_at = datetime(2026, 8, 20, 2, tzinfo=UTC)
+        first_published_at = datetime.combine(
+            source_day,
+            datetime.min.time(),
+            UTC,
+        ) + timedelta(hours=2)
         for position in range(story_count):
             publisher = publishers[position % len(publishers)]
-            candidate_id = _id(f"database-candidate:{position}")
-            document_id = _id(f"database-document:{position}")
-            story_id = _id(f"database-story:{position}")
-            claim_id = _id(f"database-claim:{position}")
-            evidence_id = _id(f"database-evidence:{position}")
+            candidate_id = _id(f"{scope}database-candidate:{position}")
+            document_id = _id(f"{scope}database-document:{position}")
+            story_id = _id(f"{scope}database-story:{position}")
+            claim_id = _id(f"{scope}database-claim:{position}")
+            evidence_id = _id(f"{scope}database-evidence:{position}")
             exact_text = f"{publisher} exact persisted Evidence {position}."
             body = f"{exact_text} Additional private source text."
             published_at = (
-                datetime(2026, 8, 21, 0, tzinfo=UTC) + timedelta(minutes=position)
+                first_published_at + timedelta(days=1, minutes=position)
                 if position in future_story_positions
                 else first_published_at + timedelta(hours=position)
             )
@@ -355,14 +369,14 @@ def _persist_pending_stories(
                     candidate=Candidate(
                         id=candidate_id,
                         title=f"{publisher} source {position}",
-                        canonical_url=f"https://example.com/persisted/{position}",
+                        canonical_url=f"https://example.com/{scope}persisted/{position}",
                         publisher=publisher,
                         discovered_at=discovered_at,
                     ),
                     document_version=DocumentVersion(
                         id=document_id,
                         candidate_id=candidate_id,
-                        source_url=f"https://example.com/persisted/{position}",
+                        source_url=f"https://example.com/{scope}persisted/{position}",
                         title=f"{publisher} source {position}",
                         body=body,
                         content_hash=sha256(body.encode("utf-8")).hexdigest(),
@@ -373,7 +387,7 @@ def _persist_pending_stories(
                     story=Story(
                         id=story_id,
                         primary_document_version_id=document_id,
-                        stable_key=f"persisted-story:{position}",
+                        stable_key=f"persisted-{scope}story:{position}",
                         headline=f"{publisher} persisted AI development {position}",
                         occurred_at=published_at,
                         review_state=StoryReviewState.UNREVIEWED,
@@ -396,8 +410,8 @@ def _persist_pending_stories(
                         relation=EvidenceRelation.SUPPORTS,
                     ),
                     trace=StructuredTrace(
-                        id=_id(f"database-trace:{position}"),
-                        operation_key=f"m3-editorial-test:trace:{position}",
+                        id=_id(f"{scope}database-trace:{position}"),
+                        operation_key=f"m3-editorial-test:{scope}trace:{position}",
                         evidence_span_id=evidence_id,
                         occurred_at=published_at,
                         attributes={"provider": "deterministic-fixture"},
@@ -414,7 +428,7 @@ def _persist_pending_stories(
                     status="running",
                     started_at=observed_at - timedelta(minutes=5),
                     completed_at=None,
-                    operation_key="m3-editorial-test:collection",
+                    operation_key=f"m3-editorial-test:{scope}collection",
                 )
             )
             session.add_all(
@@ -422,8 +436,8 @@ def _persist_pending_stories(
                     id=source_id,
                     name=f"{publisher} feed",
                     publisher=publisher,
-                    entry_point=f"https://example.com/{position}/feed",
-                    audit_version="m3-editorial-test.v1",
+                    entry_point=f"https://example.com/{scope}{position}/feed",
+                    audit_version=f"m3-editorial-test.{batch or 'default'}.v1",
                     activation_conclusion="approved",
                     collection_schedule="06:00/18:00 Asia/Shanghai",
                     discovery_method="fixture",
@@ -1485,14 +1499,14 @@ def test_repository_prepares_and_approves_only_the_newest_twelve_story_batch(
         assert len(plan.included_stories) == 12
         assert repository.pending_review_count() == 14
 
-        digest = repository.approve_digest_plan(
+        outcome = repository.approve_digest_plan(
             plan.id,
             expected_content_hash=plan.content_hash,
             actor_identifier="m5-editorial-operator",
             approved_at=observed_at + timedelta(minutes=1),
         )
 
-        assert digest.story_ids == tuple(story.id for story in plan.included_stories)
+        assert outcome.story_ids == tuple(story.id for story in plan.included_stories)
         assert repository.pending_review_count() == 2
         assert {
             story.stable_key
@@ -1593,8 +1607,9 @@ def test_workflow_repeatedly_removes_stories_without_rewriting_history_or_callin
         engine.dispose()
 
 
-def test_workflow_can_derive_an_empty_plan_but_cannot_approve_it_yet(
+def test_workflow_approves_an_empty_plan_as_one_durable_no_publication_outcome(
     editorial_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _persist_pending_stories(editorial_database_url, story_count=2)
     engine = create_database_engine(editorial_database_url)
@@ -1617,18 +1632,102 @@ def test_workflow_can_derive_an_empty_plan_but_cannot_approve_it_yet(
         )
 
         assert empty.included_stories == ()
-        assert any(
-            anomaly.code == "invalid-selection" and anomaly.blocking
-            for anomaly in empty.anomalies
-        )
+        assert not any(anomaly.blocking for anomaly in empty.anomalies)
         assert workflow.plan(empty.id) == empty
-        with pytest.raises(EditorialStateError, match="blocking anomaly"):
-            workflow.approve(
-                empty.id,
-                expected_content_hash=empty.content_hash,
-                actor_identifier="m3-operator",
-                approved_at=observed_at + timedelta(minutes=2),
+        completed_at = observed_at + timedelta(minutes=2)
+        outcome = workflow.approve(
+            empty.id,
+            expected_content_hash=empty.content_hash,
+            actor_identifier="m3-operator",
+            approved_at=completed_at,
+        )
+
+        assert outcome.kind == "no-publication"
+        assert outcome.digest is None
+        assert outcome.follow_up is None
+        assert outcome.publication_date == date(2026, 8, 21)
+        assert outcome.plan_id == empty.id
+        assert outcome.content_hash == empty.content_hash
+        assert outcome.actor_identifier == "m3-operator"
+        assert outcome.completed_at == completed_at
+        assert workflow.approve(
+            empty.id,
+            expected_content_hash=empty.content_hash,
+            actor_identifier="m3-operator",
+            approved_at=completed_at + timedelta(minutes=1),
+        ) == outcome
+
+        replay_provider = _RecordingExcludeUnsupportedEditorialProvider()
+        with pytest.raises(EditorialStateError, match="already completed"):
+            workflow.prepare(
+                empty.publication_date,
+                provider=replay_provider,
+                prepared_at=completed_at + timedelta(minutes=2),
             )
+        assert replay_provider.contexts == []
+
+        assert EditorialRepository(engine).digest_history(date(2026, 8, 21)) is None
+        assert PublicPublicationRepository(engine).latest_digest() is None
+        with TestClient(create_app(editorial_database_url)) as client:
+            assert client.get("/digests/2026-08-21").status_code == 404
+            assert "2026-08-21" not in client.get("/rss.xml").text
+        with Session(engine) as session:
+            assert session.scalar(text("SELECT count(*) FROM editorial_day_outcomes")) == 1
+            assert session.scalar(text("SELECT count(*) FROM retrieval_index_follow_ups")) == 0
+
+        with Session(engine) as session:
+            with pytest.raises(DBAPIError, match="published Editorial outcome"):
+                session.execute(
+                    text(
+                        "INSERT INTO retrieval_index_follow_ups ("
+                        "plan_id, publication_date, state, requested_at, attempt_count"
+                        ") VALUES ("
+                        ":plan_id, :publication_date, 'queued', :requested_at, 0"
+                        ")"
+                    ),
+                    {
+                        "plan_id": empty.id,
+                        "publication_date": empty.publication_date,
+                        "requested_at": completed_at,
+                    },
+                )
+                session.flush()
+            session.rollback()
+
+        monkeypatch.setenv("AI_INTEL_DATABASE_URL", editorial_database_url)
+        runner = CliRunner()
+        replay = runner.invoke(
+            app,
+            [
+                "digest",
+                "plan",
+                "approve",
+                str(empty.id),
+                "--content-hash",
+                empty.content_hash,
+                "--actor",
+                "m3-operator",
+            ],
+        )
+        assert replay.exit_code == 0, replay.output
+        assert "completed with no publication" in replay.output
+        follow_up_status = runner.invoke(
+            app,
+            ["digest", "plan", "follow-up-status", str(empty.id)],
+        )
+        assert follow_up_status.exit_code == 2
+        assert "No publication: follow-up is not applicable" in follow_up_status.output
+        with Session(engine) as session:
+            with pytest.raises(DBAPIError, match="Editorial day outcome is immutable"):
+                session.execute(
+                    text(
+                        "UPDATE editorial_day_outcomes "
+                        "SET actor_identifier = 'tampered' WHERE plan_id = :plan_id"
+                    ),
+                    {"plan_id": empty.id},
+                )
+                session.flush()
+            session.rollback()
     finally:
         engine.dispose()
 
@@ -1660,6 +1759,42 @@ def test_workflow_approves_one_story_with_a_visible_nonblocking_publisher_warnin
         )
 
         assert digest.story_ids == (plan.included_stories[0].id,)
+    finally:
+        engine.dispose()
+
+
+def test_empty_plan_approval_reports_stale_state_instead_of_recording_an_outcome(
+    editorial_database_url: str,
+) -> None:
+    _persist_pending_stories(editorial_database_url, story_count=2)
+    engine = create_database_engine(editorial_database_url)
+    observed_at = datetime(2026, 8, 20, 16, tzinfo=UTC)
+    try:
+        workflow = EditorialWorkflow(EditorialRepository(engine))
+        first = workflow.prepare(
+            date(2026, 8, 21),
+            provider=_ExcludeUnsupportedEditorialProvider(),
+            prepared_at=observed_at,
+        )
+        empty = workflow.remove_story(
+            first.id,
+            story_stable_key=first.included_stories[0].stable_key,
+            reason="The operator removed the final Story from this composition.",
+            actor_identifier="m4-operator",
+            removed_at=observed_at + timedelta(minutes=1),
+        )
+        SchedulerStatusRepository(engine).failed(
+            completed_at=observed_at + timedelta(minutes=2)
+        )
+
+        with pytest.raises(EditorialStateError, match="state changed"):
+            workflow.approve(
+                empty.id,
+                expected_content_hash=empty.content_hash,
+                actor_identifier="m4-operator",
+                approved_at=observed_at + timedelta(minutes=3),
+            )
+        assert workflow.outcome(empty.id) is None
     finally:
         engine.dispose()
 
@@ -1873,7 +2008,7 @@ def test_one_exact_plan_approval_atomically_accepts_decisions_and_publishes_in_o
 
         event.listen(engine, "before_cursor_execute", record_approval_sql)
         try:
-            digest = repository.approve_digest_plan(
+            outcome = repository.approve_digest_plan(
                 plan.id,
                 expected_content_hash=plan.content_hash,
                 actor_identifier="m3-operator",
@@ -1882,7 +2017,12 @@ def test_one_exact_plan_approval_atomically_accepts_decisions_and_publishes_in_o
         finally:
             event.remove(engine, "before_cursor_execute", record_approval_sql)
 
-        assert digest.story_ids == tuple(item.id for item in plan.included_stories)
+        assert outcome.kind == "published"
+        assert outcome.digest is not None
+        assert outcome.story_ids == tuple(item.id for item in plan.included_stories)
+        assert outcome.follow_up is not None
+        assert outcome.follow_up.state == "queued"
+        assert outcome.follow_up.attempt_count == 0
         assert any(statement.lstrip().startswith("LOCK TABLE") for statement in approval_sql)
         published = public.latest_digest()
         assert published is not None
@@ -1928,7 +2068,10 @@ def test_one_exact_plan_approval_atomically_accepts_decisions_and_publishes_in_o
             actor_identifier="m3-operator",
             approved_at=observed_at + timedelta(minutes=2),
         )
-        assert retried == digest
+        assert retried == outcome
+        with Session(engine) as session:
+            assert session.scalar(text("SELECT count(*) FROM editorial_day_outcomes")) == 1
+            assert session.scalar(text("SELECT count(*) FROM retrieval_index_follow_ups")) == 1
         assert repository.digest_history(date(2026, 8, 21)) == history
         with pytest.raises(ValueError, match="different actor"):
             repository.approve_digest_plan(
@@ -1937,6 +2080,243 @@ def test_one_exact_plan_approval_atomically_accepts_decisions_and_publishes_in_o
                 actor_identifier="different-operator",
                 approved_at=observed_at + timedelta(minutes=3),
             )
+    finally:
+        engine.dispose()
+
+
+def test_follow_up_claims_coalesce_recover_after_restart_and_retry_safely(
+    editorial_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _persist_pending_stories(editorial_database_url, story_count=2)
+    _persist_pending_stories(
+        editorial_database_url,
+        story_count=2,
+        batch="second",
+        source_day=date(2026, 8, 21),
+    )
+    engine = create_database_engine(editorial_database_url)
+    first_at = datetime(2026, 8, 20, 16, tzinfo=UTC)
+    second_at = first_at + timedelta(days=1)
+    try:
+        repository = EditorialRepository(engine)
+        workflow = EditorialWorkflow(repository)
+        first = workflow.prepare(
+            date(2026, 8, 21),
+            provider=_ExcludeUnsupportedEditorialProvider(),
+            prepared_at=first_at,
+        )
+        first_outcome = workflow.approve(
+            first.id,
+            expected_content_hash=first.content_hash,
+            actor_identifier="m4-operator",
+            approved_at=first_at + timedelta(minutes=1),
+        )
+        second = workflow.prepare(
+            date(2026, 8, 22),
+            provider=_ExcludeUnsupportedEditorialProvider(),
+            prepared_at=second_at,
+        )
+        second_outcome = workflow.approve(
+            second.id,
+            expected_content_hash=second.content_hash,
+            actor_identifier="m4-operator",
+            approved_at=second_at + timedelta(minutes=1),
+        )
+
+        assert first_outcome.follow_up is not None
+        assert second_outcome.follow_up is not None
+        monkeypatch.setenv("AI_INTEL_DATABASE_URL", editorial_database_url)
+        runner = CliRunner()
+        status = runner.invoke(
+            app,
+            ["digest", "plan", "follow-up-status", str(first.id)],
+        )
+        assert status.exit_code == 0, status.output
+        assert '"state": "queued"' in status.output
+        assert f'"plan_id": "{first.id}"' in status.output
+        claimed_at = second_at + timedelta(minutes=2)
+        claimed = repository.claim_retrieval_index_follow_ups(
+            claimed_at=claimed_at,
+            lease_duration=timedelta(minutes=30),
+        )
+        assert {item.plan_id for item in claimed} == {first.id, second.id}
+        assert {item.claim_id for item in claimed} == {claimed[0].claim_id}
+        assert all(item.state == "running" for item in claimed)
+        assert all(item.attempt_count == 1 for item in claimed)
+
+        restarted_repository = EditorialRepository(engine)
+        assert restarted_repository.claim_retrieval_index_follow_ups(
+            claimed_at=claimed_at + timedelta(minutes=29),
+        ) == ()
+        recovered = restarted_repository.claim_retrieval_index_follow_ups(
+            claimed_at=claimed_at + timedelta(minutes=31),
+        )
+        assert {item.plan_id for item in recovered} == {first.id, second.id}
+        assert all(item.attempt_count == 2 for item in recovered)
+        assert recovered[0].claim_id is not None
+        assert recovered[0].claim_id != claimed[0].claim_id
+
+        failed = restarted_repository.fail_retrieval_index_follow_ups(
+            recovered[0].claim_id,
+            fault_code="index-rebuild-failed",
+            last_error="RuntimeError: full retrieval index rebuild failed",
+            completed_at=claimed_at + timedelta(minutes=32),
+        )
+        assert all(item.state == "failed" for item in failed)
+        assert workflow.follow_up_status(first.id) == next(
+            item for item in failed if item.plan_id == first.id
+        )
+        assert first_outcome.digest is not None
+        assert PublicPublicationRepository(engine).latest_digest() is not None
+
+        retried_cli = runner.invoke(
+            app,
+            [
+                "digest",
+                "plan",
+                "follow-up-retry",
+                str(first.id),
+                "--actor",
+                "m4-operator",
+            ],
+        )
+        assert retried_cli.exit_code == 0, retried_cli.output
+        assert '"state": "queued"' in retried_cli.output
+        retried = workflow.follow_up_status(first.id)
+        assert retried is not None
+        assert retried.state == "queued"
+        assert retried.attempt_count == 2
+        assert workflow.retry_follow_up(
+            first.id,
+            actor_identifier="m4-operator",
+            requested_at=claimed_at + timedelta(minutes=34),
+        ) == retried
+        retry_claim = restarted_repository.claim_retrieval_index_follow_ups(
+            claimed_at=claimed_at + timedelta(minutes=35),
+        )
+        assert tuple(item.plan_id for item in retry_claim) == (first.id,)
+        assert retry_claim[0].attempt_count == 3
+        assert workflow.follow_up_status(second.id).state == "failed"
+    finally:
+        engine.dispose()
+
+
+class _CompleteEmbeddingBackend:
+    def embed_documents(self, texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
+        vector = (1.0, *(0.0 for _ in range(383)))
+        return tuple(vector for _ in texts)
+
+
+class _FailingEmbeddingBackend:
+    def embed_documents(self, texts: tuple[str, ...]) -> tuple[tuple[float, ...], ...]:
+        raise RuntimeError("deterministic embedding failure")
+
+
+def test_follow_up_rebuild_keeps_the_old_index_until_a_complete_retry_activates(
+    editorial_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _persist_pending_stories(editorial_database_url, story_count=2)
+    engine = create_database_engine(editorial_database_url)
+    first_at = datetime(2026, 8, 20, 16, tzinfo=UTC)
+    try:
+        repository = EditorialRepository(engine)
+        workflow = EditorialWorkflow(repository)
+        first = workflow.prepare(
+            date(2026, 8, 21),
+            provider=_ExcludeUnsupportedEditorialProvider(),
+            prepared_at=first_at,
+        )
+        workflow.approve(
+            first.id,
+            expected_content_hash=first.content_hash,
+            actor_identifier="m4-operator",
+            approved_at=first_at + timedelta(minutes=1),
+        )
+        first_completed = first_at + timedelta(minutes=2)
+        first_result = RetrievalIndexFollowUpWorker(
+            repository,
+            indexer=AcceptedKnowledgeIndexer(
+                engine,
+                embedding=_CompleteEmbeddingBackend(),
+                require_embeddings=True,
+                clock=lambda: first_completed,
+            ),
+            now=lambda: first_completed,
+        ).run_pending()
+        assert len(first_result) == 1
+        assert first_result[0].state == "succeeded"
+        first_index_id = first_result[0].index_id
+        assert first_index_id is not None
+
+        _persist_pending_stories(
+            editorial_database_url,
+            story_count=2,
+            batch="replacement",
+            source_day=date(2026, 8, 21),
+        )
+        second_at = first_at + timedelta(days=1)
+        second = workflow.prepare(
+            date(2026, 8, 22),
+            provider=_ExcludeUnsupportedEditorialProvider(),
+            prepared_at=second_at,
+        )
+        workflow.approve(
+            second.id,
+            expected_content_hash=second.content_hash,
+            actor_identifier="m4-operator",
+            approved_at=second_at + timedelta(minutes=1),
+        )
+        monkeypatch.setattr(
+            cli_module,
+            "_retrieval_backends_from_environment",
+            lambda: ApprovedRetrievalBackends(
+                embedding=_FailingEmbeddingBackend(),
+                reranker=None,
+                faults=(),
+            ),
+        )
+        failed = cli_module._retrieval_index_follow_up_worker(engine).run_pending()
+        assert len(failed) == 1
+        assert failed[0].state == "failed"
+        with Session(engine) as session:
+            assert session.scalar(
+                select(RetrievalIndexRecord.id).where(
+                    RetrievalIndexRecord.state == "active"
+                )
+            ) == first_index_id
+            assert session.scalar(
+                select(func.count()).select_from(RetrievalIndexRecord)
+            ) == 1
+
+        workflow.retry_follow_up(
+            second.id,
+            actor_identifier="m4-operator",
+            requested_at=second_at + timedelta(minutes=3),
+        )
+        replacement_at = second_at + timedelta(minutes=4)
+        replacement = RetrievalIndexFollowUpWorker(
+            repository,
+            indexer=AcceptedKnowledgeIndexer(
+                engine,
+                embedding=_CompleteEmbeddingBackend(),
+                require_embeddings=True,
+                clock=lambda: replacement_at,
+            ),
+            now=lambda: replacement_at,
+        ).run_pending()
+        assert len(replacement) == 1
+        assert replacement[0].state == "succeeded"
+        assert replacement[0].index_id not in {None, first_index_id}
+        with Session(engine) as session:
+            states = dict(
+                session.execute(
+                    select(RetrievalIndexRecord.id, RetrievalIndexRecord.state)
+                ).all()
+            )
+        assert states[first_index_id] == "retired"
+        assert states[replacement[0].index_id] == "active"
     finally:
         engine.dispose()
 
@@ -2000,6 +2380,182 @@ def test_database_cannot_publish_an_editorial_plan_contract_without_approval(
 
         assert repository.digest_plan(plan.id) == plan
         assert PublicPublicationRepository(engine).latest_digest() is None
+    finally:
+        engine.dispose()
+
+
+def test_database_rejects_no_publication_for_a_nonempty_plan(
+    editorial_database_url: str,
+) -> None:
+    _persist_pending_stories(editorial_database_url, story_count=2)
+    engine = create_database_engine(editorial_database_url)
+    observed_at = datetime(2026, 8, 20, 14, tzinfo=UTC)
+    try:
+        repository = EditorialRepository(engine)
+        plan = repository.prepare_digest_plan(
+            date(2026, 8, 21),
+            provider=_ExcludeUnsupportedEditorialProvider(),
+            prepared_at=observed_at,
+        )
+        assert len(plan.included_stories) == 1
+        with Session(engine) as session:
+            session.add(
+                EditorialDayOutcomeRecord(
+                    plan_id=plan.id,
+                    publication_date=plan.publication_date,
+                    outcome_kind="no-publication",
+                    digest_id=None,
+                    content_hash=plan.content_hash,
+                    actor_identifier="database-bypass",
+                    completed_at=observed_at + timedelta(minutes=1),
+                )
+            )
+            with pytest.raises(DBAPIError, match="zero-Story Digest Plan"):
+                session.flush()
+            session.rollback()
+        assert repository.editorial_outcome(plan.id) is None
+    finally:
+        engine.dispose()
+
+
+def test_database_rejects_exact_publication_without_durable_index_follow_up(
+    editorial_database_url: str,
+) -> None:
+    _persist_pending_stories(editorial_database_url, story_count=2)
+    engine = create_database_engine(editorial_database_url)
+    observed_at = datetime(2026, 8, 20, 14, tzinfo=UTC)
+    try:
+        repository = EditorialRepository(engine)
+        plan = repository.prepare_digest_plan(
+            date(2026, 8, 21),
+            provider=_ExcludeUnsupportedEditorialProvider(),
+            prepared_at=observed_at,
+        )
+        draft = compose_digest(
+            plan.publication_date,
+            tuple(item.id for item in plan.included_stories),
+        )
+        with Session(engine) as session:
+            for item in plan.stories:
+                story = session.get(StoryRecord, item.id)
+                assert story is not None
+                if item.inclusion is DigestPlanInclusion.HELD:
+                    continue
+                story.review_state = (
+                    StoryReviewState.ACCEPTED.value
+                    if item.inclusion is DigestPlanInclusion.INCLUDED
+                    else StoryReviewState.REJECTED.value
+                )
+                if item.inclusion is DigestPlanInclusion.INCLUDED:
+                    presentation = session.get(StoryPresentationRecord, item.id)
+                    assert presentation is not None
+                    presentation.summary = item.summary
+                    presentation.why_it_matters = item.why_it_matters
+                    presentation.primary_topic = item.primary_topic
+                    presentation.secondary_topics = list(item.secondary_topics)
+            digest_record = DigestRecord(
+                id=draft.id,
+                stable_key=draft.stable_key,
+                publication_date=draft.publication_date,
+                state=DigestState.DRAFT.value,
+                published_at=None,
+                introduction=plan.digest_summary,
+                publication_contract=DigestPublicationContract.M3_EDITORIAL_PLAN.value,
+                digest_plan_id=plan.id,
+            )
+            session.add(digest_record)
+            session.flush()
+            session.add_all(
+                DigestStoryRecord(
+                    digest_id=draft.id,
+                    story_id=story_id,
+                    position=position,
+                )
+                for position, story_id in enumerate(draft.story_ids)
+            )
+            session.add(
+                DigestPlanApprovalRecord(
+                    plan_id=plan.id,
+                    digest_id=draft.id,
+                    content_hash=plan.content_hash,
+                    actor_identifier="database-bypass",
+                    approved_at=observed_at + timedelta(minutes=1),
+                )
+            )
+            session.add(
+                EditorialDayOutcomeRecord(
+                    plan_id=plan.id,
+                    publication_date=plan.publication_date,
+                    outcome_kind="published",
+                    digest_id=draft.id,
+                    content_hash=plan.content_hash,
+                    actor_identifier="database-bypass",
+                    completed_at=observed_at + timedelta(minutes=1),
+                )
+            )
+            session.flush()
+
+            with pytest.raises(DBAPIError, match="durable retrieval-index follow-up"):
+                session.execute(
+                    update(DigestRecord)
+                    .where(DigestRecord.id == draft.id)
+                    .values(
+                        state=DigestState.PUBLISHED.value,
+                        published_at=observed_at + timedelta(minutes=1),
+                    )
+                )
+                session.flush()
+            session.rollback()
+        assert PublicPublicationRepository(engine).latest_digest() is None
+    finally:
+        engine.dispose()
+
+
+def test_database_cannot_lose_or_reassign_a_published_index_follow_up(
+    editorial_database_url: str,
+) -> None:
+    _persist_pending_stories(editorial_database_url, story_count=2)
+    engine = create_database_engine(editorial_database_url)
+    observed_at = datetime(2026, 8, 20, 14, tzinfo=UTC)
+    try:
+        workflow = EditorialWorkflow(EditorialRepository(engine))
+        plan = workflow.prepare(
+            date(2026, 8, 21),
+            provider=_ExcludeUnsupportedEditorialProvider(),
+            prepared_at=observed_at,
+        )
+        workflow.approve(
+            plan.id,
+            expected_content_hash=plan.content_hash,
+            actor_identifier="m4-operator",
+            approved_at=observed_at + timedelta(minutes=1),
+        )
+
+        with Session(engine) as session:
+            with pytest.raises(DBAPIError, match="follow-up identity is durable"):
+                session.execute(
+                    text("DELETE FROM retrieval_index_follow_ups WHERE plan_id = :plan_id"),
+                    {"plan_id": plan.id},
+                )
+                session.flush()
+            session.rollback()
+
+        with Session(engine) as session:
+            with pytest.raises(DBAPIError, match="follow-up identity is durable"):
+                session.execute(
+                    text(
+                        "UPDATE retrieval_index_follow_ups "
+                        "SET publication_date = :publication_date WHERE plan_id = :plan_id"
+                    ),
+                    {
+                        "publication_date": date(2026, 8, 22),
+                        "plan_id": plan.id,
+                    },
+                )
+                session.flush()
+            session.rollback()
+
+        assert workflow.follow_up_status(plan.id) is not None
     finally:
         engine.dispose()
 
@@ -2622,7 +3178,7 @@ def test_cli_withdrawal_hides_every_public_surface_but_preserves_history(
             provider=_ExcludeUnsupportedEditorialProvider(),
             prepared_at=observed_at,
         )
-        digest = repository.approve_digest_plan(
+        outcome = repository.approve_digest_plan(
             plan.id,
             expected_content_hash=plan.content_hash,
             actor_identifier="m3-operator",
@@ -2695,28 +3251,31 @@ def test_cli_withdrawal_hides_every_public_surface_but_preserves_history(
     try:
         history = EditorialRepository(engine).digest_history(date(2026, 8, 21))
         assert history is not None
-        assert history.digest == digest
+        assert outcome.digest is not None
+        assert history.digest == outcome.digest
         assert history.approval is not None
         assert history.withdrawal is not None
         assert history.withdrawal.actor_identifier == "m3-cli-operator"
         assert history.withdrawal.reason == reason
         assert "digest.withdrawn" in history.audit_actions
         with Session(engine) as session:
-            assert session.get(DigestRecord, digest.id) is not None
+            assert session.get(DigestRecord, outcome.digest.id) is not None
             assert (
                 len(
                     session.scalars(
-                        select(DigestStoryRecord).where(DigestStoryRecord.digest_id == digest.id)
+                        select(DigestStoryRecord).where(
+                            DigestStoryRecord.digest_id == outcome.digest.id
+                        )
                     ).all()
                 )
                 == 9
             )
-            withdrawal = session.get(DigestWithdrawalRecord, digest.id)
+            withdrawal = session.get(DigestWithdrawalRecord, outcome.digest.id)
             assert withdrawal is not None
             with pytest.raises(DBAPIError, match="Digest withdrawal is immutable"):
                 session.execute(
                     update(DigestWithdrawalRecord)
-                    .where(DigestWithdrawalRecord.digest_id == digest.id)
+                    .where(DigestWithdrawalRecord.digest_id == outcome.digest.id)
                     .values(reason="tampered immutable withdrawal reason")
                 )
                 session.flush()
@@ -2765,17 +3324,18 @@ def test_0009_to_0010_upgrade_preserves_predecessor_state_and_runs_cli_seam(
                     )
                     == "succeeded"
                 )
-                assert session.scalar(text("SELECT version_num FROM alembic_version")) == "0014"
+                assert session.scalar(text("SELECT version_num FROM alembic_version")) == "0015"
                 assert (
                     session.scalar(
                         text(
                             "SELECT count(*) FROM information_schema.tables "
                             "WHERE table_schema = 'public' "
                             "AND table_name IN "
-                            "('digest_plans', 'digest_plan_approvals', 'digest_withdrawals')"
+                            "('digest_plans', 'digest_plan_approvals', 'digest_withdrawals', "
+                            "'editorial_day_outcomes', 'retrieval_index_follow_ups')"
                         )
                     )
-                    == 3
+                    == 5
                 )
                 assert (
                     session.scalar(
@@ -2802,6 +3362,22 @@ def test_0009_to_0010_upgrade_preserves_predecessor_state_and_runs_cli_seam(
                 )
         finally:
             engine.dispose()
+
+        command.downgrade(config, "0014")
+        engine = create_database_engine(server.uri)
+        try:
+            with engine.connect() as connection:
+                assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0014"
+                assert connection.scalar(
+                    text(
+                        "SELECT count(*) FROM information_schema.tables "
+                        "WHERE table_schema = 'public' AND table_name IN "
+                        "('editorial_day_outcomes', 'retrieval_index_follow_ups')"
+                    )
+                ) == 0
+        finally:
+            engine.dispose()
+        command.upgrade(config, "head")
 
         _persist_pending_stories(server.uri)
         monkeypatch.setenv("AI_INTEL_DATABASE_URL", server.uri)
@@ -2856,7 +3432,7 @@ def test_0014_downgrade_refuses_immutable_derived_plan_and_keeps_0014(
         ):
             command.downgrade(config, "0013")
         with Session(engine) as session:
-            assert session.scalar(text("SELECT version_num FROM alembic_version")) == "0014"
+            assert session.scalar(text("SELECT version_num FROM alembic_version")) == "0015"
             assert session.scalar(
                 select(DigestPlanRecord).where(DigestPlanRecord.previous_plan_id == first.id)
             ) is not None
@@ -2865,7 +3441,7 @@ def test_0014_downgrade_refuses_immutable_derived_plan_and_keeps_0014(
 
 
 @pytest.mark.postgres
-def test_0014_downgrade_withdraws_relaxed_digest_then_restores_0013_guard(
+def test_0015_downgrade_refuses_to_discard_publication_follow_up_even_after_withdrawal(
     editorial_database_url: str,
 ) -> None:
     config = Config(str(Path("alembic.ini").resolve()))
@@ -2894,11 +3470,11 @@ def test_0014_downgrade_withdraws_relaxed_digest_then_restores_0013_guard(
         )
         with pytest.raises(
             DBAPIError,
-            match="0014 Story-removal data violates the 0013 publication contract",
+            match="0015 Editorial completion data cannot be represented by 0014",
         ):
             command.downgrade(config, "0013")
         with engine.connect() as connection:
-            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0014"
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0015"
 
         repository.withdraw_digest(
             date(2026, 8, 21),
@@ -2906,32 +3482,12 @@ def test_0014_downgrade_withdraws_relaxed_digest_then_restores_0013_guard(
             reason="Withdraw the relaxed Digest before restoring the 0013 contract.",
             withdrawn_at=observed_at + timedelta(minutes=2),
         )
-    finally:
-        engine.dispose()
-
-    command.downgrade(config, "0013")
-    engine = create_database_engine(editorial_database_url)
-    try:
+        with pytest.raises(
+            DBAPIError,
+            match="0015 Editorial completion data cannot be represented by 0014",
+        ):
+            command.downgrade(config, "0013")
         with engine.connect() as connection:
-            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0013"
-            assert connection.scalar(
-                text(
-                    "SELECT count(*) FROM information_schema.columns "
-                    "WHERE table_schema = 'public' AND table_name = 'digest_plans' "
-                    "AND column_name IN "
-                    "('previous_plan_id', 'removed_story_stable_key', 'removal_reason')"
-                )
-            ) == 0
-            publication_guard = connection.scalar(
-                text(
-                    "SELECT pg_get_functiondef("
-                    "'ai_intel_validate_m3_digest_publication()'::regprocedure)"
-                )
-            )
-            assert "story_count NOT BETWEEN 8 AND 12" in publication_guard
-            assert "publisher_count < 3" in publication_guard
-            assert "approved_plan_version" not in publication_guard
-            assert "latest_plan_version" not in publication_guard
-            assert "plan.version" not in publication_guard
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0015"
     finally:
         engine.dispose()

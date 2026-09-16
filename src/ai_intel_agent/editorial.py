@@ -114,6 +114,50 @@ class DigestPlanInclusion(StrEnum):
     HELD = "held"
 
 
+class EditorialOutcomeKind(StrEnum):
+    PUBLISHED = "published"
+    NO_PUBLICATION = "no-publication"
+
+
+class RetrievalIndexFollowUpState(StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class RetrievalIndexFollowUp:
+    plan_id: UUID
+    publication_date: date
+    state: RetrievalIndexFollowUpState
+    requested_at: datetime
+    attempt_count: int
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    claim_id: UUID | None = None
+    lease_expires_at: datetime | None = None
+    index_id: UUID | None = None
+    fault_code: str | None = None
+    last_error: str | None = None
+
+
+@dataclass(frozen=True)
+class EditorialApprovalOutcome:
+    kind: EditorialOutcomeKind
+    plan_id: UUID
+    publication_date: date
+    content_hash: str
+    actor_identifier: str
+    completed_at: datetime
+    digest: Digest | None
+    follow_up: RetrievalIndexFollowUp | None
+
+    @property
+    def story_ids(self) -> tuple[UUID, ...]:
+        return self.digest.story_ids if self.digest is not None else ()
+
+
 @dataclass(frozen=True)
 class SourceHealthInspection:
     source_definition_id: UUID
@@ -635,7 +679,19 @@ class EditorialWorkflowRepository(Protocol):
         expected_content_hash: str,
         actor_identifier: str,
         approved_at: datetime,
-    ) -> Digest: ...
+    ) -> EditorialApprovalOutcome: ...
+
+    def editorial_outcome(self, plan_id: UUID) -> EditorialApprovalOutcome | None: ...
+
+    def retrieval_index_follow_up(self, plan_id: UUID) -> RetrievalIndexFollowUp | None: ...
+
+    def retry_retrieval_index_follow_up(
+        self,
+        plan_id: UUID,
+        *,
+        actor_identifier: str,
+        requested_at: datetime,
+    ) -> RetrievalIndexFollowUp: ...
 
 
 class EditorialWorkflow:
@@ -694,12 +750,31 @@ class EditorialWorkflow:
         expected_content_hash: str,
         actor_identifier: str,
         approved_at: datetime,
-    ) -> Digest:
+    ) -> EditorialApprovalOutcome:
         return self._repository.approve_digest_plan(
             plan_id,
             expected_content_hash=expected_content_hash,
             actor_identifier=actor_identifier,
             approved_at=approved_at,
+        )
+
+    def outcome(self, plan_id: UUID) -> EditorialApprovalOutcome | None:
+        return self._repository.editorial_outcome(plan_id)
+
+    def follow_up_status(self, plan_id: UUID) -> RetrievalIndexFollowUp | None:
+        return self._repository.retrieval_index_follow_up(plan_id)
+
+    def retry_follow_up(
+        self,
+        plan_id: UUID,
+        *,
+        actor_identifier: str,
+        requested_at: datetime,
+    ) -> RetrievalIndexFollowUp:
+        return self._repository.retry_retrieval_index_follow_up(
+            plan_id,
+            actor_identifier=actor_identifier,
+            requested_at=requested_at,
         )
 
 
@@ -1090,11 +1165,11 @@ def _digest_plan_anomalies(
 ) -> tuple[DigestPlanAnomaly, ...]:
     anomalies: list[DigestPlanAnomaly] = []
     included = tuple(item for item in stories if item.inclusion is DigestPlanInclusion.INCLUDED)
-    if not 1 <= len(included) <= 12:
+    if len(included) > 12:
         anomalies.append(
             DigestPlanAnomaly(
                 code="invalid-selection",
-                message="A Digest Plan requires between 1 and 12 included Stories",
+                message="A Digest Plan permits at most 12 included Stories",
                 blocking=True,
             )
         )

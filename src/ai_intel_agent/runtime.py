@@ -269,18 +269,22 @@ class GeminiScheduler:
         self,
         *,
         collect: Callable[[], None],
+        run_pending_index_follow_ups: Callable[[], object] | None = None,
         now: Callable[[], datetime],
         wait: Callable[[float], bool],
         schedule: GeminiSchedule | None = None,
         status: SchedulerStatusWriter | None = None,
     ) -> None:
         self._collect = collect
+        self._run_pending_index_follow_ups = run_pending_index_follow_ups
         self._now = now
         self._wait = wait
         self._schedule = schedule or GeminiSchedule()
         self._status = status or NullSchedulerStatus()
 
     def run(self) -> None:
+        if self._run_pending_index_follow_ups is not None:
+            self._run_pending_index_follow_ups()
         while True:
             current = self._now()
             due = self._schedule.next_after(current)
@@ -292,6 +296,8 @@ class GeminiScheduler:
             self._status.running(started_at=self._now())
             try:
                 self._collect()
+                if self._run_pending_index_follow_ups is not None:
+                    self._run_pending_index_follow_ups()
             except BaseException:
                 self._status.failed(completed_at=self._now())
                 raise

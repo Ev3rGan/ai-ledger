@@ -88,6 +88,14 @@ _Avoid_: Story, feed, collection run
 An immutable published rendition of a Digest for its original publication date.
 _Avoid_: Digest, new edition, repost
 
+**Editorial Outcome**:
+The immutable dated result of approving one exact Digest Plan: either a published Digest or an explicit no-publication result for a Plan with no included Stories.
+_Avoid_: Approval result, empty Digest, skipped run
+
+**Retrieval Index Follow-Up**:
+An auditable post-approval obligation to rebuild the accepted-knowledge retrieval snapshot after a Digest is published.
+_Avoid_: Incremental index update, collection run, publication
+
 **Editorial Window**:
 The fixed Asia/Shanghai time interval that determines which eligible Stories are considered for one dated Digest. It does not replace source, event, discovery, or processing timestamps.
 _Avoid_: Publication date, Collection Run, calendar day
