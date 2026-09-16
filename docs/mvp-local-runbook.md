@@ -47,7 +47,7 @@ Any startup or child-process failure follows the same `STOPPING -> STOPPED` clea
 owning process is forcibly killed, use Docker Desktop to stop only the container in the
 `ai-ledger-mvp` Compose project; do not remove its volume.
 
-## Operator acceptance from the same commit and database
+## Break-glass CLI acceptance from the same commit and database
 
 Keep `start-local` running in its owning terminal. In supervisor-launched operator subprocesses
 with only the environment keys needed by each command, run:
@@ -63,11 +63,14 @@ uv run ai-intel-agent digest plan remove <plan-id> <story-stable-key> --reason <
 uv run ai-intel-agent digest plan approve <plan-id> --content-hash <displayed-sha256> --actor local-operator
 ```
 
-The plan display is the review surface: inspect every included Story, Claim, Evidence Span,
+These commands call the same EditorialWorkflow as the protected production Console; they are the
+local and break-glass adapter, not a second implementation. The plan display is the review surface:
+inspect every included Story, Claim, Evidence Span,
 source-health snapshot, anomaly, content hash, and current-state hash before approving. If a Story
 must be removed, the remove command creates a new immutable Plan version with recorded predecessor,
 Story key, reason, and actor. Re-open the returned Plan and approve only its new ID and content hash;
-the superseded Plan cannot be approved or published. A Plan may contain 1-12 Stories. Fewer than
+the superseded Plan cannot be approved or published. A Plan may contain 0-12 Stories; approving a
+zero-Story Plan records no-publication without creating a Digest or index follow-up. Fewer than
 three Publishers is a visible non-blocking warning, not a publication gate. Direct
 `story accept`, `story reject`, `digest preview`, and `digest publish` are retired compatibility
 commands and are not part of the supported operator path.

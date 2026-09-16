@@ -63,11 +63,14 @@ from ai_intel_agent.domain import (
 from ai_intel_agent.editorial import (
     ClaimInspection,
     DigestPlan,
+    DigestPlanIdentity,
     DigestPlanInclusion,
     DigestPreview,
     DigestPublicationContract,
     EditorialApprovalOutcome,
+    EditorialConflictError,
     EditorialContext,
+    EditorialNotFoundError,
     EditorialOutcomeKind,
     EditorialPlanProvider,
     EditorialStateError,
@@ -90,6 +93,8 @@ from ai_intel_agent.editorial import (
 )
 from ai_intel_agent.source_portfolio import SourcePortfolioDefinition, load_source_universe
 from alembic import command
+
+_EDITORIAL_PREPARE_LOCK_NAMESPACE = 0x4D365052
 
 
 class Base(DeclarativeBase):
@@ -1356,6 +1361,37 @@ class EditorialRepository:
         provider: EditorialPlanProvider,
         prepared_at: datetime,
     ) -> DigestPlan:
+        return self._prepare_digest_plan(
+            publication_date,
+            provider=provider,
+            prepared_at=prepared_at,
+        )
+
+    def prepare_digest_plan_exact(
+        self,
+        publication_date: date,
+        *,
+        expected_latest: DigestPlanIdentity | None,
+        provider: EditorialPlanProvider,
+        prepared_at: datetime,
+    ) -> DigestPlan:
+        return self._prepare_digest_plan(
+            publication_date,
+            expected_latest=expected_latest,
+            provider=provider,
+            prepared_at=prepared_at,
+            enforce_expected_latest=True,
+        )
+
+    def _prepare_digest_plan(
+        self,
+        publication_date: date,
+        *,
+        provider: EditorialPlanProvider,
+        prepared_at: datetime,
+        expected_latest: DigestPlanIdentity | None = None,
+        enforce_expected_latest: bool = False,
+    ) -> DigestPlan:
         with Session(self._engine) as session:
             completed_plan_id = session.scalar(
                 select(EditorialDayOutcomeRecord.plan_id).where(
@@ -1363,7 +1399,7 @@ class EditorialRepository:
                 )
             )
             if completed_plan_id is not None:
-                raise EditorialStateError(
+                raise EditorialConflictError(
                     f"Editorial day {publication_date.isoformat()} is already completed"
                 )
             latest = session.scalar(
@@ -1372,6 +1408,13 @@ class EditorialRepository:
                 .order_by(DigestPlanRecord.version.desc())
                 .limit(1)
             )
+            if enforce_expected_latest and not self._record_matches_identity(
+                latest,
+                expected_latest,
+            ):
+                raise EditorialConflictError(
+                    "Latest Digest Plan changed; reload before preparing another version"
+                )
             next_version = 1 if latest is None else latest.version + 1
         context = self._editorial_context(publication_date)
         plan = build_digest_plan(
@@ -1380,9 +1423,15 @@ class EditorialRepository:
             version=next_version,
             prepared_at=prepared_at,
         )
-        if latest is not None and latest.content_hash == plan.content_hash:
-            return self._plan(latest)
         with Session(self._engine) as session, session.begin():
+            session.execute(
+                select(
+                    func.pg_advisory_xact_lock(
+                        _EDITORIAL_PREPARE_LOCK_NAMESPACE,
+                        publication_date.toordinal(),
+                    )
+                )
+            )
             locked_latest = session.scalar(
                 select(DigestPlanRecord)
                 .where(DigestPlanRecord.publication_date == publication_date)
@@ -1393,8 +1442,15 @@ class EditorialRepository:
             if (locked_latest is None and next_version != 1) or (
                 locked_latest is not None and locked_latest.version != next_version - 1
             ):
-                raise EditorialStateError(
+                raise EditorialConflictError(
                     "Digest Plan version changed while the Editorial Agent was preparing"
+                )
+            if enforce_expected_latest and not self._record_matches_identity(
+                locked_latest,
+                expected_latest,
+            ):
+                raise EditorialConflictError(
+                    "Latest Digest Plan changed while the Editorial Agent was preparing"
                 )
             completed_plan_id = session.scalar(
                 select(EditorialDayOutcomeRecord.plan_id).where(
@@ -1402,7 +1458,7 @@ class EditorialRepository:
                 )
             )
             if completed_plan_id is not None:
-                raise EditorialStateError(
+                raise EditorialConflictError(
                     f"Editorial day {publication_date.isoformat()} is already completed"
                 )
             if locked_latest is not None and locked_latest.content_hash == plan.content_hash:
@@ -1444,6 +1500,16 @@ class EditorialRepository:
     def digest_plan(self, plan_id: UUID) -> DigestPlan | None:
         with Session(self._engine) as session:
             record = session.get(DigestPlanRecord, plan_id)
+            return self._plan(record) if record is not None else None
+
+    def latest_digest_plan(self, publication_date: date) -> DigestPlan | None:
+        with Session(self._engine) as session:
+            record = session.scalar(
+                select(DigestPlanRecord)
+                .where(DigestPlanRecord.publication_date == publication_date)
+                .order_by(DigestPlanRecord.version.desc())
+                .limit(1)
+            )
             return self._plan(record) if record is not None else None
 
     def editorial_outcome(self, plan_id: UUID) -> EditorialApprovalOutcome | None:
@@ -1602,7 +1668,7 @@ class EditorialRepository:
                 .with_for_update()
             )
             if previous_record is None:
-                raise EditorialStateError(f"Digest Plan {previous_plan_id} does not exist")
+                raise EditorialNotFoundError(f"Digest Plan {previous_plan_id} does not exist")
             latest = session.scalar(
                 select(DigestPlanRecord)
                 .where(DigestPlanRecord.publication_date == previous_record.publication_date)
@@ -1611,9 +1677,13 @@ class EditorialRepository:
                 .with_for_update()
             )
             if latest is None or latest.id != previous_record.id:
-                raise EditorialStateError("Only the latest Digest Plan version may remove a Story")
+                raise EditorialConflictError(
+                    "Only the latest Digest Plan version may remove a Story"
+                )
             if session.get(DigestPlanApprovalRecord, previous_plan_id) is not None:
-                raise EditorialStateError("An approved Digest Plan cannot derive a Story removal")
+                raise EditorialConflictError(
+                    "An approved Digest Plan cannot derive a Story removal"
+                )
 
             previous = self._plan(previous_record)
             expected = derive_digest_plan_story_removal(
@@ -1698,24 +1768,24 @@ class EditorialRepository:
                 select(DigestPlanRecord).where(DigestPlanRecord.id == plan_id).with_for_update()
             )
             if record is None:
-                raise EditorialStateError(f"Digest Plan {plan_id} does not exist")
+                raise EditorialNotFoundError(f"Digest Plan {plan_id} does not exist")
             plan = self._plan(record)
             if plan.content_hash != expected_content_hash:
-                raise EditorialStateError("Digest Plan content hash does not match approval")
+                raise EditorialConflictError("Digest Plan content hash does not match approval")
             existing_outcome = session.get(EditorialDayOutcomeRecord, plan_id)
             if existing_outcome is not None:
                 if existing_outcome.content_hash != expected_content_hash:
-                    raise EditorialStateError(
+                    raise EditorialConflictError(
                         "Existing Editorial outcome has a different content hash"
                     )
                 if existing_outcome.actor_identifier != normalized_actor:
-                    raise EditorialStateError(
+                    raise EditorialConflictError(
                         "Existing Editorial outcome belongs to a different actor"
                     )
                 return self._outcome(session, existing_outcome)
             existing_approval = session.get(DigestPlanApprovalRecord, plan_id)
             if existing_approval is not None:
-                raise EditorialStateError(
+                raise EditorialConflictError(
                     "Existing Digest Plan approval has no immutable Editorial outcome"
                 )
 
@@ -1727,7 +1797,7 @@ class EditorialRepository:
                 .with_for_update()
             )
             if latest is None or plan.version != latest.version:
-                raise EditorialStateError("Only the latest Digest Plan version may be approved")
+                raise EditorialConflictError("Only the latest Digest Plan version may be approved")
             if any(anomaly.blocking for anomaly in plan.anomalies):
                 raise EditorialStateError("A Digest Plan with a blocking anomaly cannot publish")
             current_context = self._editorial_context_in_session(
@@ -1736,7 +1806,7 @@ class EditorialRepository:
                 lock=True,
             )
             if current_context.current_state_hash != plan.current_state_hash:
-                raise EditorialStateError(
+                raise EditorialConflictError(
                     "Persisted Story, Evidence, Source, or Scheduler state changed; "
                     "prepare a new Plan"
                 )
@@ -1744,14 +1814,16 @@ class EditorialRepository:
                 select(DigestRecord).where(DigestRecord.publication_date == plan.publication_date)
             )
             if existing_digest is not None:
-                raise EditorialStateError("An existing Digest already uses this publication date")
+                raise EditorialConflictError(
+                    "An existing Digest already uses this publication date"
+                )
             existing_day_outcome = session.scalar(
                 select(EditorialDayOutcomeRecord).where(
                     EditorialDayOutcomeRecord.publication_date == plan.publication_date
                 )
             )
             if existing_day_outcome is not None:
-                raise EditorialStateError(
+                raise EditorialConflictError(
                     "An Editorial outcome already uses this publication date"
                 )
 
@@ -1759,7 +1831,7 @@ class EditorialRepository:
             for item in plan.stories:
                 story_record = session.get(StoryRecord, item.id)
                 if story_record is None:
-                    raise EditorialStateError(f"Story {item.stable_key!r} no longer exists")
+                    raise EditorialConflictError(f"Story {item.stable_key!r} no longer exists")
                 if item.inclusion is DigestPlanInclusion.HELD:
                     continue
                 decision = (
@@ -2301,6 +2373,19 @@ class EditorialRepository:
             stories=stories,
             source_health=source_health,
             scheduler_health=scheduler_health,
+        )
+
+    @staticmethod
+    def _record_matches_identity(
+        record: DigestPlanRecord | None,
+        identity: DigestPlanIdentity | None,
+    ) -> bool:
+        if record is None or identity is None:
+            return record is None and identity is None
+        return (
+            record.id == identity.id
+            and record.version == identity.version
+            and record.content_hash == identity.content_hash
         )
 
     @staticmethod

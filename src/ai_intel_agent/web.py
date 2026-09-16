@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from email.utils import format_datetime
+from hashlib import sha256
 from importlib.resources import files
 from typing import Annotated
 from urllib.parse import quote, urlencode
@@ -38,16 +39,29 @@ from ai_intel_agent.domain import (
     EvidenceState,
     Topic,
 )
+from ai_intel_agent.editorial import (
+    DigestPlanIdentity,
+    EditorialConflictError,
+    EditorialNotFoundError,
+    EditorialPlanProvider,
+    EditorialStateError,
+    EditorialWorkflow,
+)
 from ai_intel_agent.operator_console import (
     GitHubOAuthClient,
     GitHubOAuthError,
+    OperatorIdempotencyConflictError,
+    OperatorMutationInProgressError,
+    OperatorMutationReceiptStore,
     OperatorReadProjection,
     OperatorSecurityConfiguration,
     OperatorSession,
     OperatorSessionStore,
+    operator_follow_up_payload,
+    operator_outcome_payload,
     utc_now,
 )
-from ai_intel_agent.persistence import create_database_engine
+from ai_intel_agent.persistence import EditorialRepository, create_database_engine
 from ai_intel_agent.publication import (
     PublicContent,
     PublicDigest,
@@ -99,6 +113,50 @@ class ResearchQuestion(BaseModel):
     )
 
 
+class ExactPlanInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID
+    version: int = Field(ge=1)
+    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    def identity(self) -> DigestPlanIdentity:
+        return DigestPlanIdentity(
+            id=self.id,
+            version=self.version,
+            content_hash=self.content_hash,
+        )
+
+
+class PreparePlanInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    publication_date: date
+    expected_plan: ExactPlanInput | None
+
+
+class ExactPlanMutationInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: int = Field(ge=1)
+    expected_content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    def identity(self, plan_id: UUID) -> DigestPlanIdentity:
+        return DigestPlanIdentity(
+            id=plan_id,
+            version=self.expected_version,
+            content_hash=self.expected_content_hash,
+        )
+
+
+class RemovePlanStoryInput(ExactPlanMutationInput):
+    reason: str = Field(min_length=1, max_length=1000)
+
+
+class _EditorialProviderUnavailableError(RuntimeError):
+    pass
+
+
 def create_app(
     database_url: str,
     *,
@@ -110,6 +168,7 @@ def create_app(
     retrieval_reranker: RerankerBackend | None = None,
     operator_configuration: OperatorSecurityConfiguration | None = None,
     github_oauth_client: GitHubOAuthClient | None = None,
+    editorial_provider: EditorialPlanProvider | None = None,
     operator_clock: object | None = None,
 ) -> FastAPI:
     if (anonymous_research_daily_limit is None) != (anonymous_identity_salt is None):
@@ -150,7 +209,12 @@ def create_app(
         if github_oauth_client is None:
             raise ValueError("Operator Console requires a GitHub OAuth client")
         operator_sessions = OperatorSessionStore(engine, operator_configuration)
-        operator_projection = OperatorReadProjection(engine)
+        operator_projection = OperatorReadProjection(
+            engine,
+            public_origin=f"https://{operator_configuration.public_host}",
+        )
+        operator_editorial = EditorialWorkflow(EditorialRepository(engine))
+        operator_mutations = OperatorMutationReceiptStore(engine)
         app.state.operator_sessions = operator_sessions
 
         def require_operator_session(request: Request) -> OperatorSession:
@@ -158,6 +222,69 @@ def create_app(
             if session is None:
                 raise HTTPException(status_code=401, detail="Authentication required")
             return session
+
+        def execute_operator_mutation(
+            request: Request,
+            session: OperatorSession,
+            *,
+            operation: str,
+            input_payload: dict[str, object],
+            action: Callable[[], tuple[int, dict[str, object]]],
+        ) -> Response:
+            try:
+                idempotency_key = _validate_operator_mutation_request(
+                    request,
+                    session,
+                    operator_origin=operator_configuration.operator_origin,
+                )
+            except ValueError as error:
+                return JSONResponse({"detail": str(error)}, status_code=403)
+            request_hash = _operator_mutation_request_hash(operation, input_payload)
+            try:
+                replay = operator_mutations.begin(
+                    github_user_id=session.github_user_id,
+                    idempotency_key=idempotency_key,
+                    request_hash=request_hash,
+                    created_at=now(),
+                )
+            except (OperatorIdempotencyConflictError, OperatorMutationInProgressError) as error:
+                return JSONResponse({"detail": str(error)}, status_code=409)
+            if replay is not None:
+                return JSONResponse(replay.body, status_code=replay.status_code)
+
+            def abandon_receipt() -> None:
+                operator_mutations.abandon(
+                    github_user_id=session.github_user_id,
+                    idempotency_key=idempotency_key,
+                    request_hash=request_hash,
+                )
+
+            try:
+                status_code, body = action()
+            except EditorialNotFoundError as error:
+                abandon_receipt()
+                return JSONResponse({"detail": str(error)}, status_code=404)
+            except EditorialConflictError as error:
+                abandon_receipt()
+                return JSONResponse({"detail": str(error)}, status_code=409)
+            except EditorialStateError as error:
+                abandon_receipt()
+                return JSONResponse({"detail": str(error)}, status_code=422)
+            except _EditorialProviderUnavailableError as error:
+                abandon_receipt()
+                return JSONResponse({"detail": str(error)}, status_code=503)
+            except Exception:
+                abandon_receipt()
+                raise
+            operator_mutations.complete(
+                github_user_id=session.github_user_id,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                status_code=status_code,
+                body=body,
+                completed_at=now(),
+            )
+            return JSONResponse(body, status_code=status_code)
 
         @app.middleware("http")
         async def isolate_operator_host(request: Request, call_next):
@@ -304,6 +431,128 @@ def create_app(
             if payload is None:
                 return JSONResponse({"detail": "Document Version not found"}, status_code=404)
             return JSONResponse(payload)
+
+        @app.post("/api/operator/plans/prepare", include_in_schema=False)
+        def operator_prepare_plan(
+            request: Request,
+            input_data: PreparePlanInput,
+        ) -> Response:
+            session = require_operator_session(request)
+
+            def prepare() -> tuple[int, dict[str, object]]:
+                if editorial_provider is None:
+                    raise _EditorialProviderUnavailableError(
+                        "Editorial Provider is not configured"
+                    )
+                plan = operator_editorial.prepare_exact(
+                    input_data.publication_date,
+                    expected_latest=(
+                        input_data.expected_plan.identity()
+                        if input_data.expected_plan is not None
+                        else None
+                    ),
+                    provider=editorial_provider,
+                    prepared_at=now(),
+                )
+                payload = operator_projection.plan(plan.id)
+                if payload is None:
+                    raise RuntimeError("Prepared Digest Plan is not readable")
+                return 201, payload
+
+            return execute_operator_mutation(
+                request,
+                session,
+                operation="digest-plan.prepare",
+                input_payload=input_data.model_dump(mode="json"),
+                action=prepare,
+            )
+
+        @app.post(
+            "/api/operator/plans/{plan_id}/stories/{story_stable_key}/remove",
+            include_in_schema=False,
+        )
+        def operator_remove_plan_story(
+            plan_id: UUID,
+            story_stable_key: str,
+            request: Request,
+            input_data: RemovePlanStoryInput,
+        ) -> Response:
+            session = require_operator_session(request)
+
+            def remove() -> tuple[int, dict[str, object]]:
+                plan = operator_editorial.remove_story_exact(
+                    input_data.identity(plan_id),
+                    story_stable_key=story_stable_key,
+                    reason=input_data.reason,
+                    actor_identifier=f"github:{session.github_user_id}",
+                    removed_at=now(),
+                )
+                payload = operator_projection.plan(plan.id)
+                if payload is None:
+                    raise RuntimeError("Derived Digest Plan is not readable")
+                return 201, payload
+
+            return execute_operator_mutation(
+                request,
+                session,
+                operation=f"digest-plan.remove-story:{plan_id}:{story_stable_key}",
+                input_payload=input_data.model_dump(mode="json"),
+                action=remove,
+            )
+
+        @app.post("/api/operator/plans/{plan_id}/approve", include_in_schema=False)
+        def operator_approve_plan(
+            plan_id: UUID,
+            request: Request,
+            input_data: ExactPlanMutationInput,
+        ) -> Response:
+            session = require_operator_session(request)
+
+            def approve() -> tuple[int, dict[str, object]]:
+                outcome = operator_editorial.approve_exact(
+                    input_data.identity(plan_id),
+                    actor_identifier=f"github:{session.github_user_id}",
+                    approved_at=now(),
+                )
+                return 200, operator_outcome_payload(
+                    outcome,
+                    public_origin=f"https://{operator_configuration.public_host}",
+                )
+
+            return execute_operator_mutation(
+                request,
+                session,
+                operation=f"digest-plan.approve:{plan_id}",
+                input_payload=input_data.model_dump(mode="json"),
+                action=approve,
+            )
+
+        @app.post(
+            "/api/operator/plans/{plan_id}/follow-up/retry",
+            include_in_schema=False,
+        )
+        def operator_retry_plan_follow_up(
+            plan_id: UUID,
+            request: Request,
+            input_data: ExactPlanMutationInput,
+        ) -> Response:
+            session = require_operator_session(request)
+
+            def retry() -> tuple[int, dict[str, object]]:
+                follow_up = operator_editorial.retry_follow_up_exact(
+                    input_data.identity(plan_id),
+                    actor_identifier=f"github:{session.github_user_id}",
+                    requested_at=now(),
+                )
+                return 200, operator_follow_up_payload(follow_up)
+
+            return execute_operator_mutation(
+                request,
+                session,
+                operation=f"digest-plan.follow-up-retry:{plan_id}",
+                input_payload=input_data.model_dump(mode="json"),
+                action=retry,
+            )
 
         @app.post("/operator/logout", include_in_schema=False)
         def operator_logout(request: Request) -> Response:
@@ -572,6 +821,46 @@ def _operator_session_payload(session: OperatorSession) -> dict[str, object]:
         "csrf_token": session.csrf_token,
         "absolute_expires_at": session.absolute_expires_at.isoformat(),
     }
+
+
+def _validate_operator_mutation_request(
+    request: Request,
+    session: OperatorSession,
+    *,
+    operator_origin: str,
+) -> str:
+    origin_values = request.headers.getlist("origin")
+    csrf_values = request.headers.getlist("x-csrf-token")
+    idempotency_values = request.headers.getlist("idempotency-key")
+    if len(origin_values) != 1 or origin_values[0] != operator_origin:
+        raise ValueError("Operator mutation Origin validation failed")
+    if len(csrf_values) != 1 or not secrets.compare_digest(
+        csrf_values[0],
+        session.csrf_token,
+    ):
+        raise ValueError("Operator mutation CSRF validation failed")
+    if len(idempotency_values) != 1:
+        raise ValueError("Operator mutation requires one Idempotency-Key")
+    idempotency_key = idempotency_values[0]
+    if (
+        idempotency_key != idempotency_key.strip()
+        or not 1 <= len(idempotency_key) <= 255
+        or any(ord(character) < 33 or ord(character) > 126 for character in idempotency_key)
+    ):
+        raise ValueError("Operator mutation Idempotency-Key is invalid")
+    return idempotency_key
+
+
+def _operator_mutation_request_hash(
+    operation: str,
+    input_payload: dict[str, object],
+) -> str:
+    encoded = json.dumps(
+        {"operation": operation, "input": input_payload},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return sha256(encoded).hexdigest()
 
 
 def _set_operator_security_headers(response: Response) -> None:

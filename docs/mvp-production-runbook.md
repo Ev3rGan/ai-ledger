@@ -2,7 +2,7 @@
 
 This is the supported production procedure for the M1 service lineage, the collector over the
 current versioned Source Profile universe, and the exact Digest Plan editorial/publication loop.
-It keeps both the public and read-only Operator Hosts behind Caddy automatic HTTPS and PostgreSQL
+It keeps both the public and protected Operator Hosts behind Caddy automatic HTTPS and PostgreSQL
 reachable only on an internal Compose network. The two Hosts share one Python Web process, while
 the application rejects every Operator route, Session, and static entry on the public Host.
 
@@ -139,8 +139,11 @@ PostgreSQL advisory lock, so a second production Scheduler exits before collecti
 shows database readiness and persisted recent Scheduler state through the private container CLI.
 `operator source-status --production` additionally reports each approved source's recent result,
 cursor, health, and body-valid Document Versions pending draft generation. The separate Operator
-Host provides an authenticated, read-only HTTP view of this state, Scheduler status, Editorial
-plans, completion/index follow-up, Stories, Claims, Evidence, and raw Document Versions.
+Host provides authenticated inspection plus the bounded daily Editorial Workflow: prepare or
+re-prepare, remove one Story at a time with a reason, approve the exact latest Plan, inspect the
+public result, and retry a failed retrieval-index follow-up. These mutations use the same Workflow
+as the CLI and require the server-side Session, exact Host and Origin, CSRF token, idempotency key,
+and exact Plan identity.
 
 The lock-holding database session is monitored every two seconds, including while source or
 Provider I/O is in progress. A replacement Scheduler holds a five-second activation grace. If a
@@ -223,7 +226,9 @@ Infrastructure ownership remains with the user. After purchasing or selecting th
    valid. On the public Host, verify Home → Digest → Story, Browse, RSS, and Research are reachable
    and `/health/ready` is 404 at the public boundary. On the Operator Host, complete GitHub OAuth
    with an allowlisted numeric user ID and verify Dashboard, Plan history/detail, Evidence links,
-   and raw Document Version inspection are read-only; verify public routes are 404 on that Host.
+   raw Document Version inspection, repeated one-Story removal, exact approval/publication or
+   no-publication, public-result linking, and failed index follow-up retry. Verify a stale tab gets
+   an explicit conflict and public routes are 404 on that Host.
 7. Run the bounded Research acceptance with a dedicated anonymous client: one supported answer
    up to the recorded limit, then an `anonymous-allowance-exhausted` refusal. Confirm the
    Provider call counter does not increase for the excess request.
@@ -341,7 +346,14 @@ execution, latest multi-source Collection Run, all enabled source health snapsho
 count, and latest published Digest. It never reports the database URL, credentials, source body,
 Evidence text, or Provider response.
 
-Inspect every pending Story before asking the Editorial Agent to prepare one immutable Plan:
+The Operator Console is the routine production surface. Inspect the Plan and its Evidence there,
+remove any number of unsuitable Stories one request at a time with a reason, and approve only the
+exact latest identity. A non-empty Plan publishes atomically and exposes the public Digest link; a
+zero-Story Plan records no-publication and creates no Digest or index follow-up. Replayed requests
+with the same idempotency identity do not duplicate a Plan, outcome, Digest, or follow-up.
+
+The following CLI commands are the break-glass adapter over the same EditorialWorkflow. Inspect
+every pending Story before asking the Editorial Agent to prepare one immutable Plan:
 
 ```bash
 bash deploy/m1/operate.sh operator story show <stable-key>
@@ -367,8 +379,8 @@ bash deploy/m1/operate.sh operator operator retrieval status --production --requ
 Removing a Story creates a new immutable Plan version with lineage and audit metadata; it never
 rewrites the inspected Plan or calls the Provider again. Re-open the returned Plan and approve only
 its new ID and content hash. Superseded Plans cannot be approved or published. The supported
-quantity is 1-12 Stories, while fewer than three Publishers remains visible as a non-blocking
-warning.
+quantity is 0-12 Stories: approving zero records no-publication, while fewer than three Publishers
+remains visible as a non-blocking warning.
 
 Direct `story accept`, `story reject`, `digest preview`, and `digest publish` are retired
 compatibility surfaces and are not a supported production workflow. Do not bypass the exact Plan

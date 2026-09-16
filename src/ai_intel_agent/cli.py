@@ -239,6 +239,7 @@ class _ProductionResearchRuntime:
     engine: Engine
     retrieval: AcceptedKnowledgeRetrieval
     provider: ResearchProvider
+    editorial_provider: EditorialPlanProvider
 
 
 @contextmanager
@@ -263,6 +264,11 @@ def _production_research_runtime(
                 engine=engine,
                 retrieval=retrieval,
                 provider=DeepSeekResearchProvider(
+                    client,
+                    api_key=configuration.provider.api_key,
+                    budget=provider_budget,
+                ),
+                editorial_provider=DeepSeekEditorialPlanProvider(
                     client,
                     api_key=configuration.provider.api_key,
                     budget=provider_budget,
@@ -893,6 +899,7 @@ def serve(
                     client_id=service_configuration.operator.github_client_id,
                     client_secret=service_configuration.operator.github_client_secret,
                 ),
+                editorial_provider=runtime.editorial_provider,
             )
             uvicorn.run(web_app, host=host, port=port, log_config=None)
         return

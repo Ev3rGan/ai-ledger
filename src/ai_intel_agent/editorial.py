@@ -102,6 +102,14 @@ class EditorialStateError(ValueError):
     pass
 
 
+class EditorialConflictError(EditorialStateError):
+    """The requested transition targets editorial state that is no longer current."""
+
+
+class EditorialNotFoundError(EditorialStateError):
+    """The requested exact editorial artifact does not exist."""
+
+
 class DigestPublicationContract(StrEnum):
     LEGACY_FIXTURE = "legacy-fixture"
     M3_MULTISOURCE = "m3-multisource"
@@ -654,6 +662,17 @@ class DigestPlan:
         return _digest_plan_content_payload(self)
 
 
+@dataclass(frozen=True)
+class DigestPlanIdentity:
+    id: UUID
+    version: int
+    content_hash: str
+
+    @classmethod
+    def from_plan(cls, plan: DigestPlan) -> DigestPlanIdentity:
+        return cls(id=plan.id, version=plan.version, content_hash=plan.content_hash)
+
+
 class EditorialWorkflowRepository(Protocol):
     def prepare_digest_plan(
         self,
@@ -663,7 +682,18 @@ class EditorialWorkflowRepository(Protocol):
         prepared_at: datetime,
     ) -> DigestPlan: ...
 
+    def prepare_digest_plan_exact(
+        self,
+        publication_date: date,
+        *,
+        expected_latest: DigestPlanIdentity | None,
+        provider: EditorialPlanProvider,
+        prepared_at: datetime,
+    ) -> DigestPlan: ...
+
     def digest_plan(self, plan_id: UUID) -> DigestPlan | None: ...
+
+    def latest_digest_plan(self, publication_date: date) -> DigestPlan | None: ...
 
     def persist_derived_digest_plan(
         self,
@@ -713,8 +743,26 @@ class EditorialWorkflow:
             prepared_at=prepared_at,
         )
 
+    def prepare_exact(
+        self,
+        publication_date: date,
+        *,
+        expected_latest: DigestPlanIdentity | None,
+        provider: EditorialPlanProvider,
+        prepared_at: datetime,
+    ) -> DigestPlan:
+        return self._repository.prepare_digest_plan_exact(
+            publication_date,
+            expected_latest=expected_latest,
+            provider=provider,
+            prepared_at=prepared_at,
+        )
+
     def plan(self, plan_id: UUID) -> DigestPlan | None:
         return self._repository.digest_plan(plan_id)
+
+    def latest_plan(self, publication_date: date) -> DigestPlan | None:
+        return self._repository.latest_digest_plan(publication_date)
 
     def remove_story(
         self,
@@ -725,12 +773,47 @@ class EditorialWorkflow:
         actor_identifier: str,
         removed_at: datetime,
     ) -> DigestPlan:
-        actor = actor_identifier.strip()
-        if not actor:
-            raise EditorialStateError("Digest Plan Story removal requires an actor")
         current = self._repository.digest_plan(plan_id)
         if current is None:
             raise EditorialStateError(f"Digest Plan {plan_id} does not exist")
+        return self._remove_story_from_plan(
+            current,
+            story_stable_key=story_stable_key,
+            reason=reason,
+            actor_identifier=actor_identifier,
+            removed_at=removed_at,
+        )
+
+    def remove_story_exact(
+        self,
+        identity: DigestPlanIdentity,
+        *,
+        story_stable_key: str,
+        reason: str,
+        actor_identifier: str,
+        removed_at: datetime,
+    ) -> DigestPlan:
+        current = self._exact_plan(identity)
+        return self._remove_story_from_plan(
+            current,
+            story_stable_key=story_stable_key,
+            reason=reason,
+            actor_identifier=actor_identifier,
+            removed_at=removed_at,
+        )
+
+    def _remove_story_from_plan(
+        self,
+        current: DigestPlan,
+        *,
+        story_stable_key: str,
+        reason: str,
+        actor_identifier: str,
+        removed_at: datetime,
+    ) -> DigestPlan:
+        actor = actor_identifier.strip()
+        if not actor:
+            raise EditorialStateError("Digest Plan Story removal requires an actor")
         derived = derive_digest_plan_story_removal(
             current,
             story_stable_key=story_stable_key,
@@ -758,6 +841,21 @@ class EditorialWorkflow:
             approved_at=approved_at,
         )
 
+    def approve_exact(
+        self,
+        identity: DigestPlanIdentity,
+        *,
+        actor_identifier: str,
+        approved_at: datetime,
+    ) -> EditorialApprovalOutcome:
+        self._exact_plan(identity)
+        return self.approve(
+            identity.id,
+            expected_content_hash=identity.content_hash,
+            actor_identifier=actor_identifier,
+            approved_at=approved_at,
+        )
+
     def outcome(self, plan_id: UUID) -> EditorialApprovalOutcome | None:
         return self._repository.editorial_outcome(plan_id)
 
@@ -776,6 +874,28 @@ class EditorialWorkflow:
             actor_identifier=actor_identifier,
             requested_at=requested_at,
         )
+
+    def retry_follow_up_exact(
+        self,
+        identity: DigestPlanIdentity,
+        *,
+        actor_identifier: str,
+        requested_at: datetime,
+    ) -> RetrievalIndexFollowUp:
+        self._exact_plan(identity)
+        return self.retry_follow_up(
+            identity.id,
+            actor_identifier=actor_identifier,
+            requested_at=requested_at,
+        )
+
+    def _exact_plan(self, identity: DigestPlanIdentity) -> DigestPlan:
+        plan = self._repository.digest_plan(identity.id)
+        if plan is None:
+            raise EditorialNotFoundError(f"Digest Plan {identity.id} does not exist")
+        if plan.version != identity.version or plan.content_hash != identity.content_hash:
+            raise EditorialConflictError("Digest Plan identity no longer matches the displayed Plan")
+        return plan
 
 
 def editorial_window_for(publication_date: date) -> tuple[datetime, datetime]:
