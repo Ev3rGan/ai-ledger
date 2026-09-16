@@ -23,6 +23,7 @@ from ai_intel_agent.accepted_knowledge import (
     AcceptedKnowledgeIndexer,
     AcceptedKnowledgeRetrieval,
     ApprovedRetrievalBackends,
+    IndexBuildResult,
     RetrievalBackendFault,
     RetrievalFilters,
     RetrievalModelConfiguration,
@@ -43,6 +44,7 @@ from ai_intel_agent.editorial import (
     EditorialPlanProvider,
     EditorialStateError,
     EditorialWorkflow,
+    RetrievalIndexFollowUp,
     StoryInspection,
 )
 from ai_intel_agent.extraction_benchmark import (
@@ -62,6 +64,7 @@ from ai_intel_agent.gemini_collection import (
     collect_gemini_release_notes,
     deepseek_api_key_from_environment,
 )
+from ai_intel_agent.index_followup import RetrievalIndexFollowUpWorker
 from ai_intel_agent.model_routing_evaluation import (
     HttpModelEvaluationClient,
     ModelEvaluationConfigurationError,
@@ -208,6 +211,26 @@ def _retrieval_backends_from_environment() -> ApprovedRetrievalBackends:
             ),
         )
     return load_approved_fastembed_backends(configuration)
+
+
+@dataclass(frozen=True)
+class _ConfiguredFullIndexBuilder:
+    engine: Engine
+
+    def rebuild(self) -> IndexBuildResult:
+        backends = _retrieval_backends_from_environment()
+        return AcceptedKnowledgeIndexer(
+            self.engine,
+            embedding=backends.embedding,
+            require_embeddings=True,
+        ).rebuild()
+
+
+def _retrieval_index_follow_up_worker(engine: Engine) -> RetrievalIndexFollowUpWorker:
+    return RetrievalIndexFollowUpWorker(
+        EditorialRepository(engine),
+        indexer=_ConfiguredFullIndexBuilder(engine),
+    )
 
 
 @dataclass(frozen=True)
@@ -988,6 +1011,7 @@ def schedule_sources(
         )
         configure_structured_logging()
         status = SchedulerStatusRepository(engine)
+        follow_up_worker = _retrieval_index_follow_up_worker(engine)
         try:
             with PostgresSchedulerLease(engine) as lease, SchedulerStopController() as stopped:
                 if lease.guarded_wait(stopped.wait, 5.0):
@@ -1008,6 +1032,7 @@ def schedule_sources(
                             provider_budget=provider_budget,
                             structured_output=True,
                         ),
+                        run_pending_index_follow_ups=follow_up_worker.run_pending,
                         now=lambda: datetime.now(UTC),
                         wait=stopped.wait,
                         status=status,
@@ -1019,19 +1044,25 @@ def schedule_sources(
         return
 
     configuration = _local_mvp_configuration()
+    engine = create_database_engine(configuration.database_url)
+    follow_up_worker = _retrieval_index_follow_up_worker(engine)
     console.print("Source-universe scheduler active at 06:00 and 18:00 Asia/Shanghai.")
-    with SchedulerStopController() as stopped:
-        GeminiScheduler(
-            collect=lambda: _run_multisource_collection(
-                backfill_limit,
-                database_url=configuration.database_url,
-                api_key=deepseek_api_key_from_environment(),
-                operation_key=scheduled_operation_key(datetime.now(UTC)),
-                structured_output=False,
-            ),
-            now=lambda: datetime.now(UTC),
-            wait=stopped.wait,
-        ).run()
+    try:
+        with SchedulerStopController() as stopped:
+            GeminiScheduler(
+                collect=lambda: _run_multisource_collection(
+                    backfill_limit,
+                    database_url=configuration.database_url,
+                    api_key=deepseek_api_key_from_environment(),
+                    operation_key=scheduled_operation_key(datetime.now(UTC)),
+                    structured_output=False,
+                ),
+                run_pending_index_follow_ups=follow_up_worker.run_pending,
+                now=lambda: datetime.now(UTC),
+                wait=stopped.wait,
+            ).run()
+    finally:
+        engine.dispose()
 
 
 def _local_mvp_configuration() -> LocalMvpConfiguration:
@@ -1461,7 +1492,7 @@ def approve_digest_plan_command(
             if plan is None:
                 raise EditorialStateError(f"Digest Plan {plan_id} does not exist")
             _print_digest_plan(plan)
-            digest = workflow.approve(
+            outcome = workflow.approve(
                 plan_id,
                 expected_content_hash=content_hash,
                 actor_identifier=actor,
@@ -1470,9 +1501,74 @@ def approve_digest_plan_command(
         except (EditorialStateError, ValueError) as error:
             raise typer.BadParameter(str(error)) from error
     console.print(
-        f"Digest Plan {plan.id} published with {len(digest.story_ids)} Stories.",
+        (
+            f"Digest Plan {plan.id} completed with no publication."
+            if outcome.digest is None
+            else (
+                f"Digest Plan {plan.id} published with {len(outcome.story_ids)} Stories; "
+                "retrieval-index follow-up is "
+                f"{outcome.follow_up.state.value if outcome.follow_up is not None else 'not-recorded'}."
+            )
+        ),
         markup=False,
     )
+
+
+def _retrieval_index_follow_up_payload(
+    follow_up: RetrievalIndexFollowUp,
+) -> dict[str, object]:
+    return {
+        "plan_id": str(follow_up.plan_id),
+        "publication_date": follow_up.publication_date.isoformat(),
+        "state": follow_up.state.value,
+        "requested_at": follow_up.requested_at.isoformat(),
+        "attempt_count": follow_up.attempt_count,
+        "started_at": (
+            follow_up.started_at.isoformat() if follow_up.started_at is not None else None
+        ),
+        "completed_at": (
+            follow_up.completed_at.isoformat() if follow_up.completed_at is not None else None
+        ),
+        "index_id": str(follow_up.index_id) if follow_up.index_id is not None else None,
+        "fault_code": follow_up.fault_code,
+        "last_error": follow_up.last_error,
+    }
+
+
+@digest_plan_app.command("follow-up-status")
+def digest_plan_follow_up_status_command(plan_id: UUID) -> None:
+    """Report durable retrieval-index follow-up state for one published Plan."""
+    with _editorial_workflow() as workflow:
+        try:
+            follow_up = workflow.follow_up_status(plan_id)
+        except (EditorialStateError, ValueError) as error:
+            raise typer.BadParameter(str(error)) from error
+    if follow_up is None:
+        raise typer.BadParameter(
+            f"Digest Plan {plan_id} has no retrieval-index follow-up"
+        )
+    console.print_json(data=_retrieval_index_follow_up_payload(follow_up))
+
+
+@digest_plan_app.command("follow-up-retry")
+def digest_plan_follow_up_retry_command(
+    plan_id: UUID,
+    actor: Annotated[
+        str,
+        typer.Option("--actor", help="Identifier recorded in the retry audit."),
+    ] = "local-operator",
+) -> None:
+    """Safely requeue a failed retrieval-index follow-up."""
+    with _editorial_workflow() as workflow:
+        try:
+            follow_up = workflow.retry_follow_up(
+                plan_id,
+                actor_identifier=actor,
+                requested_at=datetime.now(UTC),
+            )
+        except (EditorialStateError, ValueError) as error:
+            raise typer.BadParameter(str(error)) from error
+    console.print_json(data=_retrieval_index_follow_up_payload(follow_up))
 
 
 @digest_app.command("withdraw")

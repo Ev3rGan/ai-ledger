@@ -235,6 +235,29 @@ def test_scheduler_collects_once_after_waiting_for_the_next_fixed_slot() -> None
     assert collections == ["collected"]
 
 
+def test_scheduler_drains_durable_follow_up_on_restart_and_after_collection() -> None:
+    waits: list[float] = []
+    collections: list[str] = []
+    follow_up_runs: list[str] = []
+    wait_results = iter((False, True))
+    current = datetime(2026, 8, 15, 5, 59, tzinfo=SHANGHAI)
+
+    def wait(seconds: float) -> bool:
+        waits.append(seconds)
+        return next(wait_results)
+
+    GeminiScheduler(
+        collect=lambda: collections.append("collected"),
+        run_pending_index_follow_ups=lambda: follow_up_runs.append("drained"),
+        now=lambda: current,
+        wait=wait,
+    ).run()
+
+    assert waits == [60.0, 60.0]
+    assert collections == ["collected"]
+    assert follow_up_runs == ["drained", "drained"]
+
+
 def test_scheduler_stop_controller_handles_windows_break_and_restores_handler() -> None:
     previous_handler = signal.getsignal(signal.SIGBREAK)
 

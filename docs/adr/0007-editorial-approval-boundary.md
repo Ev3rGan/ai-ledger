@@ -1,6 +1,7 @@
 # ADR 0007: Editorial planning and one explicit approval
 
 - Status: accepted and implemented
+- Amended by: ADR 0011 for zero-Story outcomes and post-publication index follow-up
 - Scope: the v2.1-v2.2 Editorial Agent boundary
 
 ## Context

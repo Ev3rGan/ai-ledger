@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_CEILING, Decimal
 from hashlib import sha256
 from pathlib import Path
@@ -28,6 +28,7 @@ from sqlalchemy import (
     UniqueConstraint,
     Uuid,
     func,
+    or_,
     select,
     update,
 )
@@ -65,10 +66,14 @@ from ai_intel_agent.editorial import (
     DigestPlanInclusion,
     DigestPreview,
     DigestPublicationContract,
+    EditorialApprovalOutcome,
     EditorialContext,
+    EditorialOutcomeKind,
     EditorialPlanProvider,
     EditorialStateError,
     EvidenceSpanInspection,
+    RetrievalIndexFollowUp,
+    RetrievalIndexFollowUpState,
     SchedulerHealthInspection,
     SourceHealthInspection,
     StoryInspection,
@@ -374,6 +379,86 @@ class DigestPlanApprovalRecord(Base):
     content_hash: Mapped[str] = mapped_column(String(64))
     actor_identifier: Mapped[str] = mapped_column(String(255))
     approved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class EditorialDayOutcomeRecord(Base):
+    __tablename__ = "editorial_day_outcomes"
+    __table_args__ = (
+        CheckConstraint(
+            "outcome_kind IN ('published', 'no-publication')",
+            name="ck_editorial_day_outcomes_kind",
+        ),
+        CheckConstraint(
+            "(outcome_kind = 'published' AND digest_id IS NOT NULL) OR "
+            "(outcome_kind = 'no-publication' AND digest_id IS NULL)",
+            name="ck_editorial_day_outcomes_digest_shape",
+        ),
+        CheckConstraint(
+            "length(content_hash) = 64",
+            name="ck_editorial_day_outcomes_hash_length",
+        ),
+        UniqueConstraint("publication_date", name="uq_editorial_day_outcomes_publication_date"),
+        UniqueConstraint("digest_id", name="uq_editorial_day_outcomes_digest_id"),
+    )
+
+    plan_id: Mapped[UUID] = mapped_column(ForeignKey("digest_plans.id"), primary_key=True)
+    publication_date: Mapped[date] = mapped_column(Date)
+    outcome_kind: Mapped[str] = mapped_column(String(32))
+    digest_id: Mapped[UUID | None] = mapped_column(ForeignKey("digests.id"), nullable=True)
+    content_hash: Mapped[str] = mapped_column(String(64))
+    actor_identifier: Mapped[str] = mapped_column(String(255))
+    completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class RetrievalIndexFollowUpRecord(Base):
+    __tablename__ = "retrieval_index_follow_ups"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('queued', 'running', 'succeeded', 'failed')",
+            name="ck_retrieval_index_follow_ups_state",
+        ),
+        CheckConstraint(
+            "attempt_count >= 0",
+            name="ck_retrieval_index_follow_ups_attempt_count",
+        ),
+        CheckConstraint(
+            "(state = 'queued' AND started_at IS NULL AND completed_at IS NULL "
+            "AND claim_id IS NULL AND lease_expires_at IS NULL AND index_id IS NULL "
+            "AND fault_code IS NULL AND last_error IS NULL) OR "
+            "(state = 'running' AND started_at IS NOT NULL AND completed_at IS NULL "
+            "AND claim_id IS NOT NULL AND lease_expires_at IS NOT NULL AND index_id IS NULL "
+            "AND fault_code IS NULL AND last_error IS NULL) OR "
+            "(state = 'succeeded' AND started_at IS NOT NULL AND completed_at IS NOT NULL "
+            "AND claim_id IS NOT NULL AND lease_expires_at IS NULL AND index_id IS NOT NULL "
+            "AND fault_code IS NULL AND last_error IS NULL) OR "
+            "(state = 'failed' AND started_at IS NOT NULL AND completed_at IS NOT NULL "
+            "AND claim_id IS NOT NULL AND lease_expires_at IS NULL AND index_id IS NULL "
+            "AND fault_code IS NOT NULL AND last_error IS NOT NULL)",
+            name="ck_retrieval_index_follow_ups_state_shape",
+        ),
+    )
+
+    plan_id: Mapped[UUID] = mapped_column(
+        ForeignKey("editorial_day_outcomes.plan_id"),
+        primary_key=True,
+    )
+    publication_date: Mapped[date] = mapped_column(Date)
+    state: Mapped[str] = mapped_column(String(32))
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claim_id: Mapped[UUID | None] = mapped_column(Uuid, nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    index_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("retrieval_indexes.id"),
+        nullable=True,
+    )
+    fault_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class DigestWithdrawalRecord(Base):
@@ -1271,8 +1356,16 @@ class EditorialRepository:
         provider: EditorialPlanProvider,
         prepared_at: datetime,
     ) -> DigestPlan:
-        context = self._editorial_context(publication_date)
         with Session(self._engine) as session:
+            completed_plan_id = session.scalar(
+                select(EditorialDayOutcomeRecord.plan_id).where(
+                    EditorialDayOutcomeRecord.publication_date == publication_date
+                )
+            )
+            if completed_plan_id is not None:
+                raise EditorialStateError(
+                    f"Editorial day {publication_date.isoformat()} is already completed"
+                )
             latest = session.scalar(
                 select(DigestPlanRecord)
                 .where(DigestPlanRecord.publication_date == publication_date)
@@ -1280,6 +1373,7 @@ class EditorialRepository:
                 .limit(1)
             )
             next_version = 1 if latest is None else latest.version + 1
+        context = self._editorial_context(publication_date)
         plan = build_digest_plan(
             context,
             provider,
@@ -1301,6 +1395,15 @@ class EditorialRepository:
             ):
                 raise EditorialStateError(
                     "Digest Plan version changed while the Editorial Agent was preparing"
+                )
+            completed_plan_id = session.scalar(
+                select(EditorialDayOutcomeRecord.plan_id).where(
+                    EditorialDayOutcomeRecord.publication_date == publication_date
+                )
+            )
+            if completed_plan_id is not None:
+                raise EditorialStateError(
+                    f"Editorial day {publication_date.isoformat()} is already completed"
                 )
             if locked_latest is not None and locked_latest.content_hash == plan.content_hash:
                 return self._plan(locked_latest)
@@ -1342,6 +1445,141 @@ class EditorialRepository:
         with Session(self._engine) as session:
             record = session.get(DigestPlanRecord, plan_id)
             return self._plan(record) if record is not None else None
+
+    def editorial_outcome(self, plan_id: UUID) -> EditorialApprovalOutcome | None:
+        with Session(self._engine) as session:
+            record = session.get(EditorialDayOutcomeRecord, plan_id)
+            return self._outcome(session, record) if record is not None else None
+
+    def retrieval_index_follow_up(self, plan_id: UUID) -> RetrievalIndexFollowUp | None:
+        with Session(self._engine) as session:
+            record = session.get(RetrievalIndexFollowUpRecord, plan_id)
+            return self._follow_up(record) if record is not None else None
+
+    def retry_retrieval_index_follow_up(
+        self,
+        plan_id: UUID,
+        *,
+        actor_identifier: str,
+        requested_at: datetime,
+    ) -> RetrievalIndexFollowUp:
+        actor = actor_identifier.strip()
+        if not actor:
+            raise EditorialStateError("Retrieval-index follow-up retry requires an actor")
+        with Session(self._engine) as session, session.begin():
+            record = session.scalar(
+                select(RetrievalIndexFollowUpRecord)
+                .where(RetrievalIndexFollowUpRecord.plan_id == plan_id)
+                .with_for_update()
+            )
+            if record is None:
+                raise EditorialStateError(
+                    f"Digest Plan {plan_id} has no retrieval-index follow-up"
+                )
+            if record.state == RetrievalIndexFollowUpState.FAILED.value:
+                record.state = RetrievalIndexFollowUpState.QUEUED.value
+                record.requested_at = requested_at
+                record.started_at = None
+                record.completed_at = None
+                record.claim_id = None
+                record.lease_expires_at = None
+                record.index_id = None
+                record.fault_code = None
+                record.last_error = None
+                _persist_raw_audit_event(
+                    session,
+                    operation_key=(
+                        f"m4-retrieval-index-follow-up:{plan_id}:retry:{record.attempt_count}"
+                    ),
+                    actor_identifier=actor,
+                    action="retrieval-index-follow-up.retried",
+                    subject_type="digest-plan",
+                    subject_id=plan_id,
+                    occurred_at=requested_at,
+                    sequence=0,
+                    attributes={"attempt_count": record.attempt_count},
+                )
+                session.flush()
+            return self._follow_up(record)
+
+    def claim_retrieval_index_follow_ups(
+        self,
+        *,
+        claimed_at: datetime,
+        lease_duration: timedelta = timedelta(minutes=30),
+    ) -> tuple[RetrievalIndexFollowUp, ...]:
+        if lease_duration <= timedelta(0):
+            raise ValueError("Retrieval-index follow-up lease duration must be positive")
+        with Session(self._engine) as session, session.begin():
+            records = tuple(
+                session.scalars(
+                    select(RetrievalIndexFollowUpRecord)
+                    .where(
+                        or_(
+                            RetrievalIndexFollowUpRecord.state
+                            == RetrievalIndexFollowUpState.QUEUED.value,
+                            (
+                                (RetrievalIndexFollowUpRecord.state
+                                 == RetrievalIndexFollowUpState.RUNNING.value)
+                                & (RetrievalIndexFollowUpRecord.lease_expires_at <= claimed_at)
+                            ),
+                        )
+                    )
+                    .order_by(
+                        RetrievalIndexFollowUpRecord.requested_at,
+                        RetrievalIndexFollowUpRecord.plan_id,
+                    )
+                    .with_for_update(skip_locked=True)
+                )
+            )
+            if not records:
+                return ()
+            claim_id = uuid4()
+            lease_expires_at = claimed_at + lease_duration
+            for record in records:
+                record.state = RetrievalIndexFollowUpState.RUNNING.value
+                record.started_at = claimed_at
+                record.completed_at = None
+                record.claim_id = claim_id
+                record.lease_expires_at = lease_expires_at
+                record.index_id = None
+                record.fault_code = None
+                record.last_error = None
+                record.attempt_count += 1
+            session.flush()
+            return tuple(self._follow_up(record) for record in records)
+
+    def complete_retrieval_index_follow_ups(
+        self,
+        claim_id: UUID,
+        *,
+        index_id: UUID,
+        completed_at: datetime,
+    ) -> tuple[RetrievalIndexFollowUp, ...]:
+        return self._finish_retrieval_index_follow_ups(
+            claim_id,
+            completed_at=completed_at,
+            index_id=index_id,
+        )
+
+    def fail_retrieval_index_follow_ups(
+        self,
+        claim_id: UUID,
+        *,
+        fault_code: str,
+        last_error: str,
+        completed_at: datetime,
+    ) -> tuple[RetrievalIndexFollowUp, ...]:
+        normalized_code = fault_code.strip()
+        normalized_error = last_error.strip()
+        if not normalized_code or len(normalized_code) > 64 or not normalized_error:
+            raise ValueError("A bounded fault code and non-empty error are required")
+        return self._finish_retrieval_index_follow_ups(
+            claim_id,
+            completed_at=completed_at,
+            fault_code=normalized_code,
+            last_error=normalized_error,
+        )
 
     def persist_derived_digest_plan(
         self,
@@ -1433,7 +1671,7 @@ class EditorialRepository:
         expected_content_hash: str,
         actor_identifier: str,
         approved_at: datetime,
-    ) -> Digest:
+    ) -> EditorialApprovalOutcome:
         normalized_actor = actor_identifier.strip()
         if not normalized_actor:
             raise EditorialStateError("Digest Plan approval requires an actor")
@@ -1464,25 +1702,22 @@ class EditorialRepository:
             plan = self._plan(record)
             if plan.content_hash != expected_content_hash:
                 raise EditorialStateError("Digest Plan content hash does not match approval")
+            existing_outcome = session.get(EditorialDayOutcomeRecord, plan_id)
+            if existing_outcome is not None:
+                if existing_outcome.content_hash != expected_content_hash:
+                    raise EditorialStateError(
+                        "Existing Editorial outcome has a different content hash"
+                    )
+                if existing_outcome.actor_identifier != normalized_actor:
+                    raise EditorialStateError(
+                        "Existing Editorial outcome belongs to a different actor"
+                    )
+                return self._outcome(session, existing_outcome)
             existing_approval = session.get(DigestPlanApprovalRecord, plan_id)
             if existing_approval is not None:
-                if existing_approval.content_hash != expected_content_hash:
-                    raise EditorialStateError(
-                        "Existing Digest Plan approval has a different content hash"
-                    )
-                if existing_approval.actor_identifier != normalized_actor:
-                    raise EditorialStateError(
-                        "Existing Digest Plan approval belongs to a different actor"
-                    )
-                existing_digest = session.get(
-                    DigestRecord,
-                    existing_approval.digest_id,
+                raise EditorialStateError(
+                    "Existing Digest Plan approval has no immutable Editorial outcome"
                 )
-                if existing_digest is None:
-                    raise EditorialStateError(
-                        "Existing Digest Plan approval has no publication record"
-                    )
-                return self._digest(session, existing_digest)
 
             latest = session.scalar(
                 select(DigestPlanRecord)
@@ -1510,6 +1745,15 @@ class EditorialRepository:
             )
             if existing_digest is not None:
                 raise EditorialStateError("An existing Digest already uses this publication date")
+            existing_day_outcome = session.scalar(
+                select(EditorialDayOutcomeRecord).where(
+                    EditorialDayOutcomeRecord.publication_date == plan.publication_date
+                )
+            )
+            if existing_day_outcome is not None:
+                raise EditorialStateError(
+                    "An Editorial outcome already uses this publication date"
+                )
 
             included_story_ids: list[UUID] = []
             for item in plan.stories:
@@ -1567,6 +1811,31 @@ class EditorialRepository:
             ordered_story_ids = tuple(item.id for item in plan.included_stories)
             if set(included_story_ids) != set(ordered_story_ids):
                 raise EditorialStateError("Digest Plan included Story decisions are inconsistent")
+            if not ordered_story_ids:
+                session.flush()
+                outcome_record = EditorialDayOutcomeRecord(
+                    plan_id=plan.id,
+                    publication_date=plan.publication_date,
+                    outcome_kind=EditorialOutcomeKind.NO_PUBLICATION.value,
+                    digest_id=None,
+                    content_hash=plan.content_hash,
+                    actor_identifier=normalized_actor,
+                    completed_at=approved_at,
+                )
+                session.add(outcome_record)
+                _persist_raw_audit_event(
+                    session,
+                    operation_key=f"m4-editorial-plan:{plan.id}:no-publication",
+                    actor_identifier=normalized_actor,
+                    action="digest-plan.no-publication",
+                    subject_type="digest-plan",
+                    subject_id=plan.id,
+                    occurred_at=approved_at,
+                    sequence=0,
+                    attributes={"content_hash": plan.content_hash},
+                )
+                session.flush()
+                return self._outcome(session, outcome_record)
             draft = compose_digest(plan.publication_date, ordered_story_ids)
             published, digest_events = publish_digest(
                 draft,
@@ -1604,6 +1873,25 @@ class EditorialRepository:
                     approved_at=approved_at,
                 )
             )
+            outcome_record = EditorialDayOutcomeRecord(
+                plan_id=plan.id,
+                publication_date=plan.publication_date,
+                outcome_kind=EditorialOutcomeKind.PUBLISHED.value,
+                digest_id=draft.id,
+                content_hash=plan.content_hash,
+                actor_identifier=normalized_actor,
+                completed_at=approved_at,
+            )
+            session.add(outcome_record)
+            session.add(
+                RetrievalIndexFollowUpRecord(
+                    plan_id=plan.id,
+                    publication_date=plan.publication_date,
+                    state=RetrievalIndexFollowUpState.QUEUED.value,
+                    requested_at=approved_at,
+                    attempt_count=0,
+                )
+            )
             _persist_raw_audit_event(
                 session,
                 operation_key=f"m3-editorial-plan:{plan.id}:approved",
@@ -1623,7 +1911,113 @@ class EditorialRepository:
             digest_record.published_at = published.published_at
             _persist_audit_event(session, digest_events[1])
             session.flush()
-            return published
+            return self._outcome(session, outcome_record)
+
+    def _finish_retrieval_index_follow_ups(
+        self,
+        claim_id: UUID,
+        *,
+        completed_at: datetime,
+        index_id: UUID | None = None,
+        fault_code: str | None = None,
+        last_error: str | None = None,
+    ) -> tuple[RetrievalIndexFollowUp, ...]:
+        succeeded = index_id is not None
+        if succeeded == (fault_code is not None or last_error is not None):
+            raise ValueError("Follow-up completion must be either success or failure")
+        with Session(self._engine) as session, session.begin():
+            records = tuple(
+                session.scalars(
+                    select(RetrievalIndexFollowUpRecord)
+                    .where(
+                        RetrievalIndexFollowUpRecord.claim_id == claim_id,
+                        RetrievalIndexFollowUpRecord.state
+                        == RetrievalIndexFollowUpState.RUNNING.value,
+                    )
+                    .order_by(RetrievalIndexFollowUpRecord.plan_id)
+                    .with_for_update()
+                )
+            )
+            if not records:
+                raise EditorialStateError(
+                    "Retrieval-index follow-up claim is not active"
+                )
+            for sequence, record in enumerate(records):
+                record.state = (
+                    RetrievalIndexFollowUpState.SUCCEEDED.value
+                    if succeeded
+                    else RetrievalIndexFollowUpState.FAILED.value
+                )
+                record.completed_at = completed_at
+                record.lease_expires_at = None
+                record.index_id = index_id
+                record.fault_code = fault_code
+                record.last_error = last_error
+                _persist_raw_audit_event(
+                    session,
+                    operation_key=(
+                        f"m4-retrieval-index-follow-up:{record.plan_id}:"
+                        f"{claim_id}:{record.state}"
+                    ),
+                    actor_identifier="scheduler",
+                    action=f"retrieval-index-follow-up.{record.state}",
+                    subject_type="digest-plan",
+                    subject_id=record.plan_id,
+                    occurred_at=completed_at,
+                    sequence=sequence,
+                    attributes={
+                        "attempt_count": record.attempt_count,
+                        "claim_id": str(claim_id),
+                        "index_id": str(index_id) if index_id is not None else None,
+                        "fault_code": fault_code,
+                    },
+                )
+            session.flush()
+            return tuple(self._follow_up(record) for record in records)
+
+    def _outcome(
+        self,
+        session: Session,
+        record: EditorialDayOutcomeRecord,
+    ) -> EditorialApprovalOutcome:
+        digest = None
+        if record.digest_id is not None:
+            digest_record = session.get(DigestRecord, record.digest_id)
+            if digest_record is None:
+                raise EditorialStateError("Published Editorial outcome has no Digest")
+            digest = self._digest(session, digest_record)
+        follow_up_record = session.get(RetrievalIndexFollowUpRecord, record.plan_id)
+        return EditorialApprovalOutcome(
+            kind=EditorialOutcomeKind(record.outcome_kind),
+            plan_id=record.plan_id,
+            publication_date=record.publication_date,
+            content_hash=record.content_hash,
+            actor_identifier=record.actor_identifier,
+            completed_at=record.completed_at,
+            digest=digest,
+            follow_up=(
+                self._follow_up(follow_up_record)
+                if follow_up_record is not None
+                else None
+            ),
+        )
+
+    @staticmethod
+    def _follow_up(record: RetrievalIndexFollowUpRecord) -> RetrievalIndexFollowUp:
+        return RetrievalIndexFollowUp(
+            plan_id=record.plan_id,
+            publication_date=record.publication_date,
+            state=RetrievalIndexFollowUpState(record.state),
+            requested_at=record.requested_at,
+            attempt_count=record.attempt_count,
+            started_at=record.started_at,
+            completed_at=record.completed_at,
+            claim_id=record.claim_id,
+            lease_expires_at=record.lease_expires_at,
+            index_id=record.index_id,
+            fault_code=record.fault_code,
+            last_error=record.last_error,
+        )
 
     def digest_history(self, publication_date: date) -> DigestHistorySnapshot | None:
         with Session(self._engine) as session:
