@@ -23,6 +23,15 @@ def _publication_guard(
     require_publisher_diversity: bool,
     require_latest_plan: bool,
 ) -> str:
+    version_declarations = (
+        """
+            approved_plan_version integer;
+            latest_plan_version integer;"""
+        if require_latest_plan
+        else ""
+    )
+    plan_version_projection = ", plan.version" if require_latest_plan else ""
+    plan_version_target = ", approved_plan_version" if require_latest_plan else ""
     publisher_check = (
         """
                 IF publisher_count < 3 THEN
@@ -56,9 +65,7 @@ def _publication_guard(
             minimum_position integer;
             maximum_position integer;
             approved_story_count integer;
-            approved_content jsonb;
-            approved_plan_version integer;
-            latest_plan_version integer;
+            approved_content jsonb;{version_declarations}
             must_validate boolean := false;
         BEGIN
             IF NEW.state = 'published'
@@ -119,8 +126,8 @@ def _publication_guard(
                 END IF;
                 IF NEW.publication_contract = 'm3-editorial-plan' THEN
                     IF NEW.digest_plan_id IS NOT NULL THEN
-                        SELECT plan.content::jsonb, plan.version
-                        INTO approved_content, approved_plan_version
+                        SELECT plan.content::jsonb{plan_version_projection}
+                        INTO approved_content{plan_version_target}
                         FROM digest_plan_approvals AS approval
                         JOIN digest_plans AS plan ON plan.id = approval.plan_id
                         WHERE approval.plan_id = NEW.digest_plan_id

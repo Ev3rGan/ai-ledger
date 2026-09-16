@@ -456,6 +456,14 @@ run, and anonymous allowance boundary. If the old application cannot operate aga
 forward-compatible schema, stop and restore service from the candidate; do not improvise a schema
 downgrade.
 
+Schema revision 0014 adds immutable Digest Plan lineage that 0013 cannot represent. An
+`0014 → 0013` downgrade is available only before any derived Digest Plan exists. Once Story
+removal creates one, the migration refuses downgrade even if it was never approved or published;
+do not delete Plan history to bypass that guard. The downgrade also refuses an active published
+Digest that violates 0013's eight-Story or three-Publisher contract until that Digest is withdrawn.
+After lineage exists, roll the application forward against the 0014 schema or restore a verified
+pre-0014 backup into the isolated restore path.
+
 ## M4 live acceptance record
 
 The supervisor owns secret injection, Provider budget authorization, and timing. Record only

@@ -247,6 +247,8 @@ def test_current_docs_retire_direct_publication_and_classify_legacy_flows() -> N
         assert classification in inventory
 
     assert "18 enabled Source Profiles" in production_runbook
+    assert "any derived Digest Plan" in production_runbook
+    assert "never approved or published" in production_runbook
     assert "No legacy flow is deleted by Issue #119" in " ".join(inventory.split())
     assert "One-to-twelve Story quantity and Publisher warning" in inventory
     assert "#120" not in inventory

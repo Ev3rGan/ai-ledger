@@ -26,6 +26,12 @@ derivation records its predecessor, removed Story key, reason, and actor while p
 remaining Story, Claim, Evidence, and source facts. Plans support 1-12 included Stories; fewer than
 three Publishers produces a visible non-blocking warning.
 
+The derived Plan inherits `provider_identifier` and `protocol_version` from its predecessor. Those
+fields identify the originating Agent proposal and the protocol used for its sole Provider call;
+they do not claim that the operator derivation called, or was authored by, a newer Provider
+protocol. The derivation metadata and immutable `digest-plan.story-removed` audit event identify
+the local operator action separately.
+
 One administrative operator approves the exact plan once. Approval accepts its included Stories
 and publishes the unchanged Digest as one controlled action. Only the latest Plan version for the
 publication date may be approved or published; predecessor Plans remain readable as immutable
@@ -37,6 +43,10 @@ hidden model reasoning.
 
 Publication still waits for a human action, and a revised plan costs another review. In return,
 the public boundary stays legible, replayable, and attributable to an exact approved artifact.
+Once any derived Digest Plan exists, migration 0014 intentionally refuses a downgrade to 0013,
+even if that Plan was never approved or published: 0013 cannot represent the immutable lineage,
+and deleting it would violate this decision. Operational rollback must keep the forward-compatible
+schema or restore a verified pre-0014 backup rather than discard Plan history.
 
 ## Revisit trigger
 

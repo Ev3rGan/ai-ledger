@@ -1550,6 +1550,10 @@ def test_workflow_repeatedly_removes_stories_without_rewriting_history_or_callin
             story_c.stable_key,
         )
         assert tuple(item.order for item in third.included_stories) == (0, 1)
+        assert second.provider_identifier == first.provider_identifier
+        assert second.protocol_version == first.protocol_version
+        assert third.provider_identifier == first.provider_identifier
+        assert third.protocol_version == first.protocol_version
         assert third.derivation is not None
         assert third.derivation.previous_plan_id == second.id
         assert third.derivation.removed_story_stable_key == story_d.stable_key
@@ -2926,5 +2930,8 @@ def test_0014_downgrade_withdraws_relaxed_digest_then_restores_0013_guard(
             )
             assert "story_count NOT BETWEEN 8 AND 12" in publication_guard
             assert "publisher_count < 3" in publication_guard
+            assert "approved_plan_version" not in publication_guard
+            assert "latest_plan_version" not in publication_guard
+            assert "plan.version" not in publication_guard
     finally:
         engine.dispose()
