@@ -22,6 +22,8 @@ from sqlalchemy import text
 from sqlalchemy.engine import URL, Connection, Engine, make_url
 from sqlalchemy.exc import ArgumentError
 
+from ai_intel_agent.operator_console import OperatorSecurityConfiguration
+
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 COLLECTION_TIMES = (time(6, 0), time(18, 0))
 
@@ -166,11 +168,57 @@ class M1ProviderConfiguration:
 
 
 @dataclass(frozen=True)
+class M1OperatorConfiguration:
+    """Operator Host identity and OAuth secrets for the production Web process."""
+
+    security: OperatorSecurityConfiguration
+    github_client_id: str
+    github_client_secret: str = field(repr=False)
+
+    @classmethod
+    def from_environment(cls, environment: Mapping[str, str]) -> M1OperatorConfiguration:
+        public_host = environment.get("AI_INTEL_DOMAIN", "").strip()
+        operator_host = environment.get("AI_INTEL_OPERATOR_DOMAIN", "").strip()
+        github_client_id = environment.get("GITHUB_OAUTH_CLIENT_ID", "").strip()
+        if not public_host:
+            raise ValueError("Set AI_INTEL_DOMAIN for the production service")
+        if not operator_host:
+            raise ValueError("Set AI_INTEL_OPERATOR_DOMAIN for the Operator Console")
+        if not github_client_id:
+            raise ValueError("Set GITHUB_OAUTH_CLIENT_ID for the Operator Console")
+        raw_user_ids = environment.get("AI_INTEL_OPERATOR_GITHUB_USER_IDS", "")
+        try:
+            user_ids = frozenset(int(value) for value in raw_user_ids.split(",") if value)
+        except ValueError as error:
+            raise ValueError(
+                "AI_INTEL_OPERATOR_GITHUB_USER_IDS must be comma-separated numeric IDs"
+            ) from error
+        if not user_ids or any(user_id <= 0 for user_id in user_ids):
+            raise ValueError(
+                "AI_INTEL_OPERATOR_GITHUB_USER_IDS must contain positive numeric IDs"
+            )
+        return cls(
+            security=OperatorSecurityConfiguration(
+                public_host=public_host,
+                operator_host=operator_host,
+                operator_origin=f"https://{operator_host}",
+                allowed_github_user_ids=user_ids,
+            ),
+            github_client_id=github_client_id,
+            github_client_secret=injected_secret_from_environment(
+                environment,
+                "GITHUB_OAUTH_CLIENT_SECRET",
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class M1WebConfiguration:
-    """Web-only production contract loaded from its three injected secrets."""
+    """Web-only production contract for public Research and the Operator Host."""
 
     database: M1DatabaseConfiguration
     provider: M1ProviderConfiguration
+    operator: M1OperatorConfiguration
     anonymous_identity_salt: bytes = field(repr=False)
     anonymous_research_daily_limit: int
 
@@ -188,6 +236,7 @@ class M1WebConfiguration:
         return cls(
             database=M1DatabaseConfiguration.from_environment(environment),
             provider=M1ProviderConfiguration.from_environment(environment),
+            operator=M1OperatorConfiguration.from_environment(environment),
             anonymous_identity_salt=identity_salt.encode("utf-8"),
             anonymous_research_daily_limit=daily_limit,
         )

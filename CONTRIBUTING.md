@@ -29,9 +29,11 @@ If `uv` is not on `PATH`, use the executable documented in `AGENTS.md`.
 
 ## Frontend assets
 
-Browse and Research use a locked Vue/Vite workspace under `frontend/`. Node is
-required only to test and build these progressive-enhancement entry points; it
-is not part of the production runtime.
+Browse, Research, and the Operator Console use a locked Vue/Vite workspace under
+`frontend/`. Node is required only to test and build these browser entry points;
+it is not part of the production runtime. The Operator SPA starts at
+`frontend/src/operator.js`, uses `frontend/vite.operator.config.js`, and is loaded
+by `src/ai_intel_agent/templates/operator.html`.
 
 From the repository root, install exactly the locked packages, run the frontend
 tests, and rebuild the hashed assets with:
@@ -42,10 +44,10 @@ npm --prefix frontend test
 npm --prefix frontend run build
 ```
 
-The build refreshes the committed Vite manifest and hashed files under
-`src/ai_intel_agent/static/`. Include those generated changes whenever the
-frontend source changes so the Python application and packaged wheel serve the
-matching build.
+The build refreshes the committed Vite manifests and hashed files under both
+`src/ai_intel_agent/static/` and `src/ai_intel_agent/operator_static/`. Include
+the matching generated changes whenever public or Operator frontend source changes
+so the Python application and packaged wheel serve the reviewed build.
 
 ## Pull requests
 

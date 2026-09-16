@@ -420,7 +420,7 @@ def test_populated_0011_budget_migrates_to_50000_hard_cap(
     engine = create_database_engine(budget_hotfix_database_url)
     try:
         with engine.connect() as connection:
-            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0015"
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0016"
             row = connection.execute(
                 text(
                     """

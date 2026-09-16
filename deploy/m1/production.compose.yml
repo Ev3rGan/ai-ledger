@@ -52,6 +52,7 @@ services:
       - no-new-privileges:true
     environment:
       AI_INTEL_DOMAIN: ${AI_INTEL_DOMAIN:?required}
+      AI_INTEL_OPERATOR_DOMAIN: ${AI_INTEL_OPERATOR_DOMAIN:?required}
     ports:
       - "80:80"
       - "443:443"
@@ -103,12 +104,18 @@ services:
       AI_INTEL_SCHEDULE_BACKFILL_LIMIT: ${AI_INTEL_SCHEDULE_BACKFILL_LIMIT:?required}
       AI_INTEL_ANONYMOUS_ID_SALT_FILE: /run/secrets/anonymous-id-salt
       AI_INTEL_ANONYMOUS_RESEARCH_DAILY_LIMIT: ${AI_INTEL_ANONYMOUS_RESEARCH_DAILY_LIMIT:-3}
+      AI_INTEL_DOMAIN: ${AI_INTEL_DOMAIN:?required}
+      AI_INTEL_OPERATOR_DOMAIN: ${AI_INTEL_OPERATOR_DOMAIN:?required}
+      AI_INTEL_OPERATOR_GITHUB_USER_IDS: ${AI_INTEL_OPERATOR_GITHUB_USER_IDS:?required}
+      GITHUB_OAUTH_CLIENT_ID: ${GITHUB_OAUTH_CLIENT_ID:?required}
+      GITHUB_OAUTH_CLIENT_SECRET_FILE: /run/secrets/github-oauth-client-secret
       # Only Caddy owns public ports and this fixed edge address may set X-Forwarded-*.
       FORWARDED_ALLOW_IPS: "172.31.255.2"
     secrets:
       - database-password
       - deepseek-api-key
       - anonymous-id-salt
+      - github-oauth-client-secret
     volumes:
       - ${AI_INTEL_EMBEDDING_MODEL_DIR:?required}:/opt/ai-ledger/models/embedding:ro
       - ${AI_INTEL_RERANKER_MODEL_DIR:?required}:/opt/ai-ledger/models/reranker:ro
@@ -279,3 +286,5 @@ secrets:
     file: ${AI_INTEL_SECRETS_DIR:?required}/deepseek-api-key
   anonymous-id-salt:
     file: ${AI_INTEL_SECRETS_DIR:?required}/anonymous-id-salt
+  github-oauth-client-secret:
+    file: ${AI_INTEL_SECRETS_DIR:?required}/github-oauth-client-secret

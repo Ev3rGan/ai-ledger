@@ -28,6 +28,7 @@ import ai_intel_agent.cli as cli_module
 import ai_intel_agent.persistence as persistence_module
 import ai_intel_agent.web as web_module
 from ai_intel_agent.cli import app
+from ai_intel_agent.operator_console import OperatorSecurityConfiguration
 from ai_intel_agent.persistence import (
     PersistentMeteredProviderBudget,
     RetrievalRuntimeStateRecord,
@@ -121,6 +122,7 @@ def production_environment(
         "database-password": parsed_database.password or "",
         "provider-key": "fixture-provider-key",
         "identity-salt": "fixture-production-salt",
+        "github-oauth-secret": "fixture-github-oauth-secret",
     }
     secret_paths: dict[str, str] = {}
     for name, value in secret_values.items():
@@ -135,6 +137,11 @@ def production_environment(
         "AI_INTEL_DATABASE_PASSWORD_FILE": secret_paths["database-password"],
         "DEEPSEEK_API_KEY_FILE": secret_paths["provider-key"],
         "AI_INTEL_ANONYMOUS_ID_SALT_FILE": secret_paths["identity-salt"],
+        "AI_INTEL_DOMAIN": "public.example",
+        "AI_INTEL_OPERATOR_DOMAIN": "operator.example",
+        "AI_INTEL_OPERATOR_GITHUB_USER_IDS": "42,315310121",
+        "GITHUB_OAUTH_CLIENT_ID": "fixture-github-client",
+        "GITHUB_OAUTH_CLIENT_SECRET_FILE": secret_paths["github-oauth-secret"],
         "AI_INTEL_ANONYMOUS_RESEARCH_DAILY_LIMIT": "1",
         "AI_INTEL_PROVIDER_MONTHLY_BUDGET_CENTS": "50000",
         "AI_INTEL_PROVIDER_REQUEST_RESERVATION_CENTS": "100",
@@ -377,9 +384,16 @@ def test_production_configuration_reads_secrets_from_files_and_redacts_repr(
     assert parsed_database.database == production_environment["AI_INTEL_DATABASE_NAME"]
     assert configuration.anonymous_research_daily_limit == 1
     assert configuration.provider.monthly_budget_cents == 50_000
+    assert configuration.operator.security.public_host == "public.example"
+    assert configuration.operator.security.operator_host == "operator.example"
+    assert configuration.operator.security.allowed_github_user_ids == frozenset(
+        {42, 315310121}
+    )
+    assert configuration.operator.github_client_id == "fixture-github-client"
     assert parsed_database.password not in repr(configuration)
     assert "fixture-provider-key" not in repr(configuration)
     assert "fixture-production-salt" not in repr(configuration)
+    assert "fixture-github-oauth-secret" not in repr(configuration)
 
 
 def test_private_operator_status_reports_complete_operational_snapshot(
@@ -651,7 +665,7 @@ def test_production_serve_wires_secret_files_and_persistent_allowance(
         engine.dispose()
     assert retrieval_states["embedding"].fault_code == "embedding-unavailable"
     assert retrieval_states["reranker"].fault_code == "reranker-unavailable"
-    with TestClient(captured["app"]) as client:
+    with TestClient(captured["app"], base_url="https://public.example") as client:
         headers = {"X-AI-Anonymous-Client": "198.51.100.23"}
         first = client.post(
             "/research/answer",
@@ -711,6 +725,16 @@ def test_production_caddy_proxy_emits_https_absolute_rss_links(
         ),
         anonymous_research_daily_limit=1,
         anonymous_identity_salt=b"fixture-production-salt",
+        operator=SimpleNamespace(
+            security=OperatorSecurityConfiguration(
+                public_host="public.example",
+                operator_host="operator.example",
+                operator_origin="https://operator.example",
+                allowed_github_user_ids=frozenset({42}),
+            ),
+            github_client_id="fixture-github-client",
+            github_client_secret="fixture-github-secret",
+        ),
     )
     public_story = SimpleNamespace(
         stable_key="story:proxy-boundary",
@@ -961,6 +985,10 @@ def test_versioned_linux_bundle_keeps_only_https_boundary_public() -> None:
     assert "AI_INTEL_DATABASE_PASSWORD_FILE" in compose
     assert "DEEPSEEK_API_KEY_FILE" in compose
     assert "AI_INTEL_ANONYMOUS_ID_SALT_FILE" in compose
+    assert "GITHUB_OAUTH_CLIENT_SECRET_FILE" in compose
+    assert "AI_INTEL_OPERATOR_GITHUB_USER_IDS" in compose
+    assert "AI_INTEL_OPERATOR_DOMAIN" in compose
+    assert "GITHUB_OAUTH_CLIENT_ID" in compose
     migrate_block = compose.split("\n  migrate:\n", 1)[1].split("\n  restore-postgres:\n", 1)[0]
     assert "deepseek-api-key" not in migrate_block
     assert "anonymous-id-salt" not in migrate_block
@@ -968,6 +996,7 @@ def test_versioned_linux_bundle_keeps_only_https_boundary_public() -> None:
     assert 'group_add:\n    - "10001"' in compose
     assert "health/ready" in compose
     assert "{$AI_INTEL_DOMAIN}" in caddy
+    assert "{$AI_INTEL_OPERATOR_DOMAIN}" in caddy
     assert "X-AI-Anonymous-Client {client_ip}" in caddy
     assert "respond @internal_health 404" in caddy
     assert "USER 10001:10001" in dockerfile
@@ -1016,6 +1045,9 @@ def test_operator_script_supports_lifecycle_backup_restore_and_rollback() -> Non
         "AI_INTEL_IMAGE",
         "AI_INTEL_RELEASE",
         "AI_INTEL_DOMAIN",
+        "AI_INTEL_OPERATOR_DOMAIN",
+        "AI_INTEL_OPERATOR_GITHUB_USER_IDS",
+        "GITHUB_OAUTH_CLIENT_ID",
         "AI_INTEL_POSTGRES_DATABASE",
         "AI_INTEL_POSTGRES_USER",
         "AI_INTEL_SECRETS_DIR",
@@ -1029,6 +1061,10 @@ def test_operator_script_supports_lifecycle_backup_restore_and_rollback() -> Non
         "AI_INTEL_BACKUP_RETENTION_DAYS",
     ):
         assert f'"{release_key}=$(release_value "$release_file" {release_key})"' in compose_block
+    assert (
+        "for secret_name in database-password deepseek-api-key anonymous-id-salt "
+        "github-oauth-client-secret"
+    ) in operator
     assert "docker image inspect" in operator
     assert "org.opencontainers.image.revision" in operator
     image_revision_block = operator.split("validate_image_revision() {", 1)[1].split("\n}\n", 1)[0]

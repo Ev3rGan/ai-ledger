@@ -16,6 +16,7 @@ that would justify reopening the decision.
 8. [Focused source portfolio](0008-source-portfolio-boundary.md)
 10. [MiniLM Hybrid retrieval and mMARCO reranking](0010-minilm-mmarco-retrieval.md)
 11. [Record zero-Story outcomes and durable index follow-up](0011-zero-story-outcomes-and-index-follow-up.md)
+12. [Isolate the Operator Console by Host within the Web runtime](0012-isolate-operator-console-by-host.md)
 
 ## Deferred
 
