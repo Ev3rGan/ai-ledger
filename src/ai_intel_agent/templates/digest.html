@@ -1,0 +1,5 @@
+{% extends "base.html" %}
+{% block content %}
+<header class="page-header"><p class="eyebrow">Daily Digest</p><h1>{{ digest.publication_date.isoformat() }} AI Digest</h1>{% if digest.introduction %}<p class="lede">{{ digest.introduction }}</p>{% endif %}<p class="muted">共 {{ digest.stories|length }} 条已审核进展</p></header>
+<section aria-labelledby="digest-stories-heading"><h2 id="digest-stories-heading">今日重点</h2><div class="story-grid">{% with stories=digest.stories %}{% include "fragments/story_cards.html" %}{% endwith %}</div></section>
+{% endblock %}

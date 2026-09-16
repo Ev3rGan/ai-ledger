@@ -1,7 +1,8 @@
 # Local MVP runbook
 
-This runbook is the supported Windows-local path for the M1 service plus the current four-profile
-collector. It does not replace the existing editorial, publication, Web, or Research behavior.
+This runbook is the supported Windows-local path for the M1 service plus the collector over the
+current versioned Source Profile universe. It does not replace the existing editorial,
+publication, Web, or Research behavior.
 
 ## Prerequisites and process-only configuration
 
@@ -56,10 +57,17 @@ uv run ai-intel-agent collect-sources --operation-key <supervisor-recorded-key>
 uv run ai-intel-agent operator source-status
 uv run ai-intel-agent story list
 uv run ai-intel-agent story show <stable-key>
-uv run ai-intel-agent story accept <stable-key> --actor m4-operator
-uv run ai-intel-agent digest preview --date <Asia-Shanghai-date>
-uv run ai-intel-agent digest publish --date <Asia-Shanghai-date> --actor m4-operator
+uv run ai-intel-agent digest plan prepare --date <Asia-Shanghai-date>
+uv run ai-intel-agent digest plan show <plan-id>
+uv run ai-intel-agent digest plan approve <plan-id> --content-hash <displayed-sha256> --actor local-operator
 ```
+
+The plan display is the review surface: inspect every included Story, Claim, Evidence Span,
+source-health snapshot, anomaly, content hash, and current-state hash before approving. Direct
+`story accept`, `story reject`, `digest preview`, and `digest publish` are retired compatibility
+commands and are not part of the supported operator path. The legacy eight-Story and
+three-Publisher checks are tracked for repair in Issue #120; do not present them as product
+requirements or manually curate around them.
 
 Observe these public URLs through a real browser session:
 
@@ -75,7 +83,7 @@ answer and click its Story, Claim, and Evidence links. Then ask an unrelated uns
 and verify explicit insufficient-Evidence refusal with zero citations. Run `collect-sources` again
 with the same operation key and verify the summary reports a replay and the operator views show no
 duplicate Candidate, Document Version, Story, Claim, or Evidence. Then run with a new operation key
-and unchanged Feed cursors and verify all four source results are `empty`.
+and unchanged Feed cursors and verify every scheduled Source Profile result is `empty`.
 
 `collect-sources` is a live backfill and Provider command. Do not run it merely to validate the
 release: it requires explicit M2 live-acceptance authorization, an isolated or approved target

@@ -1281,11 +1281,18 @@ def test_versioned_editorial_provider_protocol_is_strict_and_uses_no_live_networ
     assert len(protocol.content_sha256) == 64
     assert protocol.maximum_pending_stories == 12
     assert protocol.maximum_output_tokens == 4096
-    assert protocol.version == "editorial-digest-plan-2026-08-26.v2"
+    assert protocol.version == "editorial-digest-plan-2026-09-15.v3"
     assert len(budget.reservations) == 1
     assert budget.reservations[0].actual_cost == Decimal("0.000924")
     assert len(observed_requests) == 1
     assert observed_requests[0]["max_tokens"] == 4096
+    provider_messages = observed_requests[0]["messages"]
+    assert [message["role"] for message in provider_messages] == ["system", "user"]
+    system_prompt = provider_messages[0]["content"]
+    assert "exactly stable_key, inclusion, order, summary, why_it_matters" in system_prompt
+    assert "normalized Simplified Chinese" in system_prompt
+    assert "consistent terminology" in system_prompt
+    assert "one coherent editorial voice" in system_prompt
 
     invalid_output = json.loads(json.dumps(provider_output))
     invalid_output["stories"][0]["evidence"] = "invented Evidence"

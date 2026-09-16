@@ -1,7 +1,8 @@
 # Public multi-source v2 production runbook
 
-This is the supported Issue #57 M4 procedure integrating the M1 service, current four-profile
-collector, and M3 editorial/publication loop. It keeps the public Web behind Caddy automatic
+This is the supported production procedure for the M1 service lineage, the collector over the
+current versioned Source Profile universe, and the exact Digest Plan editorial/publication loop.
+It keeps the public Web behind Caddy automatic
 HTTPS and PostgreSQL reachable only on an internal Compose network. M4 does not change the
 public security boundary, allowance ledger, backup/restore, rollback, secret handling, or add an
 administrator Web surface.
@@ -225,28 +226,34 @@ Infrastructure ownership remains with the user. After purchasing or selecting th
 Any missing real domain/certificate, public browser path, Provider counter proof, restart
 persistence, isolated restore, rollback, or secret audit makes live M1 acceptance incomplete.
 
-## Current live-source acceptance gate
+## Historical four-feed live-source acceptance gate
 
-The active Source Profile set uses only these public discovery URLs:
+The original M1 live-source probe used only these public discovery URLs:
 
 - `https://the-decoder.com/feed/`
 - `https://techcrunch.com/category/artificial-intelligence/feed/`
 - `https://huggingface.co/blog/feed.xml`
 - `https://www.qbitai.com/feed/`
 
-The earlier implementation probe is historical evidence and included a Source Profile that is now
-retired. Its immutable baseline remains linked from the
+That probe is historical evidence and included a Source Profile that is now retired. Its immutable
+baseline remains linked from the
 [historical evidence index](archive/README.md); it is not current activation policy. Ordinary
 repository validation makes no live request to the four URLs above.
 
+The current versioned universe contains 18 enabled Source Profiles across the core and supplemental
+groups, plus one disabled authorization-required profile. Treat
+`src/ai_intel_agent/data/source_profiles.v1.json` and `operator source-status --production` as the
+current source-count authorities; the four URLs above remain a bounded historical acceptance set.
+
 Do not run `collect-sources`, start a live backfill, or let the M2 Scheduler reach a collection
-slot until the supervisor explicitly authorizes the applicable live-acceptance gate. After authorization,
-use only the four active versioned Source Profiles and record URLs, response status/behavior,
-counters, and identifiers—not raw fetched bodies or credentials. Verify TechCrunch discovery uses
-only its AI category Feed; one forced source failure leaves useful results from the other sources; and a
-same-key replay plus a new-key unchanged-cursor run creates no duplicates. Run
+slot until the supervisor explicitly authorizes the applicable live-acceptance gate. Do not rerun
+the historical four-feed probe as current activation policy. After authorization, use the enabled
+versioned Source Profiles and record URLs, response status/behavior, counters, and identifiers—not
+raw fetched bodies or credentials. Verify each source follows its versioned discovery and body
+policy; one forced source failure leaves useful results from the other sources; and a same-key
+replay plus a new-key unchanged-cursor run creates no duplicates. Run
 `operator source-status --production` before and after collection and preserve the M1 acceptance
-record above. A missing real Feed/article observation, real budgeted Provider draft, idempotency
+record above as history only. A missing real source observation, real budgeted Provider draft, idempotency
 proof, source-isolation proof, or exact Candidate-to-Evidence provenance leaves M2 live acceptance
 incomplete.
 
@@ -320,36 +327,35 @@ bash deploy/m1/operate.sh operator story list --state unreviewed
 ```
 
 The combined status reports the deployed commit, database readiness, Scheduler state and next
-execution, latest multi-source Collection Run, all four source health snapshots, pending review
+execution, latest multi-source Collection Run, all enabled source health snapshots, pending review
 count, and latest published Digest. It never reports the database URL, credentials, source body,
 Evidence text, or Provider response.
 
-Inspect every draft before deciding. Acceptance requires operator-authored reader metadata;
-rejection remains explicit:
+Inspect every pending Story before asking the Editorial Agent to prepare one immutable Plan:
 
 ```bash
 bash deploy/m1/operate.sh operator story show <stable-key>
-bash deploy/m1/operate.sh operator story accept <stable-key> \
-  --summary '<reviewed summary>' \
-  --why-it-matters '<reviewed significance>' \
-  --topic <Topic> \
-  --actor m4-operator
-bash deploy/m1/operate.sh operator story reject <stable-key> --actor m4-operator
+bash deploy/m1/operate.sh operator digest plan prepare --date <Asia-Shanghai-date>
 ```
 
-Select 8-12 accepted Stories from at least three Publishers. Repeat `--story` in the intended
-order for both preview and publish; publish exactly what was previewed:
+The prepare output records the Plan ID, immutable content hash, current-state hash, source and
+scheduler snapshots, Story decisions, ordering, and blockers. Re-open that exact Plan before the
+single approval action, then supply the displayed content hash unchanged:
 
 ```bash
-bash deploy/m1/operate.sh operator digest preview --date <Asia-Shanghai-date> \
-  --story <first-key> --story <second-key> --story <...>
-bash deploy/m1/operate.sh operator digest publish --date <Asia-Shanghai-date> \
-  --introduction '<reviewed daily introduction>' \
-  --story <first-key> --story <second-key> --story <...> \
-  --actor m4-operator
+bash deploy/m1/operate.sh operator digest plan show <plan-id>
+bash deploy/m1/operate.sh operator digest plan approve <plan-id> \
+  --content-hash <displayed-sha256> \
+  --actor production-operator
 bash deploy/m1/operate.sh operator operator retrieval index --production
 bash deploy/m1/operate.sh operator operator retrieval status --production --require-hybrid
 ```
+
+Direct `story accept`, `story reject`, `digest preview`, and `digest publish` are retired
+compatibility surfaces and are not a supported production workflow. The eight-Story and
+three-Publisher checks still present in the legacy planning contract are compatibility debt
+scheduled for Issue #120, not product invariants. Record a blocker from those checks as such;
+do not bypass it with direct publication commands.
 
 Research detects accepted published Documents that are newer than the active retrieval generation,
 reports `documents_pending_index`, and disables stale semantic/entity candidates while retaining the
@@ -361,7 +367,7 @@ public projection, not CLI prose copied into an acceptance report, are the sourc
 
 ## Bounded backfill to incremental schedule
 
-Initial backfill and subsequent scheduled collection use the same four active Source Profiles,
+Initial backfill and subsequent scheduled collection use the enabled versioned Source Profiles,
 body gate, cursor, canonical identity, operation-key idempotency, and Provider budget. A backfill
 requires an explicit supervisor-approved unique operation key and a limit no greater than the
 recorded scheduled limit:
@@ -453,9 +459,9 @@ values, source bodies, Evidence text, model responses, or anonymous-client ident
 M4 is incomplete until one frozen candidate proves all of the following in the same deployed
 state:
 
-- all four active Feeds and the body gate, with no retired profile in scheduler or status output;
-- real DeepSeek draft preparation and the operator review/order/publish loop;
-- one public Digest with 8-12 real Stories from at least three Publishers;
+- the enabled versioned Source Profiles and body gate, with no retired profile in scheduler or status output;
+- real DeepSeek draft preparation and the exact Digest Plan review/approval loop;
+- one public Digest that exactly matches the approved immutable Plan;
 - anonymous HTTPS Home → Digest → Story/source, Browse, RSS, and Research;
 - supported Research, insufficient-Evidence refusal, and allowance rejection with no excess
   Provider call;

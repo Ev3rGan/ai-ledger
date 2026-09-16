@@ -17,7 +17,7 @@
 AI Ledger 是一个紧凑的公共 AI 情报服务，让读者追踪行业进展时不会失去背后的证据。它从版本化来源组合中采集信息，生成 Claim 级可追溯记录，把发布权留给 operator，并且只依据已接受知识回答 Research 问题。
 
 > [!IMPORTANT]
-> 自动化可以采集、起草、排序和编排，但不能自行发布。只有 operator 直接接受 Story，或批准一份 exact、immutable Digest Plan 后，公开 Digest 才会出现。
+> 自动化可以采集、起草、排序和编排，但不能自行发布。只有 operator 批准一份 exact、immutable Digest Plan 后，公开 Digest 才会出现。
 
 ## 🌱 为什么需要 AI Ledger
 
@@ -36,12 +36,14 @@ AI Ledger 是一个紧凑的公共 AI 情报服务，让读者追踪行业进展
 | --- | --- |
 | 受控采集 | Source Profile 定义允许访问的范围、证据强度、正文或结构化数据门禁、cursor 与故障隔离行为。 |
 | 可追溯草稿 | Provider 辅助起草 Story、Claim 与 Evidence 记录，但不能接受或发布。 |
-| 人类门禁编辑 | Operator 可以直接审核 Story，或批准一份完整且不可变的 Editorial Agent 计划。 |
+| 人类门禁编辑 | Operator 检查一份完整且不可变的 Editorial Agent 计划，并且只批准该精确版本一次。 |
 | Hybrid retrieval | PostgreSQL FTS 与 Entity candidates 同 MiniLM 向量融合，再经过唯一的 mMARCO reranking stage；模型不可用时显式回退。 |
 | 有边界的 Research | Lookup、comparison、timeline 与 bounded multi-hop 使用相互隔离的 Evidence Set、严格时间语义和 fail-closed 引用检查。 |
-| 公共投影 | Home、Digest、Story、Browse、RSS 与 Research 只暴露已发布知识，不暴露 operator 控件或 hidden reasoning。 |
+| PublicContent 投影 | Home、Digest、Archive、Story、Browse、RSS 与 Research 入口页共享唯一公共安全读取边界，不暴露 operator 控件、原始来源正文或 hidden reasoning。 |
 
 M1–M5 的产品范围与发布记录保留在 [#70](https://github.com/Ev3rGan/ai-ledger/issues/70)、[#71](https://github.com/Ev3rGan/ai-ledger/issues/71)、[#72](https://github.com/Ev3rGan/ai-ledger/issues/72)、[#73](https://github.com/Ev3rGan/ai-ledger/issues/73) 与 [#74](https://github.com/Ev3rGan/ai-ledger/issues/74) 中。当前构建健康度以 [CI](https://github.com/Ev3rGan/ai-ledger/actions/workflows/ci.yml) 为准，不在 README 中复制历史测试数字。
+
+直接接受/拒绝 Story 与直接 preview/publish Digest 的命令已经退役。旧八条 Story 与三家 Publisher 门槛是由 [#120](https://github.com/Ev3rGan/ai-ledger/issues/120) 跟进的兼容债务，不是受支持的产品不变量。证据与删除门槛见[旧流程清单](docs/legacy-flow-inventory.md)。
 
 ## 🚀 体验产品
 
@@ -87,7 +89,7 @@ uv run ai-intel-agent start-local
 flowchart LR
     A["获批公开来源"] --> B["有边界的采集<br/>与证据门禁"]
     B --> C["Story → Claim → Evidence"]
-    C --> D["直接审核或<br/>不可变 Digest Plan"]
+    C --> D["不可变 Digest Plan"]
     D --> E{"Operator 是否批准<br/>exact content?"}
     E -- "是" --> F["已发布 Digest"]
     E -- "否" --> G["保持未发布"]

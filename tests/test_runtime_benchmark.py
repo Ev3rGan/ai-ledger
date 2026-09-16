@@ -22,6 +22,11 @@ from ai_intel_agent.runtime_benchmark import (
 from ai_intel_agent.runtime_workload import WORKLOAD_VERSION, create_runtime_workload_server
 
 runner = CliRunner()
+FIXED_COMPARISON_AT = datetime(2026, 8, 13, 8, tzinfo=UTC)
+
+
+def _fixed_comparison_clock() -> datetime:
+    return FIXED_COMPARISON_AT
 
 
 def test_fixed_protocol_and_workload_publish_the_same_v2_version() -> None:
@@ -200,7 +205,11 @@ def test_compare_requires_complete_same_protocol_evidence_and_recommends_by_gate
     ]
     output = tmp_path / "hong-kong-runtime-benchmark.md"
 
-    comparison = compare_hong_kong_runtime_results(inputs, output)
+    comparison = compare_hong_kong_runtime_results(
+        inputs,
+        output,
+        now=_fixed_comparison_clock,
+    )
 
     report = output.read_text(encoding="utf-8")
     assert comparison["recommendation"] == "tencent-lighthouse-hk"
@@ -225,7 +234,11 @@ def test_compare_requires_complete_same_protocol_evidence_and_recommends_by_gate
         RuntimeBenchmarkConfigurationError,
         match="exactly one result for each configured candidate",
     ):
-        compare_hong_kong_runtime_results(inputs[:2], tmp_path / "incomplete.md")
+        compare_hong_kong_runtime_results(
+            inputs[:2],
+            tmp_path / "incomplete.md",
+            now=_fixed_comparison_clock,
+        )
 
     mismatched = json.loads(inputs[-1].read_text(encoding="utf-8"))
     mismatched["workload_image_sha256"] = "b" * 64
@@ -236,7 +249,11 @@ def test_compare_requires_complete_same_protocol_evidence_and_recommends_by_gate
         RuntimeBenchmarkConfigurationError,
         match="same workload image SHA-256",
     ):
-        compare_hong_kong_runtime_results(inputs, tmp_path / "mixed-images.md")
+        compare_hong_kong_runtime_results(
+            inputs,
+            tmp_path / "mixed-images.md",
+            now=_fixed_comparison_clock,
+        )
 
 
 def test_compare_rejects_substituted_probes_nodes_windows_and_stale_prices(
@@ -259,7 +276,11 @@ def test_compare_rejects_substituted_probes_nodes_windows_and_stale_prices(
         json.dumps(substituted, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     with pytest.raises(RuntimeBenchmarkConfigurationError, match="exactly once"):
-        compare_hong_kong_runtime_results(inputs, tmp_path / "substituted.md")
+        compare_hong_kong_runtime_results(
+            inputs,
+            tmp_path / "substituted.md",
+            now=_fixed_comparison_clock,
+        )
 
     inputs[0] = _write_candidate_result(
         tmp_path, "tencent-lighthouse-hk", "13.20", 80
@@ -270,7 +291,11 @@ def test_compare_rejects_substituted_probes_nodes_windows_and_stale_prices(
         json.dumps(repeated_node, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     with pytest.raises(RuntimeBenchmarkConfigurationError, match="distinct candidate"):
-        compare_hong_kong_runtime_results(inputs, tmp_path / "same-node.md")
+        compare_hong_kong_runtime_results(
+            inputs,
+            tmp_path / "same-node.md",
+            now=_fixed_comparison_clock,
+        )
 
     inputs[1] = _write_candidate_result(tmp_path, "aws-lightsail-hk", "24.00", 120)
     late = json.loads(inputs[2].read_text(encoding="utf-8"))
@@ -305,7 +330,11 @@ def test_compare_rejects_substituted_probes_nodes_windows_and_stale_prices(
         json.dumps(contradictory, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     with pytest.raises(RuntimeBenchmarkConfigurationError, match="contradicts"):
-        compare_hong_kong_runtime_results(inputs, tmp_path / "contradictory-cost.md")
+        compare_hong_kong_runtime_results(
+            inputs,
+            tmp_path / "contradictory-cost.md",
+            now=_fixed_comparison_clock,
+        )
 
 
 def test_compare_rejects_non_boolean_measurement_results(tmp_path: Path) -> None:
@@ -321,7 +350,11 @@ def test_compare_rejects_non_boolean_measurement_results(tmp_path: Path) -> None
     )
 
     with pytest.raises(RuntimeBenchmarkConfigurationError, match="must be booleans"):
-        compare_hong_kong_runtime_results(inputs, tmp_path / "invalid-passed.md")
+        compare_hong_kong_runtime_results(
+            inputs,
+            tmp_path / "invalid-passed.md",
+            now=_fixed_comparison_clock,
+        )
 
 
 def test_probe_requires_candidate_official_price_evidence(tmp_path: Path) -> None:

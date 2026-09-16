@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block content %}
+<header class="page-header"><p class="eyebrow">Published knowledge</p><h1>Browse</h1><p class="lede">按关键词、发布者、主题和原始发布日期查找已发布内容。</p></header>
+<section id="browse-app" data-vue-mount="browse" aria-label="Browse 交互边界">
+  <form class="browse-form" method="get" action="/browse">
+    <label>关键词<input name="q" type="search" value="{{ query or '' }}" placeholder="模型、公司或事实"></label>
+    <label>发布者<select name="source"><option value="">全部来源</option>{% for source in sources %}<option value="{{ source }}"{% if source == selected_publisher %} selected{% endif %}>{{ source }}</option>{% endfor %}</select></label>
+    <label>主题<select name="topic"><option value="">全部主题</option>{% for available_topic in topics %}<option value="{{ available_topic.value }}"{% if available_topic == selected_topic %} selected{% endif %}>{{ available_topic.value }}</option>{% endfor %}</select></label>
+    <label>原始发布日期<input name="date" type="date" value="{{ publication_date.isoformat() if publication_date else '' }}"></label>
+    <button type="submit">筛选</button>
+  </form>
+  <p class="muted">找到 {{ stories|length }} 条 Story</p>
+  {% if stories %}<div class="story-grid">{% include "fragments/story_cards.html" %}</div>{% else %}<p class="empty-state">没有符合这些条件的已发布 Story。</p>{% endif %}
+</section>
+{% endblock %}

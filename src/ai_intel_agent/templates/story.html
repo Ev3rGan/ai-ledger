@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% from "components.html" import claim_item %}
+{% block content %}
+<article class="story-detail">
+  <header class="page-header">
+    {% if story.primary_topic %}<p class="eyebrow">{{ story.primary_topic.value }}{% for topic in story.secondary_topics %} · {{ topic.value }}{% endfor %}</p>{% endif %}
+    <h1>{{ story.headline }}</h1>
+    {% if story.lead %}<p class="story-summary">{{ story.lead }}</p>{% else %}<p class="muted">暂无可公开的导语。</p>{% endif %}
+    <p class="story-meta"><span>{{ story.publisher }}</span><span>原始发布时间 {{ story.original_published_at.isoformat() if story.original_published_at else "时间未知" }}</span></p>
+  </header>
+  {% if story.what_happened %}
+    <section aria-labelledby="what-happened-heading">
+      <h2 id="what-happened-heading">发生了什么</h2>
+      {{ claim_item(story.what_happened, "关键事实", evidence_labels) }}
+    </section>
+    <section aria-labelledby="key-changes-heading">
+      <h2 id="key-changes-heading">关键变化</h2>
+      {% for claim in story.key_changes %}{{ claim_item(claim, "变化 " ~ loop.index, evidence_labels) }}{% else %}<p class="empty-state">暂无更多可公开的关键变化。</p>{% endfor %}
+    </section>
+  {% else %}
+    <section aria-labelledby="what-happened-heading">
+      <h2 id="what-happened-heading">发生了什么与关键变化</h2>
+      <p class="empty-state">暂无可公开的事实与关键变化。</p>
+    </section>
+  {% endif %}
+  <section class="importance" aria-labelledby="importance-heading"><h2 id="importance-heading">为什么重要</h2>{% if story.why_it_matters %}<p>{{ story.why_it_matters }}</p>{% else %}<p>暂无可公开的影响说明。</p>{% endif %}</section>
+  <details class="source-details"><summary>来源与依据（Evidence）总览</summary><p class="source-meta">来源信息按已发布 Story 的持久化来源原样呈现。</p>{% if story.canonical_url %}<a class="source-link" href="{{ story.canonical_url }}" rel="noopener noreferrer">阅读 {{ story.publisher }} 原文</a>{% else %}<p class="source-meta">暂无安全的公开来源链接。</p>{% endif %}</details>
+</article>
+{% endblock %}

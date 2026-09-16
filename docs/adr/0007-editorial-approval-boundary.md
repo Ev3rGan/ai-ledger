@@ -5,9 +5,9 @@
 
 ## Context
 
-The product prepares traceable Story drafts and supports direct operator review. The Editorial
-Agent reduces composition work by preparing a complete proposal without allowing a model to
-silently decide what becomes public.
+The product prepares traceable Story drafts. The Editorial Agent reduces composition work by
+preparing a complete proposal without allowing a model to silently decide what becomes public.
+Earlier direct Story review and Digest publication commands are retired compatibility surfaces.
 
 ## Alternatives
 
@@ -18,9 +18,11 @@ silently decide what becomes public.
 
 ## Decision
 
-Each Editorial Agent proposal is one complete, versioned, immutable Digest Plan: 8-12 selected
-Stories, ordering, summary, why-it-matters text, Topics, exclusions, and anomaly flags. The
-persisted plan has a content identity that binds the approval to that exact proposal.
+Each Editorial Agent proposal is one complete, versioned, immutable Digest Plan: Story decisions,
+ordering, summary, why-it-matters text, Topics, exclusions, and anomaly flags. The persisted plan
+has a content identity that binds the approval to that exact proposal. The legacy implementation's
+eight-Story and three-Publisher checks are compatibility debt tracked by Issue #120, not part of
+this approval invariant.
 
 One administrative operator approves the exact plan once. Approval accepts its included Stories
 and publishes the unchanged Digest as one controlled action. The Agent never approves or

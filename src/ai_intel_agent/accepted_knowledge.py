@@ -51,7 +51,7 @@ from ai_intel_agent.persistence import (
     reserve_database_acquisition_budget,
 )
 from ai_intel_agent.publication import (
-    PublicPublicationRepository,
+    PublicContent,
     bounded_public_evidence_excerpt,
 )
 
@@ -1983,7 +1983,7 @@ def _accepted_evidence_conditions() -> tuple[Any, ...]:
         StoryRecord.review_state == StoryReviewState.ACCEPTED.value,
         EvidenceSpanRecord.relation == EvidenceRelation.SUPPORTS.value,
         EvidenceSpanRecord.role != EvidenceRole.COMMUNITY.value,
-        PublicPublicationRepository.public_story_exists(StoryRecord.id),
+        PublicContent.public_story_exists(StoryRecord.id),
     )
 
 

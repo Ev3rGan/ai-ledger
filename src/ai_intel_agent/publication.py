@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from sqlalchemy import Select, exists, func, select
@@ -37,10 +38,11 @@ PUBLIC_EVIDENCE_EXCERPT_MAX_CHARACTERS = 280
 @dataclass(frozen=True)
 class PublicEvidence:
     id: UUID
+    source_id: UUID
     exact_text: str
     role: EvidenceRole
     relation: EvidenceRelation
-    canonical_url: str
+    canonical_url: str | None
     publisher: str
 
 
@@ -62,7 +64,7 @@ class PublicClaim:
             return EvidenceState.CONFLICT
 
         corroborating_sources = {
-            item.canonical_url
+            item.source_id
             for item in non_community
             if item.relation is EvidenceRelation.SUPPORTS
             and item.role in (EvidenceRole.PRIMARY, EvidenceRole.INDEPENDENT)
@@ -85,9 +87,23 @@ class PublicStory:
     primary_topic: Topic | None
     secondary_topics: tuple[Topic, ...]
     publisher: str
-    canonical_url: str
+    canonical_url: str | None
     original_published_at: datetime | None
     claims: tuple[PublicClaim, ...]
+
+    @property
+    def lead(self) -> str | None:
+        return _non_empty_text(self.summary)
+
+    @property
+    def what_happened(self) -> PublicClaim | None:
+        """Map the first position-ordered Claim to the lead factual section."""
+        return self.claims[0] if self.claims else None
+
+    @property
+    def key_changes(self) -> tuple[PublicClaim, ...]:
+        """Map remaining position-ordered Claims to the additional changes section."""
+        return self.claims[1:]
 
 
 @dataclass(frozen=True)
@@ -123,8 +139,8 @@ class _StoryBuilder:
     claims_by_id: dict[UUID, _ClaimBuilder] = field(default_factory=dict)
 
 
-class PublicPublicationRepository:
-    """Read the bounded public projection of published Digests."""
+class PublicContent:
+    """Own the bounded, public-safe projection consumed by every public surface."""
 
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
@@ -260,6 +276,7 @@ class PublicPublicationRepository:
                 EvidenceSpanRecord.exact_text,
                 EvidenceSpanRecord.role,
                 EvidenceSpanRecord.relation,
+                evidence_candidate.id.label("evidence_source_id"),
                 evidence_candidate.canonical_url,
                 evidence_candidate.publisher,
             )
@@ -373,10 +390,11 @@ class PublicPublicationRepository:
                 claim.evidence.append(
                     PublicEvidence(
                         id=row.evidence_id,
+                        source_id=row.evidence_source_id,
                         exact_text=bounded_public_evidence_excerpt(row.exact_text),
                         role=EvidenceRole(row.role),
                         relation=EvidenceRelation(row.relation),
-                        canonical_url=row.canonical_url,
+                        canonical_url=_public_http_url(row.canonical_url),
                         publisher=row.publisher,
                     )
                 )
@@ -391,7 +409,7 @@ class PublicPublicationRepository:
                 primary_topic=story.primary_topic,
                 secondary_topics=story.secondary_topics,
                 publisher=story.publisher,
-                canonical_url=story.canonical_url,
+                canonical_url=_public_http_url(story.canonical_url),
                 original_published_at=story.original_published_at,
                 claims=tuple(
                     PublicClaim(
@@ -410,3 +428,25 @@ def bounded_public_evidence_excerpt(exact_text: str) -> str:
     if len(exact_text) <= PUBLIC_EVIDENCE_EXCERPT_MAX_CHARACTERS:
         return exact_text
     return exact_text[: PUBLIC_EVIDENCE_EXCERPT_MAX_CHARACTERS - 1] + "…"
+
+
+def _non_empty_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _public_http_url(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if value != value.strip() or any(ord(character) < 32 or ord(character) == 127 for character in value):
+        return None
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return value
+
+
+# Compatibility name for internal callers migrating to the unified PublicContent boundary.
+PublicPublicationRepository = PublicContent

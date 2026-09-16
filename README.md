@@ -17,7 +17,7 @@
 AI Ledger is a compact public-intelligence service for following AI developments without losing the evidence behind them. It collects from a versioned source portfolio, drafts claim-level records, keeps publication under explicit operator control, and answers research questions only from accepted knowledge.
 
 > [!IMPORTANT]
-> Automation may collect, draft, rank, and compose. It cannot publish by itself. A public Digest appears only after an operator directly accepts Stories or approves one exact, immutable Digest Plan.
+> Automation may collect, draft, rank, and compose. It cannot publish by itself. A public Digest appears only after an operator approves one exact, immutable Digest Plan.
 
 ## 🌱 Why AI Ledger
 
@@ -36,12 +36,14 @@ Fast AI news is plentiful; evidence you can inspect and publication decisions yo
 | --- | --- |
 | Controlled acquisition | Source profiles define allowed access, evidence strength, article-body or structured-data gates, cursors, and isolated failure behavior. |
 | Traceable drafting | Provider-backed drafting produces Story, Claim, and Evidence records but cannot accept or publish them. |
-| Human-gated editing | Operators may review Stories directly or approve one complete, immutable Editorial Agent plan. |
+| Human-gated editing | Operators inspect one complete, immutable Editorial Agent plan and approve that exact version once. |
 | Hybrid retrieval | PostgreSQL full-text and Entity candidates combine with MiniLM vectors and a single mMARCO reranking stage, with an explicit model-free fallback. |
 | Bounded Research | Lookup, comparison, timeline, and bounded multi-hop questions use isolated Evidence Sets, strict time semantics, and fail-closed citation checks. |
-| Public projections | Home, Digest, Story, Browse, RSS, and Research expose published knowledge without operator controls or hidden reasoning. |
+| PublicContent projection | Home, Digest, Archive, Story, Browse, RSS, and the Research entry page share one public-safe read boundary without operator controls, raw source bodies, or hidden reasoning. |
 
 The M1–M5 product scopes and release records remain available in [#70](https://github.com/Ev3rGan/ai-ledger/issues/70), [#71](https://github.com/Ev3rGan/ai-ledger/issues/71), [#72](https://github.com/Ev3rGan/ai-ledger/issues/72), [#73](https://github.com/Ev3rGan/ai-ledger/issues/73), and [#74](https://github.com/Ev3rGan/ai-ledger/issues/74). Current build health is reported by [CI](https://github.com/Ev3rGan/ai-ledger/actions/workflows/ci.yml), not by a copied historical test count.
+
+Direct Story accept/reject and direct Digest preview/publish commands are retired workflow surfaces. The legacy eight-Story and three-Publisher gates remain compatibility debt scheduled for [#120](https://github.com/Ev3rGan/ai-ledger/issues/120), not supported product invariants. See the [legacy-flow inventory](docs/legacy-flow-inventory.md) for the evidence and deletion gates.
 
 ## 🚀 Explore the product
 
@@ -87,7 +89,7 @@ uv run ai-intel-agent start-local
 flowchart LR
     A["Approved public sources"] --> B["Bounded acquisition<br/>and evidence gates"]
     B --> C["Story → Claim → Evidence"]
-    C --> D["Direct review or<br/>immutable Digest Plan"]
+    C --> D["Immutable Digest Plan"]
     D --> E{"Operator approves<br/>the exact content?"}
     E -- "Yes" --> F["Published Digest"]
     E -- "No" --> G["Remains unpublished"]
