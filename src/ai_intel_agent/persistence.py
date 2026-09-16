@@ -73,6 +73,7 @@ from ai_intel_agent.editorial import (
     SourceHealthInspection,
     StoryInspection,
     compose_digest,
+    derive_digest_plan_story_removal,
     editorial_window_for,
     load_editorial_agent_protocol,
     publish_digest,
@@ -323,6 +324,21 @@ class DigestPlanRecord(Base):
             "version",
             name="uq_digest_plans_publication_version",
         ),
+        UniqueConstraint(
+            "previous_plan_id",
+            name="uq_digest_plans_previous_plan_id",
+        ),
+        CheckConstraint(
+            "(previous_plan_id IS NULL AND removed_story_stable_key IS NULL "
+            "AND removal_reason IS NULL) OR "
+            "(previous_plan_id IS NOT NULL AND removed_story_stable_key IS NOT NULL "
+            "AND removal_reason IS NOT NULL)",
+            name="ck_digest_plans_derivation_fields",
+        ),
+        CheckConstraint(
+            "removal_reason IS NULL OR length(btrim(removal_reason)) BETWEEN 1 AND 1000",
+            name="ck_digest_plans_removal_reason_length",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
@@ -336,6 +352,12 @@ class DigestPlanRecord(Base):
     current_state_hash: Mapped[str] = mapped_column(String(64))
     provider_identifier: Mapped[str] = mapped_column(String(255))
     protocol_version: Mapped[str] = mapped_column(String(255))
+    previous_plan_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("digest_plans.id"),
+        nullable=True,
+    )
+    removed_story_stable_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    removal_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class DigestPlanApprovalRecord(Base):
@@ -1321,6 +1343,89 @@ class EditorialRepository:
             record = session.get(DigestPlanRecord, plan_id)
             return self._plan(record) if record is not None else None
 
+    def persist_derived_digest_plan(
+        self,
+        plan: DigestPlan,
+        *,
+        actor_identifier: str,
+    ) -> DigestPlan:
+        actor = actor_identifier.strip()
+        if not actor:
+            raise EditorialStateError("Digest Plan Story removal requires an actor")
+        derivation = plan.derivation
+        if derivation is None:
+            raise EditorialStateError("Derived Digest Plan removal metadata is incomplete")
+        previous_plan_id = derivation.previous_plan_id
+
+        with Session(self._engine) as session, session.begin():
+            previous_record = session.scalar(
+                select(DigestPlanRecord)
+                .where(DigestPlanRecord.id == previous_plan_id)
+                .with_for_update()
+            )
+            if previous_record is None:
+                raise EditorialStateError(f"Digest Plan {previous_plan_id} does not exist")
+            latest = session.scalar(
+                select(DigestPlanRecord)
+                .where(DigestPlanRecord.publication_date == previous_record.publication_date)
+                .order_by(DigestPlanRecord.version.desc())
+                .limit(1)
+                .with_for_update()
+            )
+            if latest is None or latest.id != previous_record.id:
+                raise EditorialStateError("Only the latest Digest Plan version may remove a Story")
+            if session.get(DigestPlanApprovalRecord, previous_plan_id) is not None:
+                raise EditorialStateError("An approved Digest Plan cannot derive a Story removal")
+
+            previous = self._plan(previous_record)
+            expected = derive_digest_plan_story_removal(
+                previous,
+                story_stable_key=derivation.removed_story_stable_key,
+                reason=derivation.removal_reason,
+                version=plan.version,
+                prepared_at=plan.prepared_at,
+            )
+            if plan != expected:
+                raise EditorialStateError("Derived Digest Plan does not match exact Story removal")
+
+            session.add(
+                DigestPlanRecord(
+                    id=plan.id,
+                    publication_date=plan.publication_date,
+                    window_start=plan.window_start,
+                    window_end=plan.window_end,
+                    version=plan.version,
+                    prepared_at=plan.prepared_at,
+                    content=plan.content_payload(),
+                    content_hash=plan.content_hash,
+                    current_state_hash=plan.current_state_hash,
+                    provider_identifier=plan.provider_identifier,
+                    protocol_version=plan.protocol_version,
+                    previous_plan_id=derivation.previous_plan_id,
+                    removed_story_stable_key=derivation.removed_story_stable_key,
+                    removal_reason=derivation.removal_reason,
+                )
+            )
+            session.flush()
+            _persist_raw_audit_event(
+                session,
+                operation_key=f"m3-editorial-plan:{plan.id}:story-removed",
+                actor_identifier=actor,
+                action="digest-plan.story-removed",
+                subject_type="digest-plan",
+                subject_id=plan.id,
+                occurred_at=plan.prepared_at,
+                sequence=0,
+                attributes={
+                    "previous_plan_id": str(previous_plan_id),
+                    "removed_story_stable_key": derivation.removed_story_stable_key,
+                    "removal_reason": derivation.removal_reason,
+                    "version": plan.version,
+                    "content_hash": plan.content_hash,
+                },
+            )
+        return plan
+
     def approve_digest_plan(
         self,
         plan_id: UUID,
@@ -1570,7 +1675,21 @@ class EditorialRepository:
             plan = self._plan(plan_record) if plan_record is not None else None
             subject_ids = {digest_record.id}
             if plan is not None:
-                subject_ids.add(plan.id)
+                lineage_record = plan_record
+                lineage_ids: set[UUID] = set()
+                while lineage_record is not None:
+                    if lineage_record.id in lineage_ids:
+                        raise EditorialStateError("Digest Plan lineage contains a cycle")
+                    lineage_ids.add(lineage_record.id)
+                    if lineage_record.previous_plan_id is None:
+                        break
+                    lineage_record = session.get(
+                        DigestPlanRecord,
+                        lineage_record.previous_plan_id,
+                    )
+                    if lineage_record is None:
+                        raise EditorialStateError("Digest Plan lineage has a missing predecessor")
+                subject_ids.update(lineage_ids)
                 subject_ids.update(item.id for item in plan.stories)
             audit_actions = tuple(
                 session.scalars(
@@ -1799,6 +1918,7 @@ class EditorialRepository:
             content_hash=record.content_hash,
             payload=record.content,
         )
+        derivation = plan.derivation
         if (
             plan.publication_date != record.publication_date
             or plan.window_start != record.window_start
@@ -1806,6 +1926,12 @@ class EditorialRepository:
             or plan.current_state_hash != record.current_state_hash
             or plan.provider_identifier != record.provider_identifier
             or plan.protocol_version != record.protocol_version
+            or (derivation.previous_plan_id if derivation is not None else None)
+            != record.previous_plan_id
+            or (derivation.removed_story_stable_key if derivation is not None else None)
+            != record.removed_story_stable_key
+            or (derivation.removal_reason if derivation is not None else None)
+            != record.removal_reason
         ):
             raise EditorialStateError("Persisted Digest Plan columns do not match content")
         return plan
@@ -1972,15 +2098,14 @@ class EditorialRepository:
     ) -> tuple[UUID, ...]:
         if len(story_keys) != len(set(story_keys)):
             raise EditorialStateError("Digest Story selection cannot contain duplicates")
-        if not 8 <= len(story_keys) <= 12:
-            raise EditorialStateError("A Digest requires between 8 and 12 Stories")
+        if not 1 <= len(story_keys) <= 12:
+            raise EditorialStateError("A Digest requires between 1 and 12 Stories")
 
         statement = select(StoryRecord).where(StoryRecord.stable_key.in_(story_keys))
         if lock:
             statement = statement.with_for_update()
         records = {record.stable_key: record for record in session.scalars(statement)}
         selected_ids: list[UUID] = []
-        publishers: set[str] = set()
         for stable_key in story_keys:
             record = records.get(stable_key)
             if record is None:
@@ -2011,9 +2136,6 @@ class EditorialRepository:
             if publisher is None:
                 raise EditorialStateError(f"Story {stable_key!r} has no primary Publisher")
             selected_ids.append(record.id)
-            publishers.add(publisher)
-        if len(publishers) < 3:
-            raise EditorialStateError("A Digest requires Stories from at least three Publishers")
         return tuple(selected_ids)
 
     @staticmethod

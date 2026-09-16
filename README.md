@@ -43,7 +43,7 @@ Fast AI news is plentiful; evidence you can inspect and publication decisions yo
 
 The M1–M5 product scopes and release records remain available in [#70](https://github.com/Ev3rGan/ai-ledger/issues/70), [#71](https://github.com/Ev3rGan/ai-ledger/issues/71), [#72](https://github.com/Ev3rGan/ai-ledger/issues/72), [#73](https://github.com/Ev3rGan/ai-ledger/issues/73), and [#74](https://github.com/Ev3rGan/ai-ledger/issues/74). Current build health is reported by [CI](https://github.com/Ev3rGan/ai-ledger/actions/workflows/ci.yml), not by a copied historical test count.
 
-Direct Story accept/reject and direct Digest preview/publish commands are retired workflow surfaces. The legacy eight-Story and three-Publisher gates remain compatibility debt scheduled for [#120](https://github.com/Ev3rGan/ai-ledger/issues/120), not supported product invariants. See the [legacy-flow inventory](docs/legacy-flow-inventory.md) for the evidence and deletion gates.
+Direct Story accept/reject and direct Digest preview/publish commands are retired workflow surfaces. Operators review one immutable Plan, may derive a new version by removing an included Story with recorded lineage and reason, and approve only the latest exact version. Plans support 1–12 Stories; fewer than three Publishers is a visible non-blocking warning. See the [legacy-flow inventory](docs/legacy-flow-inventory.md) for the evidence and deletion gates.
 
 ## 🚀 Explore the product
 

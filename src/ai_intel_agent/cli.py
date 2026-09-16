@@ -42,6 +42,7 @@ from ai_intel_agent.editorial import (
     DigestPlan,
     EditorialPlanProvider,
     EditorialStateError,
+    EditorialWorkflow,
     StoryInspection,
 )
 from ai_intel_agent.extraction_benchmark import (
@@ -1108,6 +1109,12 @@ def _editorial_repository() -> Iterator[EditorialRepository]:
         yield EditorialRepository(engine)
 
 
+@contextmanager
+def _editorial_workflow() -> Iterator[EditorialWorkflow]:
+    with _editorial_repository() as repository:
+        yield EditorialWorkflow(repository)
+
+
 def _create_editorial_plan_provider(
     engine: Engine,
     client: httpx.Client,
@@ -1296,6 +1303,14 @@ def _print_digest_plan(plan: DigestPlan) -> None:
         markup=False,
         soft_wrap=True,
     )
+    if plan.derivation is not None:
+        console.print(
+            f"Previous Plan: {plan.derivation.previous_plan_id}\n"
+            f"Removed Story: {plan.derivation.removed_story_stable_key}\n"
+            f"Removal reason: {plan.derivation.removal_reason}",
+            markup=False,
+            soft_wrap=True,
+        )
     console.print("Source health:", markup=False)
     if not plan.source_health:
         console.print("- unavailable", markup=False)
@@ -1372,10 +1387,10 @@ def prepare_digest_plan_command(
 ) -> None:
     """Have the Editorial Agent persist one immutable versioned Digest Plan."""
     with _editorial_engine() as engine, httpx.Client(timeout=60.0) as client:
-        repository = EditorialRepository(engine)
+        workflow = EditorialWorkflow(EditorialRepository(engine))
         try:
             provider = _create_editorial_plan_provider(engine, client)
-            plan = repository.prepare_digest_plan(
+            plan = workflow.prepare(
                 _digest_date(publication_date),
                 provider=provider,
                 prepared_at=datetime.now(UTC),
@@ -1388,13 +1403,40 @@ def prepare_digest_plan_command(
 @digest_plan_app.command("show")
 def show_digest_plan_command(plan_id: UUID) -> None:
     """Display one complete immutable Digest Plan."""
-    with _editorial_repository() as repository:
+    with _editorial_workflow() as workflow:
         try:
-            plan = repository.digest_plan(plan_id)
+            plan = workflow.plan(plan_id)
         except (EditorialStateError, ValueError) as error:
             raise typer.BadParameter(str(error)) from error
     if plan is None:
         raise typer.BadParameter(f"Digest Plan {plan_id} does not exist")
+    _print_digest_plan(plan)
+
+
+@digest_plan_app.command("remove")
+def remove_digest_plan_story_command(
+    plan_id: UUID,
+    story_stable_key: str,
+    reason: Annotated[
+        str,
+        typer.Option("--reason", help="Audited reason for removing this Story from the Plan."),
+    ],
+    actor: Annotated[
+        str, typer.Option("--actor", help="Identifier recorded in the removal audit.")
+    ] = "local-operator",
+) -> None:
+    """Derive a new immutable Plan without one included Story."""
+    with _editorial_workflow() as workflow:
+        try:
+            plan = workflow.remove_story(
+                plan_id,
+                story_stable_key=story_stable_key,
+                reason=reason,
+                actor_identifier=actor,
+                removed_at=datetime.now(UTC),
+            )
+        except (EditorialStateError, ValueError) as error:
+            raise typer.BadParameter(str(error)) from error
     _print_digest_plan(plan)
 
 
@@ -1413,13 +1455,13 @@ def approve_digest_plan_command(
     ] = "local-operator",
 ) -> None:
     """Review the complete Plan and atomically publish exactly that version."""
-    with _editorial_repository() as repository:
+    with _editorial_workflow() as workflow:
         try:
-            plan = repository.digest_plan(plan_id)
+            plan = workflow.plan(plan_id)
             if plan is None:
                 raise EditorialStateError(f"Digest Plan {plan_id} does not exist")
             _print_digest_plan(plan)
-            digest = repository.approve_digest_plan(
+            digest = workflow.approve(
                 plan_id,
                 expected_content_hash=content_hash,
                 actor_identifier=actor,

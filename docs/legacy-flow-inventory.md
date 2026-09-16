@@ -7,11 +7,11 @@ behavior change.
 
 | Classification | Flow or artifact | Current evidence and disposition |
 | --- | --- | --- |
-| Retain | Exact Digest Plan preparation, inspection, and approval | `digest plan prepare`, `digest plan show`, and `digest plan approve --content-hash ...` are the current human approval boundary. The approved immutable Plan controls publication membership and order. |
+| Retain | Exact Digest Plan preparation, inspection, Story removal, and approval | `digest plan prepare`, `digest plan show`, `digest plan remove`, and `digest plan approve --content-hash ...` are the current human approval boundary. Removal creates a new immutable Plan with lineage; the latest approved Plan controls publication membership and order. |
 | Retain | Public URLs, RSS, history, and withdrawal behavior | `PublicContent` projects the existing publication records for Home, Digest, Archive, Story, Browse, Research entry, and RSS without exposing private rows. Existing URLs and historical publications remain compatible. |
 | Retain | Accepted-knowledge Research boundary | Research continues to read Evidence Spans supporting accepted, published Stories through the existing accepted-knowledge projection. It must not read unreviewed, rejected, or withdrawn private material. |
 | Repair | Direct Story acceptance/rejection and direct Digest preview/publication guidance | These command handlers remain compatibility surfaces, but current operator documentation no longer presents them as the supported approval path. The exact Digest Plan loop is authoritative. |
-| Repair | Eight-Story and three-publisher publication gates | These checks are legacy compatibility debt. [Issue #120](https://github.com/Ev3rGan/ai-ledger/issues/120) owns the quantity-policy change, so Issue #119 documents but does not alter them. |
+| Retain | One-to-twelve Story quantity and Publisher warning | Exact Plan approval requires 1-12 Stories. Fewer than three Publishers is visible as a non-blocking warning rather than a publication gate. |
 | Repair | Old source-count statements | `source_profiles.v1.json` currently defines 19 profiles: 18 enabled profiles across the core and supplemental groups, plus one disabled authorization-required profile. The four-feed M1 live probe is historical acceptance evidence, not the current Source Profile universe. |
 | Archive | Early M1 live-probe and grilling checkpoints | Preserve them as dated evidence until durable decisions have been extracted. They are historical records, not current operator instructions. |
 | Archive | M1-M5 release records and research evidence | Keep them under the documentation archive and research indexes so past decisions remain auditable without being mistaken for present behavior. |

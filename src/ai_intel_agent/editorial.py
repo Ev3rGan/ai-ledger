@@ -565,6 +565,13 @@ class DigestPlanStory:
 
 
 @dataclass(frozen=True)
+class DigestPlanDerivation:
+    previous_plan_id: UUID
+    removed_story_stable_key: str
+    removal_reason: str
+
+
+@dataclass(frozen=True)
 class DigestPlan:
     id: UUID
     publication_date: date
@@ -583,6 +590,7 @@ class DigestPlan:
     protocol_version: str
     current_state_hash: str
     content_hash: str
+    derivation: DigestPlanDerivation | None = None
 
     @property
     def included_stories(self) -> tuple[DigestPlanStory, ...]:
@@ -600,6 +608,99 @@ class DigestPlan:
 
     def content_payload(self) -> dict[str, object]:
         return _digest_plan_content_payload(self)
+
+
+class EditorialWorkflowRepository(Protocol):
+    def prepare_digest_plan(
+        self,
+        publication_date: date,
+        *,
+        provider: EditorialPlanProvider,
+        prepared_at: datetime,
+    ) -> DigestPlan: ...
+
+    def digest_plan(self, plan_id: UUID) -> DigestPlan | None: ...
+
+    def persist_derived_digest_plan(
+        self,
+        plan: DigestPlan,
+        *,
+        actor_identifier: str,
+    ) -> DigestPlan: ...
+
+    def approve_digest_plan(
+        self,
+        plan_id: UUID,
+        *,
+        expected_content_hash: str,
+        actor_identifier: str,
+        approved_at: datetime,
+    ) -> Digest: ...
+
+
+class EditorialWorkflow:
+    """Shared application interface for immutable Digest Plan operations."""
+
+    def __init__(self, repository: EditorialWorkflowRepository) -> None:
+        self._repository = repository
+
+    def prepare(
+        self,
+        publication_date: date,
+        *,
+        provider: EditorialPlanProvider,
+        prepared_at: datetime,
+    ) -> DigestPlan:
+        return self._repository.prepare_digest_plan(
+            publication_date,
+            provider=provider,
+            prepared_at=prepared_at,
+        )
+
+    def plan(self, plan_id: UUID) -> DigestPlan | None:
+        return self._repository.digest_plan(plan_id)
+
+    def remove_story(
+        self,
+        plan_id: UUID,
+        *,
+        story_stable_key: str,
+        reason: str,
+        actor_identifier: str,
+        removed_at: datetime,
+    ) -> DigestPlan:
+        actor = actor_identifier.strip()
+        if not actor:
+            raise EditorialStateError("Digest Plan Story removal requires an actor")
+        current = self._repository.digest_plan(plan_id)
+        if current is None:
+            raise EditorialStateError(f"Digest Plan {plan_id} does not exist")
+        derived = derive_digest_plan_story_removal(
+            current,
+            story_stable_key=story_stable_key,
+            reason=reason,
+            version=current.version + 1,
+            prepared_at=removed_at,
+        )
+        return self._repository.persist_derived_digest_plan(
+            derived,
+            actor_identifier=actor,
+        )
+
+    def approve(
+        self,
+        plan_id: UUID,
+        *,
+        expected_content_hash: str,
+        actor_identifier: str,
+        approved_at: datetime,
+    ) -> Digest:
+        return self._repository.approve_digest_plan(
+            plan_id,
+            expected_content_hash=expected_content_hash,
+            actor_identifier=actor_identifier,
+            approved_at=approved_at,
+        )
 
 
 def editorial_window_for(publication_date: date) -> tuple[datetime, datetime]:
@@ -822,6 +923,23 @@ def restore_digest_plan(
     if _content_hash(normalized_payload) != content_hash:
         raise EditorialStateError("Persisted Digest Plan content hash is invalid")
     try:
+        raw_derivation = normalized_payload.get("derivation")
+        if raw_derivation is None:
+            derivation = None
+        elif isinstance(raw_derivation, Mapping):
+            if set(raw_derivation) != {
+                "previous_plan_id",
+                "removed_story_stable_key",
+                "removal_reason",
+            }:
+                raise ValueError("invalid Digest Plan derivation fields")
+            derivation = DigestPlanDerivation(
+                previous_plan_id=UUID(str(raw_derivation["previous_plan_id"])),
+                removed_story_stable_key=str(raw_derivation["removed_story_stable_key"]),
+                removal_reason=str(raw_derivation["removal_reason"]),
+            )
+        else:
+            raise ValueError("invalid Digest Plan derivation")
         source_health = tuple(
             SourceHealthInspection(
                 source_definition_id=UUID(str(item["source_definition_id"])),
@@ -891,6 +1009,7 @@ def restore_digest_plan(
             protocol_version=str(normalized_payload["protocol_version"]),
             current_state_hash=str(normalized_payload["current_state_hash"]),
             content_hash=content_hash,
+            derivation=derivation,
         )
     except (KeyError, TypeError, ValueError) as error:
         raise EditorialStateError("Persisted Digest Plan content is invalid") from error
@@ -971,11 +1090,11 @@ def _digest_plan_anomalies(
 ) -> tuple[DigestPlanAnomaly, ...]:
     anomalies: list[DigestPlanAnomaly] = []
     included = tuple(item for item in stories if item.inclusion is DigestPlanInclusion.INCLUDED)
-    if not 8 <= len(included) <= 12:
+    if not 1 <= len(included) <= 12:
         anomalies.append(
             DigestPlanAnomaly(
                 code="invalid-selection",
-                message="A Digest Plan requires between 8 and 12 included Stories",
+                message="A Digest Plan requires between 1 and 12 included Stories",
                 blocking=True,
             )
         )
@@ -997,8 +1116,8 @@ def _digest_plan_anomalies(
         anomalies.append(
             DigestPlanAnomaly(
                 code="weak-source-coverage",
-                message="A Digest Plan requires at least three Publishers",
-                blocking=True,
+                message="A Digest Plan includes fewer than three Publishers",
+                blocking=False,
             )
         )
     if not 20 <= len(digest_summary.strip()) <= 2000:
@@ -1179,6 +1298,104 @@ def _digest_plan_anomalies(
     return tuple(anomalies)
 
 
+def derive_digest_plan_story_removal(
+    plan: DigestPlan,
+    *,
+    story_stable_key: str,
+    reason: str,
+    version: int,
+    prepared_at: datetime,
+) -> DigestPlan:
+    """Derive one new immutable Plan by excluding one currently included Story."""
+
+    stable_key = story_stable_key.strip()
+    normalized_reason = reason.strip()
+    if not stable_key:
+        raise EditorialStateError("Digest Plan Story removal requires a stable key")
+    if not 1 <= len(normalized_reason) <= 1000:
+        raise EditorialStateError("Digest Plan Story removal reason must contain 1-1000 characters")
+    if version != plan.version + 1:
+        raise EditorialStateError("Derived Digest Plan version must follow its predecessor")
+    if not any(item.stable_key == stable_key for item in plan.included_stories):
+        raise EditorialStateError(
+            f"Story {stable_key!r} is not included in the current Digest Plan"
+        )
+
+    remaining_order = {
+        item.stable_key: order
+        for order, item in enumerate(
+            item for item in plan.included_stories if item.stable_key != stable_key
+        )
+    }
+    stories = tuple(
+        replace(
+            item,
+            inclusion=DigestPlanInclusion.EXCLUDED,
+            order=None,
+            exclusion_reason=normalized_reason,
+        )
+        if item.stable_key == stable_key
+        else (
+            replace(item, order=remaining_order[item.stable_key])
+            if item.stable_key in remaining_order
+            else item
+        )
+        for item in plan.stories
+    )
+    included = _included_stories_in_plan_order(stories)
+    digest_summary = _digest_summary_from_included_stories(included)
+    source_coverage = _ordered_unique(item.publisher for item in included)
+    topic_coverage = _ordered_unique(
+        topic
+        for item in included
+        for topic in (item.primary_topic, *item.secondary_topics)
+    )
+    context = EditorialContext(
+        publication_date=plan.publication_date,
+        window_start=plan.window_start,
+        window_end=plan.window_end,
+        stories=(),
+        source_health=plan.source_health,
+        scheduler_health=plan.scheduler_health,
+    )
+    anomalies = _digest_plan_anomalies(
+        context,
+        stories,
+        digest_summary=digest_summary,
+    )
+    derived = DigestPlan(
+        id=UUID(int=0),
+        publication_date=plan.publication_date,
+        window_start=plan.window_start,
+        window_end=plan.window_end,
+        version=version,
+        prepared_at=prepared_at,
+        digest_summary=digest_summary,
+        stories=stories,
+        source_health=plan.source_health,
+        scheduler_health=plan.scheduler_health,
+        source_coverage=source_coverage,
+        topic_coverage=topic_coverage,
+        anomalies=anomalies,
+        provider_identifier=plan.provider_identifier,
+        protocol_version=plan.protocol_version,
+        current_state_hash=plan.current_state_hash,
+        content_hash="",
+        derivation=DigestPlanDerivation(
+            previous_plan_id=plan.id,
+            removed_story_stable_key=stable_key,
+            removal_reason=normalized_reason,
+        ),
+    )
+    content_hash = _content_hash(derived.content_payload())
+    plan_id = uuid5(
+        NAMESPACE_URL,
+        "ai-intel-agent:digest-plan:"
+        f"{plan.publication_date.isoformat()}:v{version}:{content_hash}",
+    )
+    return replace(derived, id=plan_id, content_hash=content_hash)
+
+
 def _editorial_context_payload(context: EditorialContext) -> dict[str, object]:
     return {
         "publication_date": context.publication_date.isoformat(),
@@ -1325,7 +1542,7 @@ def _anomaly_payload(anomaly: DigestPlanAnomaly) -> dict[str, object]:
 
 
 def _digest_plan_content_payload(plan: DigestPlan) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "publication_date": plan.publication_date.isoformat(),
         "window_start": plan.window_start.isoformat(),
         "window_end": plan.window_end.isoformat(),
@@ -1344,6 +1561,13 @@ def _digest_plan_content_payload(plan: DigestPlan) -> dict[str, object]:
         "protocol_version": plan.protocol_version,
         "current_state_hash": plan.current_state_hash,
     }
+    if plan.derivation is not None:
+        payload["derivation"] = {
+            "previous_plan_id": str(plan.derivation.previous_plan_id),
+            "removed_story_stable_key": plan.derivation.removed_story_stable_key,
+            "removal_reason": plan.derivation.removal_reason,
+        }
+    return payload
 
 
 def _content_hash(payload: dict[str, object]) -> str:

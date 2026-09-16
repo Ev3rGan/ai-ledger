@@ -18,14 +18,14 @@
 
 草稿控制流是：`body-valid Document Version → Provider draft → unreviewed Story`。Provider 输出即使结构正确也只停在 `unreviewed`；operator 可以逐条 inspect，但不能通过已退役的直接命令绕过 exact plan 审批。
 
-当前辅助编排流是：`eligible unreviewed Stories → Editorial Agent → persisted immutable Digest Plan → operator inspects exact version → one explicit approval → accept included Stories + publish unchanged Digest`。批准事务只接受该计划固定的内容；blocking anomaly、过期版本或内容变化都要求新计划/新批准。Agent 不自动发布，不逐条申请零散批准，也不输出或持久化 hidden reasoning。该边界记录在 [ADR 0007](../adr/0007-editorial-approval-boundary.md)。
+当前辅助编排流是：`eligible unreviewed Stories → Editorial Agent → persisted immutable Digest Plan → operator inspects exact version → optional immutable Story-removal derivation(s) → one explicit approval → accept included Stories + publish unchanged Digest`。每次移除都会生成带 predecessor、Story key、原因和 actor 审计信息的新版本，不修改旧计划，也不会再次调用 Provider。批准事务只接受最新计划固定的内容；blocking anomaly、过期版本或内容变化都要求新计划/新批准。计划支持 1–12 条 Story；少于三个 Publisher 会显示非阻断告警。Agent 不自动发布，不逐条申请零散批准，也不输出或持久化 hidden reasoning。该边界记录在 [ADR 0007](../adr/0007-editorial-approval-boundary.md)。
 
 ## 真实代码入口
 
 - [`multisource_collection.py`](../../src/ai_intel_agent/multisource_collection.py)：`DraftProvider` protocol 及草稿边界。
 - [`editorial.py`](../../src/ai_intel_agent/editorial.py)：`DigestPlan`、`EditorialPlanProvider`、plan preparation、anomaly 与内容哈希契约。
 - [`persistence.py`](../../src/ai_intel_agent/persistence.py)：不可变 plan/approval records，以及绑定 exact plan 的原子 `approve_digest_plan` transaction。
-- [`cli.py`](../../src/ai_intel_agent/cli.py)：只读 `story list/show` 与受支持的 `digest plan prepare/show/approve` operator 子组；直接审核/发布命令是待后续依赖证明后删除的兼容入口。
+- [`cli.py`](../../src/ai_intel_agent/cli.py)：只读 `story list/show` 与受支持的 `digest plan prepare/show/remove/approve` operator 子组；直接审核/发布命令是待后续依赖证明后删除的兼容入口。
 - [ADR 0007](../adr/0007-editorial-approval-boundary.md)：当前“一份计划、一次显式批准”的决策记录。
 
 ## 如何本地运行或观察
@@ -36,6 +36,7 @@
 uv run ai-intel-agent story show --help
 uv run ai-intel-agent digest plan prepare --help
 uv run ai-intel-agent digest plan show --help
+uv run ai-intel-agent digest plan remove --help
 uv run ai-intel-agent digest plan approve --help
 uv run --extra dev pytest tests/test_m3_digest.py -q
 ```
