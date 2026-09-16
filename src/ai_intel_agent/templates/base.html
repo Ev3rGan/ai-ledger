@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ title }}</title>
+  {% for asset_url in frontend_assets.css %}<link rel="stylesheet" href="{{ asset_url }}">{% endfor %}
   <style>
     :root{color-scheme:light;--ink:#172033;--muted:#5f6b7a;--line:#d9e0e8;--paper:#fff;--wash:#f4f7fa;--accent:#0b6bcb;--accent-dark:#084e96;--radius:1rem}
     *{box-sizing:border-box}html{background:var(--wash)}
@@ -51,5 +52,6 @@
     </div>
   </nav>
   <main id="public-content" data-public-page="{{ page_name }}">{% block content %}{% endblock %}</main>
+  {% if frontend_assets.module %}<script type="module" src="{{ frontend_assets.module }}"></script>{% endif %}
 </body>
 </html>

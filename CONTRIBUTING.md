@@ -27,6 +27,26 @@ uv run ai-intel-agent run --sample --output reports\daily.md
 
 If `uv` is not on `PATH`, use the executable documented in `AGENTS.md`.
 
+## Frontend assets
+
+Browse and Research use a locked Vue/Vite workspace under `frontend/`. Node is
+required only to test and build these progressive-enhancement entry points; it
+is not part of the production runtime.
+
+From the repository root, install exactly the locked packages, run the frontend
+tests, and rebuild the hashed assets with:
+
+```powershell
+npm --prefix frontend ci
+npm --prefix frontend test
+npm --prefix frontend run build
+```
+
+The build refreshes the committed Vite manifest and hashed files under
+`src/ai_intel_agent/static/`. Include those generated changes whenever the
+frontend source changes so the Python application and packaged wheel serve the
+matching build.
+
 ## Pull requests
 
 - Link the issue the change addresses, using `Closes #<number>` when appropriate.

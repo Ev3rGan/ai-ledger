@@ -1,0 +1,31 @@
+{
+  "_public-interactions-6ESXJtcQ.js": {
+    "file": "public-interactions-6ESXJtcQ.js",
+    "name": "public-interactions",
+    "css": [
+      "public-interactions-B14ObSoT.css"
+    ]
+  },
+  "_public-interactions-B14ObSoT.css": {
+    "file": "public-interactions-B14ObSoT.css",
+    "src": "_public-interactions-B14ObSoT.css"
+  },
+  "src/browse.js": {
+    "file": "browse-BlKILK68.js",
+    "name": "browse",
+    "src": "src/browse.js",
+    "isEntry": true,
+    "imports": [
+      "_public-interactions-6ESXJtcQ.js"
+    ]
+  },
+  "src/research.js": {
+    "file": "research-Cg1W-cXc.js",
+    "name": "research",
+    "src": "src/research.js",
+    "isEntry": true,
+    "imports": [
+      "_public-interactions-6ESXJtcQ.js"
+    ]
+  }
+}

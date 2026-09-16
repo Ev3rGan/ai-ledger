@@ -1065,3 +1065,79 @@ def test_supporting_and_contradicting_evidence_is_visible_as_conflict(
     assert story.status_code == 200
     assert 'data-evidence-state="conflict"' in story.text
     assert "证据冲突" in story.text
+
+
+@pytest.mark.postgres
+def test_browse_interaction_api_returns_only_public_content(
+    postgres_url: str, empty_database
+) -> None:
+    publish_sample_digest(postgres_url)
+
+    with TestClient(create_app(postgres_url)) as client:
+        response = client.get("/api/public/browse", params={"source": "示例发布者"})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "filters": {
+            "q": None,
+            "source": "示例发布者",
+            "topic": None,
+            "date": None,
+        },
+        "facets": {
+            "sources": ["示例发布者"],
+            "topics": ["Products and Tools"],
+        },
+        "items": [
+            {
+                "url": "/stories/sample-story-v1",
+                "headline": "AI Agent 用任务轨迹支持结果复现",
+                "summary": "AI Agent 用任务轨迹支持结果复现：示例发布者的 AI Agent 会记录任务轨迹。",
+                "publisher": "示例发布者",
+                "topic": "Products and Tools",
+                "published_at": None,
+            }
+        ],
+        "pagination": {
+            "page": 1,
+            "page_size": 12,
+            "total_items": 1,
+            "total_pages": 1,
+        },
+    }
+    serialized = response.text
+    assert "其 AI Agent 现在会记录任务轨迹" not in serialized
+    assert "https://example.com/ai-agent-evidence" not in serialized
+
+
+@pytest.mark.postgres
+def test_python_app_serves_hashed_vue_assets_while_pages_keep_no_js_fallbacks(
+    postgres_url: str, empty_database
+) -> None:
+    publish_sample_digest(postgres_url)
+
+    with TestClient(create_app(postgres_url)) as client:
+        browse = client.get("/browse")
+        research = client.get("/research")
+        asset_paths = tuple(
+            re.search(r'<script type="module" src="(/assets/[^\"]+-[^\"]+\.js)"></script>', page.text)
+            for page in (browse, research)
+        )
+        assets = tuple(
+            client.get(match.group(1))
+            for match in asset_paths
+            if match is not None
+        )
+
+    assert browse.status_code == 200
+    assert research.status_code == 200
+    assert all(match is not None for match in asset_paths)
+    assert len(assets) == 2
+    assert all(asset.status_code == 200 for asset in assets)
+    assert all("javascript" in asset.headers["content-type"] for asset in assets)
+
+    browse_without_scripts = re.sub(r"<script\b.*?</script>", "", browse.text, flags=re.DOTALL)
+    research_without_scripts = re.sub(r"<script\b.*?</script>", "", research.text, flags=re.DOTALL)
+    assert 'method="get" action="/browse"' in browse_without_scripts
+    assert "AI Agent 用任务轨迹支持结果复现" in browse_without_scripts
+    assert "Research 不会联网搜索" in research_without_scripts

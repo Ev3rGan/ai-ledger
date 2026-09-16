@@ -1,0 +1,64 @@
+.interaction-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin: 1rem 0;
+  padding: 0.85rem 1rem;
+  border: 1px solid #c2410c;
+  border-radius: 0.65rem;
+  background: #fff7ed;
+  color: #7c2d12;
+}
+
+.interaction-error p {
+  margin: 0;
+}
+
+.interaction-error button,
+.research-actions button,
+.pagination a {
+  min-height: 2.5rem;
+  border: 1px solid #8db7df;
+  border-radius: 0.55rem;
+  padding: 0.45rem 0.8rem;
+  background: #f3f8fd;
+  color: #084e96;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  margin: 1.5rem 0;
+}
+
+.pagination a {
+  display: inline-flex;
+  align-items: center;
+  text-decoration: none;
+}
+
+.research-actions {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.research-answer {
+  white-space: pre-wrap;
+}
+
+.research-citations {
+  display: grid;
+  gap: 0.65rem;
+  padding-left: 1.25rem;
+}
+
+button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}

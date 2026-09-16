@@ -6,12 +6,14 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import date
 from email.utils import format_datetime
+from importlib.resources import files
 from typing import Annotated
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from xml.etree import ElementTree
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from ai_intel_agent.accepted_knowledge import (
@@ -32,6 +34,7 @@ from ai_intel_agent.persistence import create_database_engine
 from ai_intel_agent.publication import (
     PublicContent,
     PublicDigest,
+    PublicStory,
 )
 from ai_intel_agent.research import (
     RESEARCH_QUESTION_MAX_CHARACTERS,
@@ -46,6 +49,7 @@ from ai_intel_agent.research import (
 from ai_intel_agent.web_templates import render_public_page, render_story_cards
 
 LOGGER = logging.getLogger(__name__)
+BROWSE_PAGE_SIZE = 12
 
 EVIDENCE_STATE_LABELS: dict[EvidenceState, str] = {
     EvidenceState.SINGLE_SOURCE: "单一来源",
@@ -116,6 +120,9 @@ def create_app(
         openapi_url=None,
         lifespan=lifespan,
     )
+    static_root = files("ai_intel_agent").joinpath("static")
+    if static_root.is_dir():
+        app.mount("/assets", StaticFiles(directory=str(static_root)), name="assets")
 
     @app.get("/health/live", include_in_schema=False)
     def health_live() -> dict[str, str]:
@@ -206,23 +213,16 @@ def create_app(
         publisher: Annotated[str | None, Query(alias="source")] = None,
         topic: Annotated[Topic | None, Query(alias="topic")] = None,
         publication_date: Annotated[date | None, Query(alias="date")] = None,
+        page: Annotated[int, Query(ge=1)] = 1,
     ) -> HTMLResponse:
-        result = retrieval.retrieve(
-            RetrievalQuery(
-                text=q or "",
-                filters=RetrievalFilters(
-                    publisher=publisher,
-                    topic=topic,
-                    publication_date=publication_date,
-                ),
-            )
-        )
-        all_stories = public_content.browse_published_stories()
-        stories_by_id = {story.id: story for story in all_stories}
-        stories = tuple(
-            stories_by_id[story_id]
-            for story_id in result.matching_story_ids
-            if story_id in stories_by_id
+        payload, stories = _browse_page(
+            public_content=public_content,
+            retrieval=retrieval,
+            query=q,
+            publisher=publisher,
+            topic=topic,
+            publication_date=publication_date,
+            page=page,
         )
         return HTMLResponse(
             render_public_page(
@@ -233,21 +233,35 @@ def create_app(
                 selected_publisher=publisher,
                 selected_topic=topic,
                 publication_date=publication_date,
-                sources=tuple(sorted({story.publisher for story in all_stories})),
+                sources=tuple(payload["facets"]["sources"]),
                 topics=tuple(
-                    sorted(
-                        {
-                            story.primary_topic
-                            for story in all_stories
-                            if story.primary_topic is not None
-                        },
-                        key=lambda item: item.value,
-                    )
+                    Topic(value) for value in payload["facets"]["topics"]
                 ),
                 stories=stories,
                 story_url=_relative_story_url,
+                browse_bootstrap=payload,
+                browse_page_urls=_browse_page_urls(payload),
             )
         )
+
+    @app.get("/api/public/browse", name="browse_public_api")
+    def browse_public_api(
+        q: str | None = None,
+        publisher: Annotated[str | None, Query(alias="source")] = None,
+        topic: Annotated[Topic | None, Query(alias="topic")] = None,
+        publication_date: Annotated[date | None, Query(alias="date")] = None,
+        page: Annotated[int, Query(ge=1)] = 1,
+    ) -> JSONResponse:
+        payload, _ = _browse_page(
+            public_content=public_content,
+            retrieval=retrieval,
+            query=q,
+            publisher=publisher,
+            topic=topic,
+            publication_date=publication_date,
+            page=page,
+        )
+        return JSONResponse(payload)
 
     @app.get("/research", response_class=HTMLResponse, name="research")
     def research() -> HTMLResponse:
@@ -317,6 +331,106 @@ def create_app(
 
 def _relative_story_url(stable_key: str) -> str:
     return f"/stories/{quote(stable_key, safe='')}"
+
+
+def _browse_page(
+    *,
+    public_content: PublicContent,
+    retrieval: AcceptedKnowledgeOperation,
+    query: str | None,
+    publisher: str | None,
+    topic: Topic | None,
+    publication_date: date | None,
+    page: int,
+) -> tuple[dict[str, object], tuple[PublicStory, ...]]:
+    """Keep Browse retrieval semantics while projecting only public-safe Stories."""
+    result = retrieval.retrieve(
+        RetrievalQuery(
+            text=query or "",
+            filters=RetrievalFilters(
+                publisher=publisher,
+                topic=topic,
+                publication_date=publication_date,
+            ),
+        )
+    )
+    all_stories = public_content.browse_published_stories()
+    stories_by_id = {story.id: story for story in all_stories}
+    matching_stories = tuple(
+        stories_by_id[story_id]
+        for story_id in result.matching_story_ids
+        if story_id in stories_by_id
+    )
+    total_items = len(matching_stories)
+    total_pages = max(1, (total_items + BROWSE_PAGE_SIZE - 1) // BROWSE_PAGE_SIZE)
+    offset = (page - 1) * BROWSE_PAGE_SIZE
+    page_stories = matching_stories[offset : offset + BROWSE_PAGE_SIZE]
+    payload: dict[str, object] = {
+        "filters": {
+            "q": query,
+            "source": publisher,
+            "topic": topic.value if topic is not None else None,
+            "date": publication_date.isoformat() if publication_date is not None else None,
+        },
+        "facets": {
+            "sources": sorted({story.publisher for story in all_stories}),
+            "topics": sorted(
+                {
+                    story.primary_topic.value
+                    for story in all_stories
+                    if story.primary_topic is not None
+                }
+            ),
+        },
+        "items": [_browse_story_payload(story) for story in page_stories],
+        "pagination": {
+            "page": page,
+            "page_size": BROWSE_PAGE_SIZE,
+            "total_items": total_items,
+            "total_pages": total_pages,
+        },
+    }
+    return payload, page_stories
+
+
+def _browse_story_payload(story: PublicStory) -> dict[str, str | None]:
+    return {
+        "url": _relative_story_url(story.stable_key),
+        "headline": story.headline,
+        "summary": story.lead,
+        "publisher": story.publisher,
+        "topic": story.primary_topic.value if story.primary_topic is not None else None,
+        "published_at": (
+            story.original_published_at.isoformat()
+            if story.original_published_at is not None
+            else None
+        ),
+    }
+
+
+def _browse_page_urls(payload: dict[str, object]) -> dict[str, str | None]:
+    filters = payload["filters"]
+    pagination = payload["pagination"]
+    if not isinstance(filters, dict) or not isinstance(pagination, dict):
+        raise TypeError("Browse payload has invalid filters or pagination")
+    current_page = int(pagination["page"])
+    total_pages = int(pagination["total_pages"])
+    return {
+        "previous": _browse_url(filters, current_page - 1) if current_page > 1 else None,
+        "next": _browse_url(filters, current_page + 1) if current_page < total_pages else None,
+    }
+
+
+def _browse_url(filters: dict[str, object], page: int) -> str:
+    query = {
+        name: str(value)
+        for name, value in filters.items()
+        if value is not None and str(value)
+    }
+    if page > 1:
+        query["page"] = str(page)
+    encoded = urlencode(query)
+    return f"/browse?{encoded}" if encoded else "/browse"
 
 
 def _research_example_questions(digest: PublicDigest | None) -> tuple[str, ...]:
