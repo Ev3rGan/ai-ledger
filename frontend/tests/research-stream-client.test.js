@@ -147,6 +147,23 @@ describe("ResearchStreamClient", () => {
     expect(client.snapshot.errorCode).toBe("protocol-error");
   });
 
+  it("preserves the JSON parse error as the protocol error cause", async () => {
+    const client = new ResearchStreamClient({
+      fetchImpl: async () =>
+        responseFromText("event: status\ndata: {not-json}\n\n"),
+    });
+
+    let failure;
+    try {
+      await client.start("测试异常链");
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(ResearchProtocolError);
+    expect(failure.cause).toBeInstanceOf(SyntaxError);
+  });
+
   it.each([
     ["unknown event", sse("mystery", { version: VERSION })],
     ["malformed JSON", "event: status\ndata: {not-json}\n\n"],

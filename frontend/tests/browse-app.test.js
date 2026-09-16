@@ -14,6 +14,7 @@ const initialState = {
       summary: "公开摘要",
       publisher: "示例发布者",
       topic: "Products and Tools",
+      secondary_topics: ["Research", "Business"],
       published_at: null,
     },
   ],
@@ -40,6 +41,16 @@ function deferred() {
 describe("BrowseApp", () => {
   beforeEach(() => {
     window.history.replaceState({}, "", "/browse");
+  });
+
+  it("keeps primary and secondary topics visible after Vue mounts", () => {
+    const wrapper = mount(BrowseApp, {
+      props: { initialState, fetchImpl: vi.fn() },
+    });
+
+    expect(wrapper.get(".story-card .topic").text()).toBe(
+      "Products and Tools · Research · Business",
+    );
   });
 
   it("shows loading, synchronizes the URL, and renders an empty result", async () => {

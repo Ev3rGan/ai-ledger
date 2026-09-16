@@ -2,7 +2,7 @@
 import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
 
 /** @typedef {{q: string | null, source: string | null, topic: string | null, date: string | null}} BrowseFilters */
-/** @typedef {{url: string, headline: string, summary: string | null, publisher: string, topic: string | null, published_at: string | null}} BrowseStory */
+/** @typedef {{url: string, headline: string, summary: string | null, publisher: string, topic: string | null, secondary_topics: string[], published_at: string | null}} BrowseStory */
 /** @typedef {{page: number, page_size: number, total_items: number, total_pages: number}} BrowsePagination */
 /** @typedef {{sources: string[], topics: string[]}} BrowseFacets */
 /** @typedef {{filters: BrowseFilters, facets: BrowseFacets, items: BrowseStory[], pagination: BrowsePagination}} BrowsePayload */
@@ -126,6 +126,10 @@ function displayDate(value) {
   return value.slice(0, 10);
 }
 
+function storyTopics(story) {
+  return [story.topic, ...story.secondary_topics].filter(Boolean).join(" · ");
+}
+
 onMounted(() => window.addEventListener("popstate", restoreFromLocation));
 onUnmounted(() => {
   window.removeEventListener("popstate", restoreFromLocation);
@@ -150,7 +154,7 @@ onUnmounted(() => {
 
   <div v-if="state.items.length" class="story-grid" :aria-busy="loading">
     <article v-for="story in state.items" :key="story.url" class="story-card">
-      <p v-if="story.topic" class="topic">{{ story.topic }}</p>
+      <p v-if="storyTopics(story)" class="topic">{{ storyTopics(story) }}</p>
       <h2><a :href="story.url">{{ story.headline }}</a></h2>
       <p v-if="story.summary">{{ story.summary }}</p>
       <p class="story-meta"><span>{{ story.publisher }}</span><span>{{ displayDate(story.published_at) }}</span></p>

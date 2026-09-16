@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable
 from datetime import date, datetime
-from functools import lru_cache
+from functools import cache
 from importlib.resources import files
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from ai_intel_agent.publication import PublicStory
 
+LOGGER = logging.getLogger(__name__)
 _TEMPLATE_ROOT = files("ai_intel_agent").joinpath("templates")
 _STATIC_ROOT = files("ai_intel_agent").joinpath("static")
 _ENVIRONMENT = Environment(
@@ -29,7 +31,7 @@ def render_public_page(template_name: str, *, page_name: str, **context: object)
     )
 
 
-@lru_cache(maxsize=2)
+@cache
 def _frontend_assets(page_name: str) -> dict[str, object]:
     if page_name not in {"browse", "research"}:
         return {"module": None, "css": ()}
@@ -39,7 +41,12 @@ def _frontend_assets(page_name: str) -> dict[str, object]:
         entry = manifest[f"src/{page_name}.js"]
         module = _asset_url(entry["file"])
         css = tuple(_asset_url(path) for path in _entry_css(manifest, entry))
-    except (FileNotFoundError, KeyError, TypeError, ValueError):
+    except (FileNotFoundError, KeyError, TypeError, ValueError) as error:
+        LOGGER.warning(
+            "Frontend asset manifest unavailable for %s: %s",
+            page_name,
+            type(error).__name__,
+        )
         return {"module": None, "css": ()}
     return {"module": module, "css": css}
 

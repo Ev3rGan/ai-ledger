@@ -363,7 +363,8 @@ def _browse_page(
     )
     total_items = len(matching_stories)
     total_pages = max(1, (total_items + BROWSE_PAGE_SIZE - 1) // BROWSE_PAGE_SIZE)
-    offset = (page - 1) * BROWSE_PAGE_SIZE
+    current_page = min(page, total_pages)
+    offset = (current_page - 1) * BROWSE_PAGE_SIZE
     page_stories = matching_stories[offset : offset + BROWSE_PAGE_SIZE]
     payload: dict[str, object] = {
         "filters": {
@@ -384,7 +385,7 @@ def _browse_page(
         },
         "items": [_browse_story_payload(story) for story in page_stories],
         "pagination": {
-            "page": page,
+            "page": current_page,
             "page_size": BROWSE_PAGE_SIZE,
             "total_items": total_items,
             "total_pages": total_pages,
@@ -393,13 +394,14 @@ def _browse_page(
     return payload, page_stories
 
 
-def _browse_story_payload(story: PublicStory) -> dict[str, str | None]:
+def _browse_story_payload(story: PublicStory) -> dict[str, object]:
     return {
         "url": _relative_story_url(story.stable_key),
         "headline": story.headline,
         "summary": story.lead,
         "publisher": story.publisher,
         "topic": story.primary_topic.value if story.primary_topic is not None else None,
+        "secondary_topics": [topic.value for topic in story.secondary_topics],
         "published_at": (
             story.original_published_at.isoformat()
             if story.original_published_at is not None

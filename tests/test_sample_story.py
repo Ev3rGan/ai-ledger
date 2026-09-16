@@ -17,6 +17,7 @@ from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.orm import Session
 from typer.testing import CliRunner
 
+from ai_intel_agent import web_templates
 from ai_intel_agent.cli import app
 from ai_intel_agent.domain import (
     DigestState,
@@ -24,6 +25,7 @@ from ai_intel_agent.domain import (
     EvidenceRole,
     EvidenceState,
     StoryReviewState,
+    Topic,
 )
 from ai_intel_agent.editorial import DigestPublicationContract
 from ai_intel_agent.persistence import (
@@ -44,7 +46,7 @@ from ai_intel_agent.persistence import (
 from ai_intel_agent.pipeline import persist_sample_story, publish_sample_digest
 from ai_intel_agent.publication import PublicContent, _public_http_url
 from ai_intel_agent.sample import build_sample_story
-from ai_intel_agent.web import create_app
+from ai_intel_agent.web import _browse_story_payload, create_app
 
 runner = CliRunner()
 PUBLIC_EVIDENCE_EXCERPT_MAX_CHARACTERS = 280
@@ -1095,6 +1097,7 @@ def test_browse_interaction_api_returns_only_public_content(
                 "summary": "AI Agent 用任务轨迹支持结果复现：示例发布者的 AI Agent 会记录任务轨迹。",
                 "publisher": "示例发布者",
                 "topic": "Products and Tools",
+                "secondary_topics": [],
                 "published_at": None,
             }
         ],
@@ -1108,6 +1111,99 @@ def test_browse_interaction_api_returns_only_public_content(
     serialized = response.text
     assert "其 AI Agent 现在会记录任务轨迹" not in serialized
     assert "https://example.com/ai-agent-evidence" not in serialized
+
+    story = PublicContent(empty_database).published_story("sample-story-v1")
+    assert story is not None
+    payload_with_secondary_topics = _browse_story_payload(
+        replace(
+            story,
+            secondary_topics=(Topic.RESEARCH, Topic.BUSINESS),
+        )
+    )
+    assert payload_with_secondary_topics["secondary_topics"] == ["Research", "Business"]
+
+
+@pytest.mark.postgres
+def test_browse_clamps_an_out_of_range_page_to_the_last_public_page(
+    postgres_url: str, empty_database
+) -> None:
+    publish_sample_digest(postgres_url)
+
+    with TestClient(create_app(postgres_url)) as client:
+        api_response = client.get("/api/public/browse", params={"page": 999})
+        page_response = client.get("/browse", params={"page": 999})
+
+    assert api_response.status_code == 200
+    assert api_response.json()["pagination"] == {
+        "page": 1,
+        "page_size": 12,
+        "total_items": 1,
+        "total_pages": 1,
+    }
+    assert len(api_response.json()["items"]) == 1
+    assert page_response.status_code == 200
+    assert "第 999 / 1 页" not in page_response.text
+
+
+def test_frontend_asset_manifest_failure_logs_a_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    warning_calls: list[tuple[object, ...]] = []
+    web_templates._frontend_assets.cache_clear()
+    monkeypatch.setattr(web_templates, "_STATIC_ROOT", tmp_path)
+    monkeypatch.setattr(
+        web_templates.LOGGER,
+        "warning",
+        lambda *args: warning_calls.append(args),
+    )
+    try:
+        assets = web_templates._frontend_assets("browse")
+    finally:
+        web_templates._frontend_assets.cache_clear()
+
+    assert assets == {"module": None, "css": ()}
+    assert warning_calls == [
+        (
+            "Frontend asset manifest unavailable for %s: %s",
+            "browse",
+            "FileNotFoundError",
+        )
+    ]
+
+
+def test_non_interactive_pages_do_not_evict_cached_frontend_assets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_root = tmp_path / ".vite"
+    manifest_root.mkdir()
+    manifest_path = manifest_root / "manifest.json"
+    manifest_path.write_text(
+        '{"src/browse.js":{"file":"browse-hash.js"}}',
+        encoding="utf-8",
+    )
+    read_count = 0
+    original_read_text = Path.read_text
+
+    def count_manifest_reads(path: Path, *args: object, **kwargs: object) -> str:
+        nonlocal read_count
+        if path == manifest_path:
+            read_count += 1
+        return original_read_text(path, *args, **kwargs)
+
+    web_templates._frontend_assets.cache_clear()
+    monkeypatch.setattr(web_templates, "_STATIC_ROOT", tmp_path)
+    monkeypatch.setattr(Path, "read_text", count_manifest_reads)
+    try:
+        assert web_templates._frontend_assets("browse")["module"] == "/assets/browse-hash.js"
+        for page_name in ("home", "digest", "archive", "story", "rss"):
+            web_templates._frontend_assets(page_name)
+        assert web_templates._frontend_assets("browse")["module"] == "/assets/browse-hash.js"
+    finally:
+        web_templates._frontend_assets.cache_clear()
+
+    assert read_count == 1
 
 
 @pytest.mark.postgres

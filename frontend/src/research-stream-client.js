@@ -67,8 +67,9 @@ const TIME_SEMANTICS = new Set([
  */
 
 export class ResearchProtocolError extends Error {
-  constructor(message) {
-    super(message);
+  /** @param {string} message @param {{cause?: unknown}} [options] */
+  constructor(message, options) {
+    super(message, options);
     this.name = "ResearchProtocolError";
   }
 }
