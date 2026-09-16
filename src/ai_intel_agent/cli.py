@@ -1541,9 +1541,14 @@ def digest_plan_follow_up_status_command(plan_id: UUID) -> None:
     with _editorial_workflow() as workflow:
         try:
             follow_up = workflow.follow_up_status(plan_id)
+            outcome = workflow.outcome(plan_id)
         except (EditorialStateError, ValueError) as error:
             raise typer.BadParameter(str(error)) from error
     if follow_up is None:
+        if outcome is not None and outcome.digest is None:
+            raise typer.BadParameter(
+                f"No publication: follow-up is not applicable for Digest Plan {plan_id}"
+            )
         raise typer.BadParameter(
             f"Digest Plan {plan_id} has no retrieval-index follow-up"
         )

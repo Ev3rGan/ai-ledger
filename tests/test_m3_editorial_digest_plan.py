@@ -1695,7 +1695,8 @@ def test_workflow_approves_an_empty_plan_as_one_durable_no_publication_outcome(
             session.rollback()
 
         monkeypatch.setenv("AI_INTEL_DATABASE_URL", editorial_database_url)
-        replay = CliRunner().invoke(
+        runner = CliRunner()
+        replay = runner.invoke(
             app,
             [
                 "digest",
@@ -1710,6 +1711,12 @@ def test_workflow_approves_an_empty_plan_as_one_durable_no_publication_outcome(
         )
         assert replay.exit_code == 0, replay.output
         assert "completed with no publication" in replay.output
+        follow_up_status = runner.invoke(
+            app,
+            ["digest", "plan", "follow-up-status", str(empty.id)],
+        )
+        assert follow_up_status.exit_code == 2
+        assert "No publication: follow-up is not applicable" in follow_up_status.output
         with Session(engine) as session:
             with pytest.raises(DBAPIError, match="Editorial day outcome is immutable"):
                 session.execute(
