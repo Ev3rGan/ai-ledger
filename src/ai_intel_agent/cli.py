@@ -80,6 +80,7 @@ from ai_intel_agent.multisource_collection import (
     load_source_profiles,
     scheduled_operation_key,
 )
+from ai_intel_agent.operator_console import HttpGitHubOAuthClient
 from ai_intel_agent.persistence import (
     EditorialRepository,
     MultiSourceCollectionRepository,
@@ -887,6 +888,11 @@ def serve(
                 ),
                 anonymous_identity_salt=service_configuration.anonymous_identity_salt,
                 accepted_knowledge_retrieval=runtime.retrieval,
+                operator_configuration=service_configuration.operator.security,
+                github_oauth_client=HttpGitHubOAuthClient(
+                    client_id=service_configuration.operator.github_client_id,
+                    client_secret=service_configuration.operator.github_client_secret,
+                ),
             )
             uvicorn.run(web_app, host=host, port=port, log_config=None)
         return

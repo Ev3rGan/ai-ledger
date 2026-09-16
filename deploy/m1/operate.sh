@@ -81,6 +81,7 @@ validate_release() {
   docker run --rm --network none --read-only --cap-drop ALL --cap-add NET_BIND_SERVICE \
     --tmpfs /config --tmpfs /data \
     --env "AI_INTEL_DOMAIN=$(release_value "$release_file" AI_INTEL_DOMAIN)" \
+    --env "AI_INTEL_OPERATOR_DOMAIN=$(release_value "$release_file" AI_INTEL_OPERATOR_DOMAIN)" \
     --volume "${release_dir}/deploy/m1/Caddyfile:/etc/caddy/Caddyfile:ro" \
     --entrypoint caddy "$caddy_image" validate --config /etc/caddy/Caddyfile
 }
@@ -100,6 +101,9 @@ compose() {
     "AI_INTEL_IMAGE=$(release_value "$release_file" AI_INTEL_IMAGE)" \
     "AI_INTEL_RELEASE=$(release_value "$release_file" AI_INTEL_RELEASE)" \
     "AI_INTEL_DOMAIN=$(release_value "$release_file" AI_INTEL_DOMAIN)" \
+    "AI_INTEL_OPERATOR_DOMAIN=$(release_value "$release_file" AI_INTEL_OPERATOR_DOMAIN)" \
+    "AI_INTEL_OPERATOR_GITHUB_USER_IDS=$(release_value "$release_file" AI_INTEL_OPERATOR_GITHUB_USER_IDS)" \
+    "GITHUB_OAUTH_CLIENT_ID=$(release_value "$release_file" GITHUB_OAUTH_CLIENT_ID)" \
     "AI_INTEL_POSTGRES_DATABASE=$(release_value "$release_file" AI_INTEL_POSTGRES_DATABASE)" \
     "AI_INTEL_POSTGRES_USER=$(release_value "$release_file" AI_INTEL_POSTGRES_USER)" \
     "AI_INTEL_SECRETS_DIR=$(release_value "$release_file" AI_INTEL_SECRETS_DIR)" \
@@ -684,7 +688,7 @@ case "$operation" in
     mkdir "${temporary_dir}/image"
     tar -xf "${temporary_dir}/image.tar" -C "${temporary_dir}/image"
     failed=0
-    for secret_name in database-password deepseek-api-key anonymous-id-salt; do
+    for secret_name in database-password deepseek-api-key anonymous-id-salt github-oauth-client-secret; do
       secret_file="${secrets_dir}/${secret_name}"
       test -s "$secret_file"
       if grep -R -a -F -f "$secret_file" "${temporary_dir}/service.log" "${temporary_dir}/image" >/dev/null 2>&1; then

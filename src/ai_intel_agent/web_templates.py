@@ -14,6 +14,7 @@ from ai_intel_agent.publication import PublicStory
 LOGGER = logging.getLogger(__name__)
 _TEMPLATE_ROOT = files("ai_intel_agent").joinpath("templates")
 _STATIC_ROOT = files("ai_intel_agent").joinpath("static")
+_OPERATOR_STATIC_ROOT = files("ai_intel_agent").joinpath("operator_static")
 _ENVIRONMENT = Environment(
     loader=FileSystemLoader(str(_TEMPLATE_ROOT)),
     autoescape=select_autoescape(enabled_extensions=("html", "xml"), default_for_string=True),
@@ -29,6 +30,11 @@ def render_public_page(template_name: str, *, page_name: str, **context: object)
         frontend_assets=_frontend_assets(page_name),
         **context,
     )
+
+
+def render_operator_page() -> str:
+    template = _ENVIRONMENT.get_template("operator.html")
+    return template.render(frontend_assets=_operator_frontend_assets())
 
 
 @cache
@@ -47,6 +53,23 @@ def _frontend_assets(page_name: str) -> dict[str, object]:
             page_name,
             type(error).__name__,
         )
+        return {"module": None, "css": ()}
+    return {"module": module, "css": css}
+
+
+@cache
+def _operator_frontend_assets() -> dict[str, object]:
+    manifest_path = _OPERATOR_STATIC_ROOT.joinpath(".vite/manifest.json")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        entry = manifest["src/operator.js"]
+        module = _asset_url(entry["file"], prefix="/operator-assets/")
+        css = tuple(
+            _asset_url(path, prefix="/operator-assets/")
+            for path in _entry_css(manifest, entry)
+        )
+    except (FileNotFoundError, KeyError, TypeError, ValueError) as error:
+        LOGGER.warning("Operator asset manifest unavailable: %s", type(error).__name__)
         return {"module": None, "css": ()}
     return {"module": module, "css": css}
 
@@ -73,10 +96,10 @@ def _entry_css(manifest: dict[str, object], entry: object) -> tuple[str, ...]:
     return tuple(discovered)
 
 
-def _asset_url(path: object) -> str:
+def _asset_url(path: object, *, prefix: str = "/assets/") -> str:
     if not isinstance(path, str) or path.startswith(("/", ".")) or ".." in path:
         raise ValueError("Frontend manifest contains an unsafe asset path")
-    return f"/assets/{path}"
+    return f"{prefix}{path}"
 
 
 def render_story_cards(

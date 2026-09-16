@@ -1,4 +1,4 @@
-{$AI_INTEL_DOMAIN} {
+{$AI_INTEL_DOMAIN}, {$AI_INTEL_OPERATOR_DOMAIN} {
 	@internal_health path /health/*
 	respond @internal_health 404
 

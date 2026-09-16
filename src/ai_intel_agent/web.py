@@ -2,17 +2,25 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, datetime
 from email.utils import format_datetime
 from importlib.resources import files
 from typing import Annotated
 from urllib.parse import quote, urlencode
+from uuid import UUID
 from xml.etree import ElementTree
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -30,6 +38,15 @@ from ai_intel_agent.domain import (
     EvidenceState,
     Topic,
 )
+from ai_intel_agent.operator_console import (
+    GitHubOAuthClient,
+    GitHubOAuthError,
+    OperatorReadProjection,
+    OperatorSecurityConfiguration,
+    OperatorSession,
+    OperatorSessionStore,
+    utc_now,
+)
 from ai_intel_agent.persistence import create_database_engine
 from ai_intel_agent.publication import (
     PublicContent,
@@ -46,7 +63,11 @@ from ai_intel_agent.research import (
     interpret_query_intent,
     stream_research_events,
 )
-from ai_intel_agent.web_templates import render_public_page, render_story_cards
+from ai_intel_agent.web_templates import (
+    render_operator_page,
+    render_public_page,
+    render_story_cards,
+)
 
 LOGGER = logging.getLogger(__name__)
 BROWSE_PAGE_SIZE = 12
@@ -87,6 +108,9 @@ def create_app(
     accepted_knowledge_retrieval: AcceptedKnowledgeOperation | None = None,
     retrieval_embedding: EmbeddingBackend | None = None,
     retrieval_reranker: RerankerBackend | None = None,
+    operator_configuration: OperatorSecurityConfiguration | None = None,
+    github_oauth_client: GitHubOAuthClient | None = None,
+    operator_clock: object | None = None,
 ) -> FastAPI:
     if (anonymous_research_daily_limit is None) != (anonymous_identity_salt is None):
         raise ValueError("Anonymous Research limit and identity salt must be configured together")
@@ -120,9 +144,201 @@ def create_app(
         openapi_url=None,
         lifespan=lifespan,
     )
+    now = getattr(operator_clock, "now", utc_now)
+    operator_sessions: OperatorSessionStore | None = None
+    if operator_configuration is not None:
+        if github_oauth_client is None:
+            raise ValueError("Operator Console requires a GitHub OAuth client")
+        operator_sessions = OperatorSessionStore(engine, operator_configuration)
+        operator_projection = OperatorReadProjection(engine)
+        app.state.operator_sessions = operator_sessions
+
+        def require_operator_session(request: Request) -> OperatorSession:
+            session = _operator_session(request, operator_sessions, now())
+            if session is None:
+                raise HTTPException(status_code=401, detail="Authentication required")
+            return session
+
+        @app.middleware("http")
+        async def isolate_operator_host(request: Request, call_next):
+            host_values = request.headers.getlist("host")
+            host = host_values[0].lower() if len(host_values) == 1 else ""
+            path = request.url.path
+            if path.startswith("/health/"):
+                return await call_next(request)
+            if host == operator_configuration.operator_host:
+                if path == "/":
+                    request.scope["path"] = "/operator"
+                    request.scope["raw_path"] = b"/operator"
+                elif not _is_operator_path(path):
+                    return Response(status_code=404)
+                response = await call_next(request)
+                _set_operator_security_headers(response)
+                return response
+            if host == operator_configuration.public_host:
+                if _is_operator_path(path):
+                    return Response(status_code=404)
+                return await call_next(request)
+            return Response(status_code=404)
+
+        @app.get("/operator", response_class=HTMLResponse, include_in_schema=False)
+        def operator_page(request: Request) -> Response:
+            session = _operator_session(request, operator_sessions, now())
+            if session is None:
+                return RedirectResponse("/operator/login", status_code=303)
+            return HTMLResponse(render_operator_page())
+
+        @app.get("/operator/login", include_in_schema=False)
+        def operator_login() -> Response:
+            state, browser_nonce = operator_sessions.begin_login(created_at=now())
+            response = RedirectResponse(
+                github_oauth_client.authorization_url(
+                    state=state,
+                    redirect_uri=operator_configuration.callback_uri,
+                ),
+                status_code=303,
+            )
+            response.set_cookie(
+                "__Host-ai-ledger-operator-login",
+                browser_nonce,
+                max_age=int(operator_configuration.login_ttl.total_seconds()),
+                path="/",
+                secure=True,
+                httponly=True,
+                samesite="lax",
+            )
+            return response
+
+        @app.get("/operator/oauth/callback", include_in_schema=False)
+        def operator_oauth_callback(
+            request: Request,
+            code: str | None = None,
+            state: str | None = None,
+            error: str | None = None,
+            error_description: str | None = None,
+        ) -> Response:
+            del error_description
+            if error is not None or not code or not state:
+                return JSONResponse({"detail": "OAuth authorization failed"}, status_code=400)
+            browser_nonce = request.cookies.get("__Host-ai-ledger-operator-login", "")
+            if not browser_nonce or not operator_sessions.consume_login(
+                state=state,
+                browser_nonce=browser_nonce,
+                consumed_at=now(),
+            ):
+                return JSONResponse({"detail": "OAuth state mismatch"}, status_code=400)
+            try:
+                identity = github_oauth_client.identity_for_code(
+                    code=code,
+                    redirect_uri=operator_configuration.callback_uri,
+                )
+            except GitHubOAuthError:
+                return JSONResponse({"detail": "OAuth provider unavailable"}, status_code=502)
+            if identity.user_id not in operator_configuration.allowed_github_user_ids:
+                return JSONResponse({"detail": "Operator identity is not authorized"}, status_code=403)
+            created = operator_sessions.create(
+                identity,
+                created_at=now(),
+                rotated_token=request.cookies.get("__Host-ai-ledger-operator"),
+            )
+            response = RedirectResponse("/", status_code=303)
+            response.set_cookie(
+                "__Host-ai-ledger-operator",
+                created.token,
+                max_age=int(operator_configuration.session_absolute_ttl.total_seconds()),
+                path="/",
+                secure=True,
+                httponly=True,
+                samesite="lax",
+            )
+            response.delete_cookie(
+                "__Host-ai-ledger-operator-login",
+                path="/",
+                secure=True,
+                httponly=True,
+                samesite="lax",
+            )
+            return response
+
+        @app.get("/api/operator/session", include_in_schema=False)
+        def operator_session(request: Request) -> Response:
+            session = require_operator_session(request)
+            return JSONResponse(_operator_session_payload(session))
+
+        @app.get("/api/operator/dashboard", include_in_schema=False)
+        def operator_dashboard(request: Request) -> Response:
+            session = require_operator_session(request)
+            return JSONResponse(operator_projection.dashboard(session))
+
+        @app.get("/api/operator/plans", include_in_schema=False)
+        def operator_plans(request: Request) -> Response:
+            require_operator_session(request)
+            return JSONResponse(operator_projection.plan_history())
+
+        @app.get("/api/operator/plans/{plan_id}", include_in_schema=False)
+        def operator_plan(plan_id: str, request: Request) -> Response:
+            require_operator_session(request)
+            try:
+                parsed_plan_id = UUID(plan_id)
+            except ValueError:
+                return JSONResponse({"detail": "Digest Plan not found"}, status_code=404)
+            payload = operator_projection.plan(parsed_plan_id)
+            if payload is None:
+                return JSONResponse({"detail": "Digest Plan not found"}, status_code=404)
+            return JSONResponse(payload)
+
+        @app.get(
+            "/api/operator/document-versions/{document_version_id}",
+            include_in_schema=False,
+        )
+        def operator_document_version(
+            document_version_id: str,
+            request: Request,
+        ) -> Response:
+            require_operator_session(request)
+            try:
+                parsed_document_id = UUID(document_version_id)
+            except ValueError:
+                return JSONResponse({"detail": "Document Version not found"}, status_code=404)
+            payload = operator_projection.document_version(parsed_document_id)
+            if payload is None:
+                return JSONResponse({"detail": "Document Version not found"}, status_code=404)
+            return JSONResponse(payload)
+
+        @app.post("/operator/logout", include_in_schema=False)
+        def operator_logout(request: Request) -> Response:
+            session_token = request.cookies.get("__Host-ai-ledger-operator", "")
+            session = require_operator_session(request)
+            origin_values = request.headers.getlist("origin")
+            csrf_values = request.headers.getlist("x-csrf-token")
+            if len(origin_values) != 1 or origin_values[0] != operator_configuration.operator_origin:
+                return JSONResponse({"detail": "CSRF validation failed"}, status_code=403)
+            if len(csrf_values) != 1 or not secrets.compare_digest(
+                csrf_values[0],
+                session.csrf_token,
+            ):
+                return JSONResponse({"detail": "CSRF validation failed"}, status_code=403)
+            operator_sessions.revoke(session_token, revoked_at=now())
+            response = Response(status_code=204)
+            response.delete_cookie(
+                "__Host-ai-ledger-operator",
+                path="/",
+                secure=True,
+                httponly=True,
+                samesite="lax",
+            )
+            return response
     static_root = files("ai_intel_agent").joinpath("static")
     if static_root.is_dir():
         app.mount("/assets", StaticFiles(directory=str(static_root)), name="assets")
+    if operator_configuration is not None:
+        operator_static_root = files("ai_intel_agent").joinpath("operator_static")
+        if operator_static_root.is_dir():
+            app.mount(
+                "/operator-assets",
+                StaticFiles(directory=str(operator_static_root)),
+                name="operator-assets",
+            )
 
     @app.get("/health/live", include_in_schema=False)
     def health_live() -> dict[str, str]:
@@ -327,6 +543,47 @@ def create_app(
         )
 
     return app
+
+
+def _is_operator_path(path: str) -> bool:
+    return (
+        path in {"/operator", "/api/operator", "/operator-assets"}
+        or path.startswith(("/operator/", "/api/operator/", "/operator-assets/"))
+    )
+
+
+def _operator_session(
+    request: Request,
+    store: OperatorSessionStore,
+    observed_at: datetime,
+) -> OperatorSession | None:
+    token = request.cookies.get("__Host-ai-ledger-operator")
+    if not token:
+        return None
+    return store.resolve(token, observed_at=observed_at)
+
+
+def _operator_session_payload(session: OperatorSession) -> dict[str, object]:
+    return {
+        "operator": {
+            "github_user_id": session.github_user_id,
+            "github_login": session.github_login,
+        },
+        "csrf_token": session.csrf_token,
+        "absolute_expires_at": session.absolute_expires_at.isoformat(),
+    }
+
+
+def _set_operator_security_headers(response: Response) -> None:
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'none'; script-src 'self'; style-src 'self'; "
+        "connect-src 'self'; img-src 'self' data:; base-uri 'none'; "
+        "frame-ancestors 'none'; form-action 'self' https://github.com"
+    )
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
 
 
 def _relative_story_url(stable_key: str) -> str:

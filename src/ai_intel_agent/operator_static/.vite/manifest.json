@@ -1,0 +1,11 @@
+{
+  "src/operator.js": {
+    "file": "operator-CGSrQJez.js",
+    "name": "operator",
+    "src": "src/operator.js",
+    "isEntry": true,
+    "css": [
+      "operator-DwrVW1bx.css"
+    ]
+  }
+}

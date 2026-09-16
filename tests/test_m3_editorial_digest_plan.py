@@ -3324,7 +3324,7 @@ def test_0009_to_0010_upgrade_preserves_predecessor_state_and_runs_cli_seam(
                     )
                     == "succeeded"
                 )
-                assert session.scalar(text("SELECT version_num FROM alembic_version")) == "0015"
+                assert session.scalar(text("SELECT version_num FROM alembic_version")) == "0016"
                 assert (
                     session.scalar(
                         text(
@@ -3432,7 +3432,7 @@ def test_0014_downgrade_refuses_immutable_derived_plan_and_keeps_0014(
         ):
             command.downgrade(config, "0013")
         with Session(engine) as session:
-            assert session.scalar(text("SELECT version_num FROM alembic_version")) == "0015"
+            assert session.scalar(text("SELECT version_num FROM alembic_version")) == "0016"
             assert session.scalar(
                 select(DigestPlanRecord).where(DigestPlanRecord.previous_plan_id == first.id)
             ) is not None
@@ -3474,7 +3474,7 @@ def test_0015_downgrade_refuses_to_discard_publication_follow_up_even_after_with
         ):
             command.downgrade(config, "0013")
         with engine.connect() as connection:
-            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0015"
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0016"
 
         repository.withdraw_digest(
             date(2026, 8, 21),
@@ -3488,6 +3488,6 @@ def test_0015_downgrade_refuses_to_discard_publication_follow_up_even_after_with
         ):
             command.downgrade(config, "0013")
         with engine.connect() as connection:
-            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0015"
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0016"
     finally:
         engine.dispose()

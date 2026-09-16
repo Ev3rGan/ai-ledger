@@ -2,10 +2,9 @@
 
 This is the supported production procedure for the M1 service lineage, the collector over the
 current versioned Source Profile universe, and the exact Digest Plan editorial/publication loop.
-It keeps the public Web behind Caddy automatic
-HTTPS and PostgreSQL reachable only on an internal Compose network. M4 does not change the
-public security boundary, allowance ledger, backup/restore, rollback, secret handling, or add an
-administrator Web surface.
+It keeps both the public and read-only Operator Hosts behind Caddy automatic HTTPS and PostgreSQL
+reachable only on an internal Compose network. The two Hosts share one Python Web process, while
+the application rejects every Operator route, Session, and static entry on the public Host.
 
 The public edge network is pinned to `172.31.255.0/24`, with its dynamic allocation range limited
 to `172.31.255.128/25` and Caddy fixed at `172.31.255.2`. Keeping `.2` outside the dynamic range
@@ -56,10 +55,15 @@ The exact secret file names are:
 - `database-password`
 - `deepseek-api-key`
 - `anonymous-id-salt`
+- `github-oauth-client-secret`
 
 Create them as root in `/etc/ai-ledger-m1/secrets`, never in the checkout, release env file, shell
 arguments, Compose environment, or image. Generate the database password and anonymous salt with
-`openssl rand`; enter the Provider key through a non-echoing prompt or the host's secret manager.
+`openssl rand`; enter the Provider key and GitHub OAuth client secret through a non-echoing prompt
+or the host's secret manager. Register the exact callback URL
+`https://<AI_INTEL_OPERATOR_DOMAIN>/operator/oauth/callback` in the GitHub OAuth App. Record only
+stable numeric GitHub user IDs in `AI_INTEL_OPERATOR_GITHUB_USER_IDS`; account logins are display
+metadata and must not be used for authorization.
 Create a dedicated host group with numeric GID 10001, then set the directory and files to
 `root:10001` with modes `0750` and `0640`. Compose adds only that supplementary group to the
 services which need a mounted secret; each service receives only its own required secret files.
@@ -134,15 +138,17 @@ owned by this Compose project. The Scheduler holds a
 PostgreSQL advisory lock, so a second production Scheduler exits before collection. `status`
 shows database readiness and persisted recent Scheduler state through the private container CLI.
 `operator source-status --production` additionally reports each approved source's recent result,
-cursor, health, and body-valid Document Versions pending draft generation. There is no operator
-HTTP route.
+cursor, health, and body-valid Document Versions pending draft generation. The separate Operator
+Host provides an authenticated, read-only HTTP view of this state, Scheduler status, Editorial
+plans, completion/index follow-up, Stories, Claims, Evidence, and raw Document Versions.
 
 The lock-holding database session is monitored every two seconds, including while source or
 Provider I/O is in progress. A replacement Scheduler holds a five-second activation grace. If a
 PostgreSQL restart drops the old session, the old dedicated Scheduler process exits before the
 replacement can collect; Docker then keeps exactly one effective worker running.
 
-Only Caddy publishes host ports 80 and 443. PostgreSQL has no host port. Caddy overwrites the
+Only Caddy publishes host ports 80 and 443. PostgreSQL has no host port. Caddy terminates both
+configured HTTPS names and overwrites the
 anonymous-client header used by the persistent daily Research allowance and blocks `/health/*`
 at the public edge; container health checks use those endpoints internally.
 
@@ -195,7 +201,7 @@ the `restore-postgres` profile, which has its own volume and internal network an
 to Web, Scheduler, Caddy, or the production database.
 
 Docker stores each service stream as JSON and rotates it at 10 MiB with five files. Caddy and the
-application emit JSON records. `audit-no-secrets` compares the three injected values against
+application emit JSON records. `audit-no-secrets` compares the four injected values against
 tracked repository content, captured service logs, and the saved image layers while printing
 only pass/fail.
 
@@ -207,14 +213,17 @@ Infrastructure ownership remains with the user. After purchasing or selecting th
 2. Provision an off-host backup destination, mount it at `AI_INTEL_OFFSITE_BACKUP_DIR`, and verify
    `mountpoint --quiet "$AI_INTEL_OFFSITE_BACKUP_DIR"`. This task cannot create or authorize the
    user's storage account.
-3. Add one DNS `A` record for the chosen domain pointing to the host's public IPv4 address.
+3. Add DNS `A` records for both `AI_INTEL_DOMAIN` and `AI_INTEL_OPERATOR_DOMAIN`, each
+   pointing to the host's public IPv4 address.
 4. Permit inbound TCP 22 from the operator's trusted address and TCP 80/443 from the public
    internet; permit UDP 443 if HTTP/3 is desired. Deny public TCP 5432.
-5. Inject the three secret files named above, place the frozen checkout/release file in the
+5. Inject the four secret files named above, place the frozen checkout/release file in the
    documented paths, then run `validate` and `start`.
-6. Verify the domain resolves to the host, HTTP redirects to HTTPS, the certificate is valid,
-   Home → Digest → Story, Browse, RSS, and Research are reachable, and `/health/ready` is 404 at
-   the public boundary.
+6. Verify both domains resolve to the host, HTTP redirects to HTTPS, and both certificates are
+   valid. On the public Host, verify Home → Digest → Story, Browse, RSS, and Research are reachable
+   and `/health/ready` is 404 at the public boundary. On the Operator Host, complete GitHub OAuth
+   with an allowlisted numeric user ID and verify Dashboard, Plan history/detail, Evidence links,
+   and raw Document Version inspection are read-only; verify public routes are 404 on that Host.
 7. Run the bounded Research acceptance with a dedicated anonymous client: one supported answer
    up to the recorded limit, then an `anonymous-allowance-exhausted` refusal. Confirm the
    Provider call counter does not increase for the excess request.
@@ -296,7 +305,8 @@ manual collection refuse a requested limit above that recorded value.
 
 `operate.sh operator` is the supported private CLI boundary. It executes inside the recorded
 Web container and therefore reads and writes the same PostgreSQL state that public Web and
-Research use. It does not add an operator HTTP route.
+Research use. It remains the mutation boundary; the separate Operator Host exposes only the
+authenticated read projection and logout.
 
 For a single production Research diagnostic, run:
 
