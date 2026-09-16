@@ -69,8 +69,7 @@ def _operator_frontend_assets() -> dict[str, object]:
             for path in _entry_css(manifest, entry)
         )
     except (FileNotFoundError, KeyError, TypeError, ValueError) as error:
-        LOGGER.warning("Operator asset manifest unavailable: %s", type(error).__name__)
-        return {"module": None, "css": ()}
+        raise RuntimeError("Operator frontend assets are unavailable") from error
     return {"module": module, "css": css}
 
 

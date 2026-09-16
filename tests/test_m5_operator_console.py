@@ -21,6 +21,7 @@ from pg0 import Pg0
 from sqlalchemy.orm import Session
 from uvicorn import Config, Server
 
+from ai_intel_agent import web_templates
 from ai_intel_agent.editorial import (
     DigestPlan,
     DigestPlanAnomaly,
@@ -440,6 +441,32 @@ def test_operator_responses_set_private_security_headers(
         assert "script-src 'self'" in response.headers["content-security-policy"]
     with TestClient(app, base_url="https://public.test") as public:
         assert all(public.get(path).status_code == 404 for path in asset_paths)
+
+
+def test_operator_page_fails_explicitly_when_frontend_manifest_is_unavailable(
+    operator_database_url: str,
+    operator_configuration: OperatorSecurityConfiguration,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = MutableClock()
+    oauth = FakeGitHubOAuth(GitHubIdentity(user_id=42, login="allowed"))
+    app = _operator_app(operator_database_url, operator_configuration, clock, oauth)
+    web_templates._operator_frontend_assets.cache_clear()
+    monkeypatch.setattr(web_templates, "_OPERATOR_STATIC_ROOT", tmp_path)
+    try:
+        with TestClient(
+            app,
+            base_url="https://operator.test",
+            raise_server_exceptions=False,
+        ) as client:
+            assert _login(client).status_code == 303
+            response = client.get("/")
+    finally:
+        web_templates._operator_frontend_assets.cache_clear()
+
+    assert response.status_code == 500
+    assert "正在加载只读运行状态" not in response.text
 
 
 def test_operator_read_projection_exposes_plan_evidence_and_escaped_raw_text(
