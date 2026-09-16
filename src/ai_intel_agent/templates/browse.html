@@ -9,7 +9,13 @@
     <label>原始发布日期<input name="date" type="date" value="{{ publication_date.isoformat() if publication_date else '' }}"></label>
     <button type="submit">筛选</button>
   </form>
-  <p class="muted">找到 {{ stories|length }} 条 Story</p>
+  <p class="muted">找到 {{ browse_bootstrap.pagination.total_items }} 条 Story</p>
   {% if stories %}<div class="story-grid">{% include "fragments/story_cards.html" %}</div>{% else %}<p class="empty-state">没有符合这些条件的已发布 Story。</p>{% endif %}
+  {% if browse_page_urls.previous or browse_page_urls.next %}<nav class="pagination" aria-label="Browse 分页">
+    {% if browse_page_urls.previous %}<a href="{{ browse_page_urls.previous }}" aria-label="上一页">上一页</a>{% endif %}
+    <span>第 {{ browse_bootstrap.pagination.page }} / {{ browse_bootstrap.pagination.total_pages }} 页</span>
+    {% if browse_page_urls.next %}<a href="{{ browse_page_urls.next }}" aria-label="下一页">下一页</a>{% endif %}
+  </nav>{% endif %}
 </section>
+<script id="browse-bootstrap" type="application/json">{{ browse_bootstrap|tojson }}</script>
 {% endblock %}

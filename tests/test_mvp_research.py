@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -624,6 +625,11 @@ def test_research_page_explains_curated_capabilities_and_offers_fill_only_exampl
     )
     with TestClient(create_app(research_database_url)) as client:
         response = client.get("/research")
+        module_match = re.search(
+            r'<script type="module" src="(/assets/research-[^"]+\.js)"></script>',
+            response.text,
+        )
+        module = client.get(module_match.group(1)) if module_match is not None else None
 
     assert response.status_code == 200
     assert '<form id="research-form">' in response.text
@@ -632,7 +638,10 @@ def test_research_page_explains_curated_capabilities_and_offers_fill_only_exampl
     assert 'id="research-answer"' in response.text
     assert 'id="research-refusal"' in response.text
     assert 'id="research-citations"' in response.text
-    assert 'fetch("/research/answer"' in response.text
+    assert module_match is not None
+    assert module is not None and module.status_code == 200
+    assert "/research/answer" in module.text
+    assert 'id="research-bootstrap" type="application/json"' in response.text
     assert "支持什么" in response.text
     assert "如何提问" in response.text
     assert "仅检索已接受且已发布的知识" in response.text
@@ -648,18 +657,16 @@ def test_research_page_explains_curated_capabilities_and_offers_fill_only_exampl
     assert "关于「Gemini 3.6 Flash 正式发布 · example」，已发布知识支持什么事实？" in response.text
     assert "Anthropic 的年化营收运行率是多少？" not in response.text
     assert 'type="button"' in response.text
-    assert "question.value = button.dataset.question" in response.text
-    assert "question.focus()" in response.text
     assert "requestSubmit" not in response.text
     assert "form.submit" not in response.text
-    assert 'block.split("\\n")' in response.text
-    assert 'buffer.indexOf("\\n\\n")' in response.text
-    assert "retrieval-degraded" in response.text
-    assert "evidence-assembled" in response.text
-    assert "verifying-citations" in response.text
-    assert "statement_support" in response.text
-    assert '"source-publication": "来源发布时间"' in response.text
-    assert '"digest-publication": "Digest 发布时间"' in response.text
+    assert 'block.split("\\n")' not in response.text
+    assert 'buffer.indexOf("\\n\\n")' not in response.text
+    assert "retrieval-degraded" in module.text
+    assert "evidence-assembled" in module.text
+    assert "verifying-citations" in module.text
+    assert "statement_support" in module.text
+    assert "来源发布时间" in module.text
+    assert "Digest 发布时间" in module.text
     assert "会话历史" not in response.text
     assert "管理员" not in response.text
 
