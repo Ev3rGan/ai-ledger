@@ -59,15 +59,18 @@ uv run ai-intel-agent story list
 uv run ai-intel-agent story show <stable-key>
 uv run ai-intel-agent digest plan prepare --date <Asia-Shanghai-date>
 uv run ai-intel-agent digest plan show <plan-id>
+uv run ai-intel-agent digest plan remove <plan-id> <story-stable-key> --reason <operator-reason> --actor local-operator
 uv run ai-intel-agent digest plan approve <plan-id> --content-hash <displayed-sha256> --actor local-operator
 ```
 
 The plan display is the review surface: inspect every included Story, Claim, Evidence Span,
-source-health snapshot, anomaly, content hash, and current-state hash before approving. Direct
+source-health snapshot, anomaly, content hash, and current-state hash before approving. If a Story
+must be removed, the remove command creates a new immutable Plan version with recorded predecessor,
+Story key, reason, and actor. Re-open the returned Plan and approve only its new ID and content hash;
+the superseded Plan cannot be approved or published. A Plan may contain 1-12 Stories. Fewer than
+three Publishers is a visible non-blocking warning, not a publication gate. Direct
 `story accept`, `story reject`, `digest preview`, and `digest publish` are retired compatibility
-commands and are not part of the supported operator path. The legacy eight-Story and
-three-Publisher checks are tracked for repair in Issue #120; do not present them as product
-requirements or manually curate around them.
+commands and are not part of the supported operator path.
 
 Observe these public URLs through a real browser session:
 

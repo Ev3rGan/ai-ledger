@@ -44,6 +44,7 @@ from ai_intel_agent.editorial import (
     EditorialPlanProposal,
     EditorialStateError,
     EditorialStoryProposal,
+    EditorialWorkflow,
     EvidenceSpanInspection,
     SchedulerHealthInspection,
     SourceHealthInspection,
@@ -1185,6 +1186,46 @@ def test_editorial_agent_prepares_one_complete_traceable_plan_without_rewriting_
     )
 
 
+@pytest.mark.parametrize("story_count", (1, 12, 13))
+def test_digest_plan_nonempty_quantity_policy_and_publisher_warning(story_count: int) -> None:
+    source_id = _id(f"quantity-source:{story_count}")
+    stories = tuple(
+        _story(position, publisher="Single Publisher", source_id=source_id)
+        for position in range(story_count)
+    )
+    provider = _StaticEditorialProvider(
+        tuple(
+            _editorial_story_proposal(
+                story,
+                inclusion=DigestPlanInclusion.INCLUDED,
+                order=position,
+                exclusion_reason=None,
+            )
+            for position, story in enumerate(stories)
+        )
+    )
+
+    plan = prepare_digest_plan(
+        _editorial_context_for(stories),
+        provider,
+        version=1,
+        prepared_at=datetime(2026, 8, 20, 16, tzinfo=UTC),
+    )
+
+    selection_anomalies = tuple(
+        anomaly for anomaly in plan.anomalies if anomaly.code == "invalid-selection"
+    )
+    if story_count == 13:
+        assert len(selection_anomalies) == 1
+        assert selection_anomalies[0].blocking
+    else:
+        assert selection_anomalies == ()
+    publisher_warning = next(
+        anomaly for anomaly in plan.anomalies if anomaly.code == "weak-source-coverage"
+    )
+    assert not publisher_warning.blocking
+
+
 def test_versioned_editorial_provider_protocol_is_strict_and_uses_no_live_network() -> None:
     publication_date = date(2026, 8, 21)
     window_start, window_end = editorial_window_for(publication_date)
@@ -1281,7 +1322,7 @@ def test_versioned_editorial_provider_protocol_is_strict_and_uses_no_live_networ
     assert len(protocol.content_sha256) == 64
     assert protocol.maximum_pending_stories == 12
     assert protocol.maximum_output_tokens == 4096
-    assert protocol.version == "editorial-digest-plan-2026-09-15.v3"
+    assert protocol.version == "editorial-digest-plan-2026-09-16.v4"
     assert len(budget.reservations) == 1
     assert budget.reservations[0].actual_cost == Decimal("0.000924")
     assert len(observed_requests) == 1
@@ -1293,6 +1334,8 @@ def test_versioned_editorial_provider_protocol_is_strict_and_uses_no_live_networ
     assert "normalized Simplified Chinese" in system_prompt
     assert "consistent terminology" in system_prompt
     assert "one coherent editorial voice" in system_prompt
+    assert "Select 1-12 supported and timely Stories" in system_prompt
+    assert "Select 8-12" not in system_prompt
 
     invalid_output = json.loads(json.dumps(provider_output))
     invalid_output["stories"][0]["evidence"] = "invented Evidence"
@@ -1457,6 +1500,162 @@ def test_repository_prepares_and_approves_only_the_newest_twelve_story_batch(
         } == {"persisted-story:0", "persisted-story:1"}
         assert repository.story("persisted-story:12").review_state is StoryReviewState.ACCEPTED
         assert repository.story("persisted-story:13").review_state is StoryReviewState.ACCEPTED
+    finally:
+        engine.dispose()
+
+
+def test_workflow_repeatedly_removes_stories_without_rewriting_history_or_calling_provider(
+    editorial_database_url: str,
+) -> None:
+    _persist_pending_stories(editorial_database_url, story_count=5)
+    engine = create_database_engine(editorial_database_url)
+    provider = _RecordingExcludeUnsupportedEditorialProvider()
+    observed_at = datetime(2026, 8, 20, 16, tzinfo=UTC)
+    try:
+        repository = EditorialRepository(engine)
+        workflow = EditorialWorkflow(repository)
+        first = workflow.prepare(
+            date(2026, 8, 21),
+            provider=provider,
+            prepared_at=observed_at,
+        )
+        assert len(first.included_stories) == 4
+        story_a, story_b, story_c, story_d = first.included_stories
+        first_payload = json.dumps(first.content_payload(), ensure_ascii=False, sort_keys=True)
+
+        second = workflow.remove_story(
+            first.id,
+            story_stable_key=story_a.stable_key,
+            reason="The operator removed Story A from this Digest composition.",
+            actor_identifier="m3-operator",
+            removed_at=observed_at + timedelta(minutes=1),
+        )
+        second_payload = json.dumps(second.content_payload(), ensure_ascii=False, sort_keys=True)
+        third = workflow.remove_story(
+            second.id,
+            story_stable_key=story_d.stable_key,
+            reason="The operator removed Story D from this Digest composition.",
+            actor_identifier="m3-operator",
+            removed_at=observed_at + timedelta(minutes=2),
+        )
+
+        assert len(provider.contexts) == 1
+        assert tuple(item.stable_key for item in second.included_stories) == (
+            story_b.stable_key,
+            story_c.stable_key,
+            story_d.stable_key,
+        )
+        assert tuple(item.stable_key for item in third.included_stories) == (
+            story_b.stable_key,
+            story_c.stable_key,
+        )
+        assert tuple(item.order for item in third.included_stories) == (0, 1)
+        assert third.derivation is not None
+        assert third.derivation.previous_plan_id == second.id
+        assert third.derivation.removed_story_stable_key == story_d.stable_key
+        assert (
+            third.derivation.removal_reason
+            == "The operator removed Story D from this Digest composition."
+        )
+        assert workflow.plan(first.id) == first
+        assert workflow.plan(second.id) == second
+        assert json.dumps(first.content_payload(), ensure_ascii=False, sort_keys=True) == first_payload
+        assert json.dumps(second.content_payload(), ensure_ascii=False, sort_keys=True) == second_payload
+
+        removed_a = next(item for item in second.stories if item.id == story_a.id)
+        removed_d = next(item for item in third.stories if item.id == story_d.id)
+        assert removed_a.inclusion is DigestPlanInclusion.EXCLUDED
+        assert removed_d.inclusion is DigestPlanInclusion.EXCLUDED
+        assert removed_a.claims == story_a.claims
+        assert removed_d.claims == story_d.claims
+
+        digest = workflow.approve(
+            third.id,
+            expected_content_hash=third.content_hash,
+            actor_identifier="m3-operator",
+            approved_at=observed_at + timedelta(minutes=3),
+        )
+        assert digest.story_ids == (story_b.id, story_c.id)
+        assert repository.story(story_a.stable_key).review_state is StoryReviewState.REJECTED
+        assert repository.story(story_d.stable_key).review_state is StoryReviewState.REJECTED
+        assert repository.story(story_b.stable_key).review_state is StoryReviewState.ACCEPTED
+        assert repository.story(story_c.stable_key).review_state is StoryReviewState.ACCEPTED
+        history = repository.digest_history(date(2026, 8, 21))
+        assert history is not None
+        assert history.audit_actions.count("digest-plan.prepared") == 1
+        assert history.audit_actions.count("digest-plan.story-removed") == 2
+        assert history.audit_actions.count("digest-plan.approved") == 1
+    finally:
+        engine.dispose()
+
+
+def test_workflow_can_derive_an_empty_plan_but_cannot_approve_it_yet(
+    editorial_database_url: str,
+) -> None:
+    _persist_pending_stories(editorial_database_url, story_count=2)
+    engine = create_database_engine(editorial_database_url)
+    observed_at = datetime(2026, 8, 20, 16, tzinfo=UTC)
+    try:
+        workflow = EditorialWorkflow(EditorialRepository(engine))
+        first = workflow.prepare(
+            date(2026, 8, 21),
+            provider=_ExcludeUnsupportedEditorialProvider(),
+            prepared_at=observed_at,
+        )
+        assert len(first.included_stories) == 1
+
+        empty = workflow.remove_story(
+            first.id,
+            story_stable_key=first.included_stories[0].stable_key,
+            reason="The operator removed the final Story from this composition.",
+            actor_identifier="m3-operator",
+            removed_at=observed_at + timedelta(minutes=1),
+        )
+
+        assert empty.included_stories == ()
+        assert any(
+            anomaly.code == "invalid-selection" and anomaly.blocking
+            for anomaly in empty.anomalies
+        )
+        assert workflow.plan(empty.id) == empty
+        with pytest.raises(EditorialStateError, match="blocking anomaly"):
+            workflow.approve(
+                empty.id,
+                expected_content_hash=empty.content_hash,
+                actor_identifier="m3-operator",
+                approved_at=observed_at + timedelta(minutes=2),
+            )
+    finally:
+        engine.dispose()
+
+
+def test_workflow_approves_one_story_with_a_visible_nonblocking_publisher_warning(
+    editorial_database_url: str,
+) -> None:
+    _persist_pending_stories(editorial_database_url, story_count=2)
+    engine = create_database_engine(editorial_database_url)
+    observed_at = datetime(2026, 8, 20, 16, tzinfo=UTC)
+    try:
+        workflow = EditorialWorkflow(EditorialRepository(engine))
+        plan = workflow.prepare(
+            date(2026, 8, 21),
+            provider=_ExcludeUnsupportedEditorialProvider(),
+            prepared_at=observed_at,
+        )
+        assert len(plan.included_stories) == 1
+        assert any(
+            anomaly.code == "weak-source-coverage" and not anomaly.blocking
+            for anomaly in plan.anomalies
+        )
+
+        digest = workflow.approve(
+            plan.id,
+            expected_content_hash=plan.content_hash,
+            actor_identifier="m3-operator",
+            approved_at=observed_at + timedelta(minutes=1),
+        )
+
+        assert digest.story_ids == (plan.included_stories[0].id,)
     finally:
         engine.dispose()
 
@@ -1801,6 +2000,167 @@ def test_database_cannot_publish_an_editorial_plan_contract_without_approval(
         engine.dispose()
 
 
+def test_database_cannot_publish_a_superseded_plan_even_with_an_exact_approval_row(
+    editorial_database_url: str,
+) -> None:
+    _persist_pending_stories(editorial_database_url, story_count=5)
+    engine = create_database_engine(editorial_database_url)
+    observed_at = datetime(2026, 8, 20, 14, tzinfo=UTC)
+    try:
+        repository = EditorialRepository(engine)
+        workflow = EditorialWorkflow(repository)
+        first = workflow.prepare(
+            date(2026, 8, 21),
+            provider=_ExcludeUnsupportedEditorialProvider(),
+            prepared_at=observed_at,
+        )
+        workflow.remove_story(
+            first.id,
+            story_stable_key=first.included_stories[0].stable_key,
+            reason="A newer immutable Plan removes this Story from the composition.",
+            actor_identifier="m3-operator",
+            removed_at=observed_at + timedelta(minutes=1),
+        )
+        draft = compose_digest(
+            first.publication_date,
+            tuple(item.id for item in first.included_stories),
+        )
+
+        with Session(engine) as session:
+            for item in first.stories:
+                story = session.get(StoryRecord, item.id)
+                assert story is not None
+                story.review_state = (
+                    StoryReviewState.ACCEPTED.value
+                    if item.inclusion is DigestPlanInclusion.INCLUDED
+                    else StoryReviewState.REJECTED.value
+                )
+                if item.inclusion is DigestPlanInclusion.INCLUDED:
+                    presentation = session.get(StoryPresentationRecord, item.id)
+                    assert presentation is not None
+                    presentation.summary = item.summary
+                    presentation.why_it_matters = item.why_it_matters
+                    presentation.primary_topic = item.primary_topic
+                    presentation.secondary_topics = list(item.secondary_topics)
+            session.add(
+                DigestRecord(
+                    id=draft.id,
+                    stable_key=draft.stable_key,
+                    publication_date=draft.publication_date,
+                    state=DigestState.DRAFT.value,
+                    published_at=None,
+                    introduction=first.digest_summary,
+                    publication_contract=DigestPublicationContract.M3_EDITORIAL_PLAN.value,
+                    digest_plan_id=first.id,
+                )
+            )
+            session.flush()
+            session.add_all(
+                DigestStoryRecord(
+                    digest_id=draft.id,
+                    story_id=story_id,
+                    position=position,
+                )
+                for position, story_id in enumerate(draft.story_ids)
+            )
+            session.add(
+                DigestPlanApprovalRecord(
+                    plan_id=first.id,
+                    digest_id=draft.id,
+                    content_hash=first.content_hash,
+                    actor_identifier="m3-operator",
+                    approved_at=observed_at + timedelta(minutes=2),
+                )
+            )
+            session.flush()
+
+            with pytest.raises(DBAPIError, match="latest Digest Plan version"):
+                session.execute(
+                    update(DigestRecord)
+                    .where(DigestRecord.id == draft.id)
+                    .values(
+                        state=DigestState.PUBLISHED.value,
+                        published_at=observed_at + timedelta(minutes=3),
+                    )
+                )
+                session.flush()
+            session.rollback()
+    finally:
+        engine.dispose()
+
+
+def test_database_rejects_thirteen_story_publication_before_approval_projection(
+    editorial_database_url: str,
+) -> None:
+    _persist_pending_stories(editorial_database_url, story_count=13)
+    engine = create_database_engine(editorial_database_url)
+    observed_at = datetime(2026, 8, 20, 14, tzinfo=UTC)
+    try:
+        repository = EditorialRepository(engine)
+        plan = repository.prepare_digest_plan(
+            date(2026, 8, 21),
+            provider=_ExcludeUnsupportedEditorialProvider(),
+            prepared_at=observed_at,
+        )
+        with Session(engine) as session:
+            story_records = tuple(
+                session.scalars(select(StoryRecord).order_by(StoryRecord.stable_key)).all()
+            )
+            assert len(story_records) == 13
+            for story in story_records:
+                story.review_state = StoryReviewState.ACCEPTED.value
+                presentation = session.get(StoryPresentationRecord, story.id)
+                assert presentation is not None
+                presentation.summary = (
+                    f"{story.stable_key} has enough reader summary text for this database gate."
+                )
+                presentation.why_it_matters = (
+                    f"{story.stable_key} has enough reader impact text for this database gate."
+                )
+                presentation.primary_topic = Topic.MODELS.value
+                presentation.secondary_topics = []
+            draft = compose_digest(
+                plan.publication_date,
+                tuple(story.id for story in story_records),
+            )
+            session.add(
+                DigestRecord(
+                    id=draft.id,
+                    stable_key=draft.stable_key,
+                    publication_date=draft.publication_date,
+                    state=DigestState.DRAFT.value,
+                    published_at=None,
+                    introduction=plan.digest_summary,
+                    publication_contract=DigestPublicationContract.M3_EDITORIAL_PLAN.value,
+                    digest_plan_id=plan.id,
+                )
+            )
+            session.flush()
+            session.add_all(
+                DigestStoryRecord(
+                    digest_id=draft.id,
+                    story_id=story.id,
+                    position=position,
+                )
+                for position, story in enumerate(story_records)
+            )
+            session.flush()
+
+            with pytest.raises(DBAPIError, match="between 1 and 12 Stories"):
+                session.execute(
+                    update(DigestRecord)
+                    .where(DigestRecord.id == draft.id)
+                    .values(
+                        state=DigestState.PUBLISHED.value,
+                        published_at=observed_at + timedelta(minutes=1),
+                    )
+                )
+                session.flush()
+            session.rollback()
+    finally:
+        engine.dispose()
+
+
 def test_database_requires_the_complete_approved_plan_projection(
     editorial_database_url: str,
 ) -> None:
@@ -2130,6 +2490,96 @@ def test_cli_prepares_displays_and_approves_one_exact_plan(
         engine.dispose()
 
 
+def test_cli_removes_one_story_through_workflow_and_supersedes_the_previous_plan(
+    editorial_database_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _persist_pending_stories(editorial_database_url, story_count=5)
+    provider = _RecordingExcludeUnsupportedEditorialProvider()
+    monkeypatch.setenv("AI_INTEL_DATABASE_URL", editorial_database_url)
+    monkeypatch.setattr(
+        cli_module,
+        "_create_editorial_plan_provider",
+        lambda _engine, _client: provider,
+    )
+    runner = CliRunner()
+
+    prepared = runner.invoke(
+        app,
+        ["digest", "plan", "prepare", "--date", "2026-08-21"],
+    )
+    assert prepared.exit_code == 0, prepared.output
+    first_fields = {
+        name: line.removeprefix(f"{name}: ")
+        for line in prepared.output.splitlines()
+        for name in ("Digest Plan", "Content hash")
+        if line.startswith(f"{name}: ")
+    }
+    engine = create_database_engine(editorial_database_url)
+    try:
+        first = EditorialRepository(engine).digest_plan(UUID(first_fields["Digest Plan"]))
+        assert first is not None
+        removed_key = first.included_stories[0].stable_key
+    finally:
+        engine.dispose()
+
+    removed = runner.invoke(
+        app,
+        [
+            "digest",
+            "plan",
+            "remove",
+            first_fields["Digest Plan"],
+            removed_key,
+            "--reason",
+            "This Story does not belong in the current Digest composition.",
+            "--actor",
+            "break-glass-operator",
+        ],
+    )
+    assert removed.exit_code == 0, removed.output
+    assert "Previous Plan: " + first_fields["Digest Plan"] in removed.output
+    assert f"Removed Story: {removed_key}" in removed.output
+    second_fields = {
+        name: line.removeprefix(f"{name}: ")
+        for line in removed.output.splitlines()
+        for name in ("Digest Plan", "Content hash")
+        if line.startswith(f"{name}: ")
+    }
+    assert second_fields["Digest Plan"] != first_fields["Digest Plan"]
+    assert len(provider.contexts) == 1
+
+    stale = runner.invoke(
+        app,
+        [
+            "digest",
+            "plan",
+            "approve",
+            first_fields["Digest Plan"],
+            "--content-hash",
+            first_fields["Content hash"],
+        ],
+    )
+    assert stale.exit_code != 0
+    assert "latest Digest Plan version" in stale.output
+
+    approved = runner.invoke(
+        app,
+        [
+            "digest",
+            "plan",
+            "approve",
+            second_fields["Digest Plan"],
+            "--content-hash",
+            second_fields["Content hash"],
+            "--actor",
+            "break-glass-operator",
+        ],
+    )
+    assert approved.exit_code == 0, approved.output
+    assert "published with 3 Stories" in approved.output
+
+
 class _CitingResearchProvider:
     def __init__(self) -> None:
         self.calls = 0
@@ -2311,7 +2761,7 @@ def test_0009_to_0010_upgrade_preserves_predecessor_state_and_runs_cli_seam(
                     )
                     == "succeeded"
                 )
-                assert session.scalar(text("SELECT version_num FROM alembic_version")) == "0013"
+                assert session.scalar(text("SELECT version_num FROM alembic_version")) == "0014"
                 assert (
                     session.scalar(
                         text(
@@ -2334,6 +2784,18 @@ def test_0009_to_0010_upgrade_preserves_predecessor_state_and_runs_cli_seam(
                     )
                     == 1
                 )
+                assert (
+                    session.scalar(
+                        text(
+                            "SELECT count(*) FROM information_schema.columns "
+                            "WHERE table_schema = 'public' "
+                            "AND table_name = 'digest_plans' "
+                            "AND column_name IN "
+                            "('previous_plan_id', 'removed_story_stable_key', 'removal_reason')"
+                        )
+                    )
+                    == 3
+                )
         finally:
             engine.dispose()
 
@@ -2353,3 +2815,116 @@ def test_0009_to_0010_upgrade_preserves_predecessor_state_and_runs_cli_seam(
         assert "blocking=false" in result.output
     finally:
         server.drop()
+
+
+@pytest.mark.postgres
+def test_0014_downgrade_refuses_immutable_derived_plan_and_keeps_0014(
+    editorial_database_url: str,
+) -> None:
+    config = Config(str(Path("alembic.ini").resolve()))
+    config.set_main_option(
+        "sqlalchemy.url",
+        database_url_for_alembic_config(editorial_database_url),
+    )
+    _persist_pending_stories(editorial_database_url, story_count=2)
+    engine = create_database_engine(editorial_database_url)
+    observed_at = datetime(2026, 8, 20, 16, tzinfo=UTC)
+    try:
+        repository = EditorialRepository(engine)
+        workflow = EditorialWorkflow(repository)
+        first = workflow.prepare(
+            date(2026, 8, 21),
+            provider=_ExcludeUnsupportedEditorialProvider(),
+            prepared_at=observed_at,
+        )
+        assert len(first.included_stories) == 1
+        workflow.remove_story(
+            first.id,
+            story_stable_key=first.included_stories[0].stable_key,
+            reason="The operator removes the sole Story to test rollback safety.",
+            actor_identifier="m3-operator",
+            removed_at=observed_at + timedelta(minutes=1),
+        )
+
+        with pytest.raises(
+            DBAPIError,
+            match="0014 Story-removal data violates the 0013 publication contract",
+        ):
+            command.downgrade(config, "0013")
+        with Session(engine) as session:
+            assert session.scalar(text("SELECT version_num FROM alembic_version")) == "0014"
+            assert session.scalar(
+                select(DigestPlanRecord).where(DigestPlanRecord.previous_plan_id == first.id)
+            ) is not None
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.postgres
+def test_0014_downgrade_withdraws_relaxed_digest_then_restores_0013_guard(
+    editorial_database_url: str,
+) -> None:
+    config = Config(str(Path("alembic.ini").resolve()))
+    config.set_main_option(
+        "sqlalchemy.url",
+        database_url_for_alembic_config(editorial_database_url),
+    )
+    _persist_pending_stories(editorial_database_url, story_count=2)
+    engine = create_database_engine(editorial_database_url)
+    observed_at = datetime(2026, 8, 20, 16, tzinfo=UTC)
+    try:
+        repository = EditorialRepository(engine)
+        workflow = EditorialWorkflow(repository)
+        plan = workflow.prepare(
+            date(2026, 8, 21),
+            provider=_ExcludeUnsupportedEditorialProvider(),
+            prepared_at=observed_at,
+        )
+        assert len(plan.included_stories) == 1
+
+        workflow.approve(
+            plan.id,
+            expected_content_hash=plan.content_hash,
+            actor_identifier="m3-operator",
+            approved_at=observed_at + timedelta(minutes=1),
+        )
+        with pytest.raises(
+            DBAPIError,
+            match="0014 Story-removal data violates the 0013 publication contract",
+        ):
+            command.downgrade(config, "0013")
+        with engine.connect() as connection:
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0014"
+
+        repository.withdraw_digest(
+            date(2026, 8, 21),
+            actor_identifier="m3-operator",
+            reason="Withdraw the relaxed Digest before restoring the 0013 contract.",
+            withdrawn_at=observed_at + timedelta(minutes=2),
+        )
+    finally:
+        engine.dispose()
+
+    command.downgrade(config, "0013")
+    engine = create_database_engine(editorial_database_url)
+    try:
+        with engine.connect() as connection:
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0013"
+            assert connection.scalar(
+                text(
+                    "SELECT count(*) FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND table_name = 'digest_plans' "
+                    "AND column_name IN "
+                    "('previous_plan_id', 'removed_story_stable_key', 'removal_reason')"
+                )
+            ) == 0
+            publication_guard = connection.scalar(
+                text(
+                    "SELECT pg_get_functiondef("
+                    "'ai_intel_validate_m3_digest_publication()'::regprocedure)"
+                )
+            )
+            assert "story_count NOT BETWEEN 8 AND 12" in publication_guard
+            assert "publisher_count < 3" in publication_guard
+    finally:
+        engine.dispose()

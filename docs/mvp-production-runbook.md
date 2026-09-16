@@ -344,6 +344,9 @@ single approval action, then supply the displayed content hash unchanged:
 
 ```bash
 bash deploy/m1/operate.sh operator digest plan show <plan-id>
+bash deploy/m1/operate.sh operator digest plan remove <plan-id> <story-stable-key> \
+  --reason <operator-reason> \
+  --actor production-operator
 bash deploy/m1/operate.sh operator digest plan approve <plan-id> \
   --content-hash <displayed-sha256> \
   --actor production-operator
@@ -351,11 +354,15 @@ bash deploy/m1/operate.sh operator operator retrieval index --production
 bash deploy/m1/operate.sh operator operator retrieval status --production --require-hybrid
 ```
 
+Removing a Story creates a new immutable Plan version with lineage and audit metadata; it never
+rewrites the inspected Plan or calls the Provider again. Re-open the returned Plan and approve only
+its new ID and content hash. Superseded Plans cannot be approved or published. The supported
+quantity is 1-12 Stories, while fewer than three Publishers remains visible as a non-blocking
+warning.
+
 Direct `story accept`, `story reject`, `digest preview`, and `digest publish` are retired
-compatibility surfaces and are not a supported production workflow. The eight-Story and
-three-Publisher checks still present in the legacy planning contract are compatibility debt
-scheduled for Issue #120, not product invariants. Record a blocker from those checks as such;
-do not bypass it with direct publication commands.
+compatibility surfaces and are not a supported production workflow. Do not bypass the exact Plan
+workflow with direct publication commands.
 
 Research detects accepted published Documents that are newer than the active retrieval generation,
 reports `documents_pending_index`, and disables stale semantic/entity candidates while retaining the

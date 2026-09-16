@@ -248,7 +248,8 @@ def test_current_docs_retire_direct_publication_and_classify_legacy_flows() -> N
 
     assert "18 enabled Source Profiles" in production_runbook
     assert "No legacy flow is deleted by Issue #119" in " ".join(inventory.split())
-    assert "#120" in inventory
+    assert "One-to-twelve Story quantity and Publisher warning" in inventory
+    assert "#120" not in inventory
 
 
 def test_built_wheel_contains_every_public_template(tmp_path: Path) -> None:

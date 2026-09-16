@@ -43,7 +43,7 @@ AI Ledger 是一个紧凑的公共 AI 情报服务，让读者追踪行业进展
 
 M1–M5 的产品范围与发布记录保留在 [#70](https://github.com/Ev3rGan/ai-ledger/issues/70)、[#71](https://github.com/Ev3rGan/ai-ledger/issues/71)、[#72](https://github.com/Ev3rGan/ai-ledger/issues/72)、[#73](https://github.com/Ev3rGan/ai-ledger/issues/73) 与 [#74](https://github.com/Ev3rGan/ai-ledger/issues/74) 中。当前构建健康度以 [CI](https://github.com/Ev3rGan/ai-ledger/actions/workflows/ci.yml) 为准，不在 README 中复制历史测试数字。
 
-直接接受/拒绝 Story 与直接 preview/publish Digest 的命令已经退役。旧八条 Story 与三家 Publisher 门槛是由 [#120](https://github.com/Ev3rGan/ai-ledger/issues/120) 跟进的兼容债务，不是受支持的产品不变量。证据与删除门槛见[旧流程清单](docs/legacy-flow-inventory.md)。
+直接接受/拒绝 Story 与直接 preview/publish Digest 的命令已经退役。Operator 审查一份不可变 Plan；如需移除已收录 Story，会生成记录 predecessor 与原因的新版本，并且只能批准最新的精确版本。Plan 支持 1–12 条 Story；少于三家 Publisher 会显示非阻断告警。证据与删除门槛见[旧流程清单](docs/legacy-flow-inventory.md)。
 
 ## 🚀 体验产品
 
