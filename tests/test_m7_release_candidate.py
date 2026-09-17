@@ -211,12 +211,12 @@ def _mutate(
 def test_frozen_release_candidate_survives_restart_and_zero_story_completion(
     tmp_path: Path,
 ) -> None:
-    database = Pg0(
-        name=f"ai_intel_m7_rc_{os.urandom(8).hex()}",
-        data_dir=str(tmp_path / "primary"),
-    )
+    database = Pg0(name=f"ai_intel_m7_rc_{os.urandom(8).hex()}")
+    assert database.data_dir is None
     restored_database: Pg0 | None = None
-    database.start()
+    started_database = database.start()
+    assert started_database.data_dir is not None
+    primary_data_dir = Path(started_database.data_dir)
     configuration = OperatorSecurityConfiguration(
         public_host="public.test",
         operator_host="operator.test",
@@ -456,7 +456,7 @@ def test_frozen_release_candidate_survives_restart_and_zero_story_completion(
             engine.dispose()
 
         database.stop()
-        shutil.copytree(tmp_path / "primary", tmp_path / "backup")
+        shutil.copytree(primary_data_dir, tmp_path / "backup")
         shutil.copytree(tmp_path / "backup", tmp_path / "restored")
         restored_database = Pg0(
             name=f"ai_intel_m7_restored_{os.urandom(8).hex()}",
