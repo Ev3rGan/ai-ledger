@@ -1,9 +1,35 @@
-{$AI_INTEL_DOMAIN}, {$AI_INTEL_OPERATOR_DOMAIN} {
+{$AI_INTEL_DOMAIN} {
 	@internal_health path /health/*
 	respond @internal_health 404
+	@operator_surface path /operator /operator/* /api/operator /api/operator/* /operator-assets /operator-assets/*
+	respond @operator_surface 404
+
+	@public_assets path_regexp public_assets ^/assets/[A-Za-z0-9_-]+-[A-Za-z0-9_-]+\.(?:js|css)$
+	header @public_assets Cache-Control "public, max-age=31536000, immutable" {
+		defer
+		match status 2xx
+	}
 
 	reverse_proxy web:8000 {
 		header_up X-AI-Anonymous-Client {client_ip}
+	}
+
+	encode zstd gzip
+	log {
+		output stdout
+		format json
+	}
+}
+
+{$AI_INTEL_OPERATOR_DOMAIN} {
+	@internal_health path /health/*
+	respond @internal_health 404
+	@outside_operator not path / /operator /operator/* /api/operator /api/operator/* /operator-assets /operator-assets/*
+	respond @outside_operator 404
+
+	header Cache-Control "no-store"
+	reverse_proxy web:8000 {
+		header_up -X-AI-Anonymous-Client
 	}
 
 	encode zstd gzip

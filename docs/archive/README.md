@@ -35,3 +35,15 @@ is defined by the tracked manifest at `HEAD` and the
 
 Architecture decisions that still govern the product live under [`docs/adr/`](../adr/) rather
 than this historical index.
+
+## Design checkpoints
+
+- [Original MVP grilling checkpoint](../design/grilling-checkpoint-2026-08-11.md)
+
+The checkpoint remains intact as dated interview evidence. Its durable decisions now live in the
+domain model, ADRs, guides, and runbooks: one small Python service, PostgreSQL/pgvector as the
+system of record, explicit human publication approval, immutable provenance and history, bounded
+accepted-knowledge Research, GitHub OAuth for the sole operator, and verified backup/rollback.
+Quota language, direct Story review, fixed-source counts, and an administrator UI described there
+are historical inputs; current runtime policy is the exact Plan workflow and protected Operator
+Console documented by the accepted ADRs.

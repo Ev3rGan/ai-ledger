@@ -17,8 +17,8 @@ facts before using an old conclusion for a new activation decision.
 ## Document extraction benchmark
 
 ```powershell
-uv run playwright install chromium
-uv run ai-intel-agent benchmark-extraction --output reports\document-extraction-benchmark.md
+uv run --extra dev playwright install chromium
+uv run --extra dev ai-intel-agent benchmark-extraction --output reports\document-extraction-benchmark.md
 ```
 
 This live, credit-aware benchmark compares the supported extraction paths over its fixed corpus.

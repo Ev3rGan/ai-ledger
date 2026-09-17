@@ -36,18 +36,19 @@ AI Ledger 是一个紧凑的公共 AI 情报服务，让读者追踪行业进展
 | --- | --- |
 | 受控采集 | Source Profile 定义允许访问的范围、证据强度、正文或结构化数据门禁、cursor 与故障隔离行为。 |
 | 可追溯草稿 | Provider 辅助起草 Story、Claim 与 Evidence 记录，但不能接受或发布。 |
-| 人类门禁编辑 | Operator 检查一份完整且不可变的 Editorial Agent 计划，并且只批准该精确版本一次。 |
+| 人类门禁编辑 | 受保护的 Operator Console 准备或重新准备一份不可变 Plan，逐项移除任意多条 Story，并且只批准最新的精确版本。 |
+| 持久化完成状态 | 非空批准会发布该精确组合并排入检索索引跟进；零 Story 批准会记录 no-publication，不创建 Digest 或 RSS 条目。 |
 | Hybrid retrieval | PostgreSQL FTS 与 Entity candidates 同 MiniLM 向量融合，再经过唯一的 mMARCO reranking stage；模型不可用时显式回退。 |
 | 有边界的 Research | Lookup、comparison、timeline 与 bounded multi-hop 使用相互隔离的 Evidence Set、严格时间语义和 fail-closed 引用检查。 |
 | PublicContent 投影 | Home、Digest、Archive、Story、Browse、RSS 与 Research 入口页共享唯一公共安全读取边界，不暴露 operator 控件、原始来源正文或 hidden reasoning。 |
 
 M1–M5 的产品范围与发布记录保留在 [#70](https://github.com/Ev3rGan/ai-ledger/issues/70)、[#71](https://github.com/Ev3rGan/ai-ledger/issues/71)、[#72](https://github.com/Ev3rGan/ai-ledger/issues/72)、[#73](https://github.com/Ev3rGan/ai-ledger/issues/73) 与 [#74](https://github.com/Ev3rGan/ai-ledger/issues/74) 中。当前构建健康度以 [CI](https://github.com/Ev3rGan/ai-ledger/actions/workflows/ci.yml) 为准，不在 README 中复制历史测试数字。
 
-直接接受/拒绝 Story 与直接 preview/publish Digest 的命令已经退役。Operator 审查一份不可变 Plan；如需移除已收录 Story，会生成记录 predecessor 与原因的新版本，并且只能批准最新的精确版本。Plan 支持 1–12 条 Story；少于三家 Publisher 会显示非阻断告警。证据与删除门槛见[旧流程清单](docs/legacy-flow-inventory.md)。
+直接接受/拒绝 Story 与直接 preview/publish Digest 的命令已经退役。Operator 日常使用受保护的 Operator Console，CLI 只作为同一工作流的 break-glass adapter。Operator 审查一份不可变 Plan；逐项移除已收录 Story 时会连续生成记录 predecessor 与原因的新版本，并且只能批准最新的精确版本。Plan 支持 0–12 条 Story；少于三家 Publisher 会显示非阻断告警。批准零条 Story 会记录持久化 no-publication 结果。证据与删除门槛见[旧流程清单](docs/legacy-flow-inventory.md)。
 
 ## 🚀 体验产品
 
-获得第一个有效结果的最短路径，是直接使用已经部署的只读产品：
+获得第一个读者侧有效结果的最短路径，是直接使用已经部署的公共产品：
 
 | 页面 | 打开 | 提供什么 |
 | --- | --- | --- |
@@ -90,11 +91,12 @@ flowchart LR
     A["获批公开来源"] --> B["有边界的采集<br/>与证据门禁"]
     B --> C["Story → Claim → Evidence"]
     C --> D["不可变 Digest Plan"]
-    D --> E{"Operator 是否批准<br/>exact content?"}
-    E -- "是" --> F["已发布 Digest"]
-    E -- "否" --> G["保持未发布"]
-    F --> H["已接受公共知识"]
-    H --> I["带引用的 Research 回答<br/>或明确拒绝"]
+    D --> E["Operator 可逐项移除 Story<br/>并生成新的不可变 Plan"]
+    E --> F{"Operator 是否批准<br/>最新 exact Plan?"}
+    F -- "1–12 条 Story" --> G["已发布 Digest"]
+    F -- "0 条 Story" --> H["持久化 no-publication"]
+    G --> I["已接受公共知识"]
+    I --> J["带引用的 Research 回答<br/>或明确拒绝"]
 ```
 
 生产 scheduler 在 Asia/Shanghai 每日 06:00 与 18:00 采集并准备可追溯草稿。定时运行不会越过发布边界。

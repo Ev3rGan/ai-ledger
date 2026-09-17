@@ -49,6 +49,11 @@ The build refreshes the committed Vite manifests and hashed files under both
 the matching generated changes whenever public or Operator frontend source changes
 so the Python application and packaged wheel serve the reviewed build.
 
+The production Dockerfile repeats `npm ci` and both Vite builds in a pinned Node
+builder stage. Only the generated static directories cross into the final Python
+stage; Node, npm, the frontend sources, and `node_modules` are not runtime content.
+CI rebuilds the committed assets and rejects drift before building that image.
+
 ## Pull requests
 
 - Link the issue the change addresses, using `Closes #<number>` when appropriate.
