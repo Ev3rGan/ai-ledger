@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import socket
 import tomllib
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -216,6 +217,7 @@ def test_frozen_release_candidate_survives_restart_and_zero_story_completion(
     restored_database: Pg0 | None = None
     started_database = database.start()
     assert started_database.data_dir is not None
+    assert started_database.port is not None
     primary_data_dir = Path(started_database.data_dir)
     configuration = OperatorSecurityConfiguration(
         public_host="public.test",
@@ -462,7 +464,12 @@ def test_frozen_release_candidate_survives_restart_and_zero_story_completion(
             name=f"ai_intel_m7_restored_{os.urandom(8).hex()}",
             data_dir=str(tmp_path / "restored"),
         )
-        restored_database.start()
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as primary_port_guard:
+            primary_port_guard.bind(("127.0.0.1", started_database.port))
+            primary_port_guard.listen()
+            restored_info = restored_database.start()
+        assert restored_info.port is not None
+        assert restored_info.port != started_database.port
         restored_app = create_app(
             restored_database.uri,
             operator_configuration=configuration,
