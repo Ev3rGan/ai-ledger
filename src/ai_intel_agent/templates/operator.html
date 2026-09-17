@@ -7,7 +7,7 @@
   {% for asset_url in frontend_assets.css %}<link rel="stylesheet" href="{{ asset_url }}">{% endfor %}
 </head>
 <body>
-  <main id="operator-app"><h1>Operator Console</h1><p>正在加载只读运行状态…</p></main>
+  <main id="operator-app"><h1>Operator Console</h1><p>正在加载受保护的编辑工作流…</p></main>
   {% if frontend_assets.module %}<script type="module" src="{{ frontend_assets.module }}"></script>{% endif %}
 </body>
 </html>

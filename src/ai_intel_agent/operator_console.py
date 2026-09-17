@@ -9,7 +9,8 @@ from urllib.parse import urlencode, urlsplit
 from uuid import UUID
 
 import httpx
-from sqlalchemy import BigInteger, CheckConstraint, DateTime, String, delete, select
+from sqlalchemy import JSON, BigInteger, CheckConstraint, DateTime, Integer, String, delete, select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
@@ -183,6 +184,36 @@ class OperatorSessionRecord(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class OperatorMutationReceiptRecord(Base):
+    __tablename__ = "operator_mutation_receipts"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('pending', 'completed')",
+            name="ck_operator_mutation_receipts_state",
+        ),
+        CheckConstraint(
+            "(state = 'pending' AND response_status IS NULL AND response_body IS NULL "
+            "AND completed_at IS NULL) OR "
+            "(state = 'completed' AND response_status BETWEEN 200 AND 299 "
+            "AND response_body IS NOT NULL AND completed_at IS NOT NULL)",
+            name="ck_operator_mutation_receipts_shape",
+        ),
+        CheckConstraint(
+            "length(request_hash) = 64",
+            name="ck_operator_mutation_receipts_request_hash",
+        ),
+    )
+
+    github_user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    idempotency_key: Mapped[str] = mapped_column(String(255), primary_key=True)
+    request_hash: Mapped[str] = mapped_column(String(64))
+    state: Mapped[str] = mapped_column(String(16))
+    response_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    response_body: Mapped[dict[str, object] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 @dataclass(frozen=True)
 class OperatorSession:
     github_user_id: int
@@ -314,11 +345,129 @@ class OperatorSessionStore:
                 record.revoked_at = revoked_at
 
 
-class OperatorReadProjection:
-    """Compose existing operational seams into one deliberately read-only projection."""
+class OperatorIdempotencyConflictError(ValueError):
+    pass
+
+
+class OperatorMutationInProgressError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class OperatorMutationReplay:
+    status_code: int
+    body: dict[str, object]
+
+
+class OperatorMutationReceiptStore:
+    """Persist transport idempotency without duplicating EditorialWorkflow rules."""
 
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
+
+    def begin(
+        self,
+        *,
+        github_user_id: int,
+        idempotency_key: str,
+        request_hash: str,
+        created_at: datetime,
+    ) -> OperatorMutationReplay | None:
+        with Session(self._engine) as session, session.begin():
+            created = session.scalar(
+                insert(OperatorMutationReceiptRecord)
+                .values(
+                    github_user_id=github_user_id,
+                    idempotency_key=idempotency_key,
+                    request_hash=request_hash,
+                    state="pending",
+                    created_at=created_at,
+                )
+                .on_conflict_do_nothing(
+                    index_elements=[
+                        OperatorMutationReceiptRecord.github_user_id,
+                        OperatorMutationReceiptRecord.idempotency_key,
+                    ]
+                )
+                .returning(OperatorMutationReceiptRecord.idempotency_key)
+            )
+            if created is not None:
+                return None
+            record = session.get(
+                OperatorMutationReceiptRecord,
+                (github_user_id, idempotency_key),
+            )
+            if record is None:
+                raise RuntimeError("Operator mutation receipt disappeared")
+            if not secrets.compare_digest(record.request_hash, request_hash):
+                raise OperatorIdempotencyConflictError(
+                    "Idempotency key was already used for a different request"
+                )
+            if record.state == "pending":
+                raise OperatorMutationInProgressError(
+                    "An identical Operator mutation is still in progress"
+                )
+            if record.response_status is None or record.response_body is None:
+                raise RuntimeError("Completed Operator mutation receipt is incomplete")
+            return OperatorMutationReplay(
+                status_code=record.response_status,
+                body=dict(record.response_body),
+            )
+
+    def complete(
+        self,
+        *,
+        github_user_id: int,
+        idempotency_key: str,
+        request_hash: str,
+        status_code: int,
+        body: dict[str, object],
+        completed_at: datetime,
+    ) -> None:
+        with Session(self._engine) as session, session.begin():
+            record = session.scalar(
+                select(OperatorMutationReceiptRecord)
+                .where(
+                    OperatorMutationReceiptRecord.github_user_id == github_user_id,
+                    OperatorMutationReceiptRecord.idempotency_key == idempotency_key,
+                )
+                .with_for_update()
+            )
+            if (
+                record is None
+                or record.state != "pending"
+                or not secrets.compare_digest(record.request_hash, request_hash)
+            ):
+                raise RuntimeError("Operator mutation receipt cannot be completed")
+            record.state = "completed"
+            record.response_status = status_code
+            record.response_body = body
+            record.completed_at = completed_at
+
+    def abandon(
+        self,
+        *,
+        github_user_id: int,
+        idempotency_key: str,
+        request_hash: str,
+    ) -> None:
+        with Session(self._engine) as session, session.begin():
+            session.execute(
+                delete(OperatorMutationReceiptRecord).where(
+                    OperatorMutationReceiptRecord.github_user_id == github_user_id,
+                    OperatorMutationReceiptRecord.idempotency_key == idempotency_key,
+                    OperatorMutationReceiptRecord.request_hash == request_hash,
+                    OperatorMutationReceiptRecord.state == "pending",
+                )
+            )
+
+
+class OperatorReadProjection:
+    """Compose existing operational seams into one deliberately read-only projection."""
+
+    def __init__(self, engine: Engine, *, public_origin: str | None = None) -> None:
+        self._engine = engine
+        self._public_origin = public_origin
         self._editorial_repository = EditorialRepository(engine)
         self._editorial = EditorialWorkflow(self._editorial_repository)
         self._scheduler = SchedulerStatusRepository(engine)
@@ -431,6 +580,7 @@ class OperatorReadProjection:
     def _plan_summary(self, plan: DigestPlan) -> dict[str, object]:
         outcome = self._editorial.outcome(plan.id)
         follow_up = self._editorial.follow_up_status(plan.id)
+        latest = self._editorial.latest_plan(plan.publication_date)
         return {
             "id": str(plan.id),
             "publication_date": plan.publication_date.isoformat(),
@@ -442,7 +592,17 @@ class OperatorReadProjection:
             "held_story_count": len(plan.held_stories),
             "warning_count": sum(not item.blocking for item in plan.anomalies),
             "blocker_count": sum(item.blocking for item in plan.anomalies),
-            "completion": _outcome_payload(outcome),
+            "is_latest": latest is not None and latest.id == plan.id,
+            "derivation": (
+                {
+                    "previous_plan_id": str(plan.derivation.previous_plan_id),
+                    "removed_story_stable_key": plan.derivation.removed_story_stable_key,
+                    "removal_reason": plan.derivation.removal_reason,
+                }
+                if plan.derivation is not None
+                else None
+            ),
+            "completion": _outcome_payload(outcome, public_origin=self._public_origin),
             "index_follow_up": _follow_up_payload(follow_up),
         }
 
@@ -514,15 +674,46 @@ def _anomaly_payload(anomaly: DigestPlanAnomaly) -> dict[str, object]:
     return payload
 
 
-def _outcome_payload(outcome: EditorialApprovalOutcome | None) -> dict[str, object] | None:
+def _outcome_payload(
+    outcome: EditorialApprovalOutcome | None,
+    *,
+    public_origin: str | None = None,
+) -> dict[str, object] | None:
     if outcome is None:
         return None
     return {
         "kind": outcome.kind.value,
+        "plan_id": str(outcome.plan_id),
+        "publication_date": outcome.publication_date.isoformat(),
+        "content_hash": outcome.content_hash,
         "actor_identifier": outcome.actor_identifier,
         "completed_at": _iso(outcome.completed_at),
         "digest_id": str(outcome.digest.id) if outcome.digest is not None else None,
+        "public_url": (
+            f"{public_origin or ''}/digests/{outcome.publication_date.isoformat()}"
+            if outcome.digest is not None
+            else None
+        ),
+        "follow_up": _follow_up_payload(outcome.follow_up),
     }
+
+
+def operator_outcome_payload(
+    outcome: EditorialApprovalOutcome,
+    *,
+    public_origin: str,
+) -> dict[str, object]:
+    payload = _outcome_payload(outcome, public_origin=public_origin)
+    if payload is None:
+        raise AssertionError("Editorial outcome payload unexpectedly missing")
+    return payload
+
+
+def operator_follow_up_payload(follow_up: RetrievalIndexFollowUp) -> dict[str, object]:
+    payload = _follow_up_payload(follow_up)
+    if payload is None:
+        raise AssertionError("Retrieval-index follow-up payload unexpectedly missing")
+    return payload
 
 
 def _follow_up_payload(follow_up: RetrievalIndexFollowUp | None) -> dict[str, object] | None:
