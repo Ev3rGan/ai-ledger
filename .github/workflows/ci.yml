@@ -157,6 +157,7 @@ jobs:
             --env AI_INTEL_DOMAIN=http://public.invalid \
             --env AI_INTEL_OPERATOR_DOMAIN=http://operator.invalid \
             --volume "${GITHUB_WORKSPACE}/deploy/m1/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            --entrypoint caddy \
             caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d \
             run --config /etc/caddy/Caddyfile
           docker run --rm --network "${network}" \

@@ -108,6 +108,13 @@ def test_ci_rebuilds_assets_and_proves_the_runtime_has_no_node() -> None:
     assert "playwright/driver/node" in workflow
     assert "m7_caddy_backend.py" in workflow
     assert "m7_caddy_acceptance.py" in workflow
+    edge_invocation = workflow.split(
+        'docker run --detach --name "${edge}"', 1
+    )[1].split('docker run --rm --network "${network}"', 1)[0]
+    assert "--entrypoint caddy" in edge_invocation
+    assert edge_invocation.index("--entrypoint caddy") < edge_invocation.index(
+        "caddy:2.10.2-alpine@sha256:"
+    )
 
 
 def test_current_product_docs_describe_the_same_release_candidate() -> None:
