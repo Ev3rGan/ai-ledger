@@ -73,6 +73,9 @@ def test_production_image_builds_locked_frontend_before_python_runtime() -> None
 
 def test_caddy_isolates_hosts_and_keeps_cache_policy_on_its_trust_side() -> None:
     caddy = _read("deploy/m1/Caddyfile")
+    validation_harness = _read(
+        "tests/fixtures/m1_caddy_validate_security_harness.sh"
+    )
     public_marker = "{$AI_INTEL_DOMAIN} {"
     operator_marker = "{$AI_INTEL_OPERATOR_DOMAIN} {"
     assert caddy.count(public_marker) == 1
@@ -92,6 +95,12 @@ def test_caddy_isolates_hosts_and_keeps_cache_policy_on_its_trust_side() -> None
     assert "respond @outside_operator 404" in operator
     assert 'Cache-Control "no-store"' in operator
     assert "header_up -X-AI-Anonymous-Client" in operator
+
+    assert "--env AI_INTEL_DOMAIN=validate.invalid" in validation_harness
+    assert (
+        "--env AI_INTEL_OPERATOR_DOMAIN=validate-operator.invalid"
+        in validation_harness
+    )
 
 
 def test_ci_rebuilds_assets_and_proves_the_runtime_has_no_node() -> None:
