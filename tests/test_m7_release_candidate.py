@@ -215,10 +215,13 @@ def test_frozen_release_candidate_survives_restart_and_zero_story_completion(
     database = Pg0(name=f"ai_intel_m7_rc_{os.urandom(8).hex()}")
     assert database.data_dir is None
     restored_database: Pg0 | None = None
+    restored_instance_dir: Path | None = None
     started_database = database.start()
     assert started_database.data_dir is not None
     assert started_database.port is not None
     primary_data_dir = Path(started_database.data_dir)
+    managed_instances_dir = primary_data_dir.parent.parent
+    assert primary_data_dir == managed_instances_dir / database.name / "data"
     configuration = OperatorSecurityConfiguration(
         public_host="public.test",
         operator_host="operator.test",
@@ -459,10 +462,15 @@ def test_frozen_release_candidate_survives_restart_and_zero_story_completion(
 
         database.stop()
         shutil.copytree(primary_data_dir, tmp_path / "backup")
-        shutil.copytree(tmp_path / "backup", tmp_path / "restored")
+        restored_name = f"ai_intel_m7_restored_{os.urandom(8).hex()}"
+        restored_instance_dir = managed_instances_dir / restored_name
+        restored_data_dir = restored_instance_dir / "data"
+        assert restored_data_dir == managed_instances_dir / restored_name / "data"
+        assert not restored_instance_dir.exists()
+        shutil.copytree(tmp_path / "backup", restored_data_dir)
         restored_database = Pg0(
-            name=f"ai_intel_m7_restored_{os.urandom(8).hex()}",
-            data_dir=str(tmp_path / "restored"),
+            name=restored_name,
+            data_dir=str(restored_data_dir),
         )
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as primary_port_guard:
             primary_port_guard.bind(("127.0.0.1", started_database.port))
@@ -492,3 +500,8 @@ def test_frozen_release_candidate_survives_restart_and_zero_story_completion(
         database.drop()
         if restored_database is not None:
             restored_database.drop()
+        if restored_instance_dir is not None and restored_instance_dir.exists():
+            assert restored_instance_dir.parent == managed_instances_dir
+            shutil.rmtree(restored_instance_dir)
+        if restored_instance_dir is not None:
+            assert not restored_instance_dir.exists()
