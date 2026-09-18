@@ -5,6 +5,8 @@ current versioned Source Profile universe, and the exact Digest Plan editorial/p
 It keeps both the public and protected Operator Hosts behind Caddy automatic HTTPS and PostgreSQL
 reachable only on an internal Compose network. The two Hosts share one Python Web process, while
 the application rejects every Operator route, Session, and static entry on the public Host.
+Caddy repeats that isolation before proxying: the Public Host rejects Operator paths and caches
+only hashed public assets immutably; the Operator Host rejects public paths and remains `no-store`.
 
 The public edge network is pinned to `172.31.255.0/24`, with its dynamic allocation range limited
 to `172.31.255.128/25` and Caddy fixed at `172.31.255.2`. Keeping `.2` outside the dynamic range
@@ -24,6 +26,26 @@ docker build --build-arg "AI_INTEL_RELEASE=${release}" \
   --tag "REGISTRY/ai-ledger:${release}" .
 docker push "REGISTRY/ai-ledger:${release}"
 docker image inspect "REGISTRY/ai-ledger:${release}" --format '{{index .RepoDigests 0}}'
+```
+
+The Docker build runs `npm ci` and both Vite builds in a pinned Node builder stage. The tracked
+asset directories are excluded from the Docker context so the image cannot accidentally reuse a
+developer build; only the builder's generated public and Operator assets are copied into the final
+Python stage. Before publishing, prove the runtime contains the manifests but no Node toolchain:
+
+```bash
+docker run --rm --entrypoint sh "REGISTRY/ai-ledger:${release}" -eu -c '
+  ! command -v node
+  ! command -v npm
+  ! command -v npx
+  ! find /opt/ai-ledger -path "*/playwright/driver/node" -type f -print -quit | grep -q .
+  test -z "$(find /opt/ai-ledger /usr/local /usr -type f \
+    \( -name node -o -name nodejs -o -name npm -o -name npx \) \
+    -perm /111 -print -quit)"
+  test -f /opt/ai-ledger/src/ai_intel_agent/static/.vite/manifest.json
+  test -f /opt/ai-ledger/src/ai_intel_agent/operator_static/.vite/manifest.json
+  ai-intel-agent --help >/dev/null
+'
 ```
 
 Use these root-owned host paths; none belongs inside the repository or image:
@@ -153,7 +175,9 @@ replacement can collect; Docker then keeps exactly one effective worker running.
 Only Caddy publishes host ports 80 and 443. PostgreSQL has no host port. Caddy terminates both
 configured HTTPS names and overwrites the
 anonymous-client header used by the persistent daily Research allowance and blocks `/health/*`
-at the public edge; container health checks use those endpoints internally.
+at the public edge; container health checks use those endpoints internally. It sets the anonymous
+identity header only on the Public Host, never on the Operator Host. Application Host validation,
+server-side Session lookup, host-only secure Cookies, Origin, CSRF, and CSP remain defense in depth.
 
 ## Lifecycle operations
 
@@ -271,13 +295,13 @@ record above as history only. A missing real source observation, real budgeted P
 proof, source-isolation proof, or exact Candidate-to-Evidence provenance leaves M2 live acceptance
 incomplete.
 
-## M4 frozen Release Candidate
+## M7 frozen Release Candidate
 
 Freeze one candidate before any live acceptance. The checkout must be clean at one reviewed
 40-character commit, the image must be built from that checkout, and the release file must pin
 the resulting `@sha256:` digest. Record `AI_INTEL_SCHEDULE_BACKFILL_LIMIT=5` (or a smaller
 reviewed value) in that immutable release file. Keep the previous release file and image
-available until M4 acceptance and the public preview are complete.
+available until M7 acceptance and the public preview are complete.
 
 Run `validate` before the change. Use `upgrade`, not an ad-hoc Compose invocation, when a current
 release exists:
@@ -297,8 +321,8 @@ current/previous only after the candidate is healthy. An already pinned edge is 
 retry or later rollback/upgrade cycle does not rebuild it. Do not edit a recorded release file or
 checkout in place. A rebuilt image or changed configuration is a new candidate. The candidate
 `upgrade` command deliberately does not dispatch to the recorded older operator: this ensures the
-new pre-migration backup guard and edge migration recovery are active on the first M3-to-M4
-upgrade. `validate` pulls the pinned application image and verifies that its
+new pre-migration backup guard and edge migration recovery are active on the first legacy-to-pinned
+edge upgrade. `validate` pulls the pinned application image and verifies that its
 `org.opencontainers.image.revision` label exactly matches `AI_INTEL_RELEASE`; status reports that
 validated commit. Lifecycle commands also override ambient release-contract variables with the
 values from the recorded release file and fix the Compose project name, so an exported shell
@@ -310,8 +334,8 @@ manual collection refuse a requested limit above that recorded value.
 
 `operate.sh operator` is the supported private CLI boundary. It executes inside the recorded
 Web container and therefore reads and writes the same PostgreSQL state that public Web and
-Research use. It remains the mutation boundary; the separate Operator Host exposes only the
-authenticated read projection and logout.
+Research use. It is the break-glass adapter over the same `EditorialWorkflow`; the protected
+Operator Console is the routine mutation and inspection surface.
 
 For a single production Research diagnostic, run:
 
@@ -346,9 +370,10 @@ execution, latest multi-source Collection Run, all enabled source health snapsho
 count, and latest published Digest. It never reports the database URL, credentials, source body,
 Evidence text, or Provider response.
 
-The Operator Console is the routine production surface. Inspect the Plan and its Evidence there,
-remove any number of unsuitable Stories one request at a time with a reason, and approve only the
-exact latest identity. A non-empty Plan publishes atomically and exposes the public Digest link; a
+The Operator Console is the routine production surface. Use it to prepare or re-prepare the dated
+Plan, inspect the Plan and its Evidence, remove any number of unsuitable Stories one request at a
+time with a reason, and approve only the exact latest Plan. A non-empty Plan publishes atomically
+and exposes the public Digest link; a
 zero-Story Plan records no-publication and creates no Digest or index follow-up. Replayed requests
 with the same idempotency identity do not duplicate a Plan, outcome, Digest, or follow-up.
 
@@ -486,15 +511,20 @@ Digest that violates 0013's eight-Story or three-Publisher contract until that D
 After lineage exists, roll the application forward against the 0014 schema or restore a verified
 pre-0014 backup into the isolated restore path.
 
-## M4 live acceptance record
+## M7 authorized production acceptance record
 
 The supervisor owns secret injection, Provider budget authorization, and timing. Record only
 commit/image digests, protocol/profile versions, timestamps, public URLs, non-secret operation
 keys, row counts, status/result codes, and pass/fail observations. Do not record environment
 values, source bodies, Evidence text, model responses, or anonymous-client identifiers.
 
-M4 is incomplete until one frozen candidate proves all of the following in the same deployed
-state:
+Repository, fake-Provider, isolated-database, and local HTTPS acceptance do not authorize this
+step. Until the user separately authorizes the real scheduled source window, production Secrets,
+paid Provider use, shared database, DNS/TLS Host, and deployment, record those observations as
+`NOT AUTHORIZED / NOT RUN`; do not promote deterministic RC evidence into production evidence.
+
+M7 production acceptance is incomplete until one frozen candidate proves all of the following in
+the same deployed state:
 
 - the enabled versioned Source Profiles and body gate, with no retired profile in scheduler or status output;
 - real DeepSeek draft preparation and the exact Digest Plan review/approval loop;

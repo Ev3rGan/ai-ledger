@@ -36,18 +36,19 @@ Fast AI news is plentiful; evidence you can inspect and publication decisions yo
 | --- | --- |
 | Controlled acquisition | Source profiles define allowed access, evidence strength, article-body or structured-data gates, cursors, and isolated failure behavior. |
 | Traceable drafting | Provider-backed drafting produces Story, Claim, and Evidence records but cannot accept or publish them. |
-| Human-gated editing | Operators inspect one complete, immutable Editorial Agent plan and approve that exact version once. |
+| Human-gated editing | The protected Operator Console prepares or re-prepares one immutable Plan, removes any number of Stories one at a time, and approves only the exact latest version. |
+| Durable completion | A non-empty approval publishes that exact composition and queues retrieval-index follow-up; a zero-Story approval records no-publication without creating a Digest or RSS item. |
 | Hybrid retrieval | PostgreSQL full-text and Entity candidates combine with MiniLM vectors and a single mMARCO reranking stage, with an explicit model-free fallback. |
 | Bounded Research | Lookup, comparison, timeline, and bounded multi-hop questions use isolated Evidence Sets, strict time semantics, and fail-closed citation checks. |
 | PublicContent projection | Home, Digest, Archive, Story, Browse, RSS, and the Research entry page share one public-safe read boundary without operator controls, raw source bodies, or hidden reasoning. |
 
 The M1–M5 product scopes and release records remain available in [#70](https://github.com/Ev3rGan/ai-ledger/issues/70), [#71](https://github.com/Ev3rGan/ai-ledger/issues/71), [#72](https://github.com/Ev3rGan/ai-ledger/issues/72), [#73](https://github.com/Ev3rGan/ai-ledger/issues/73), and [#74](https://github.com/Ev3rGan/ai-ledger/issues/74). Current build health is reported by [CI](https://github.com/Ev3rGan/ai-ledger/actions/workflows/ci.yml), not by a copied historical test count.
 
-Direct Story accept/reject and direct Digest preview/publish commands are retired workflow surfaces. Operators review one immutable Plan, may derive a new version by removing an included Story with recorded lineage and reason, and approve only the latest exact version. Plans support 1–12 Stories; fewer than three Publishers is a visible non-blocking warning. See the [legacy-flow inventory](docs/legacy-flow-inventory.md) for the evidence and deletion gates.
+Direct Story accept/reject and direct Digest preview/publish commands are retired workflow surfaces. Operators use the protected Operator Console for the routine loop and the CLI only as its break-glass adapter. They review one immutable Plan, may derive successive versions by removing included Stories with recorded lineage and reasons, and approve only the exact latest version. Plans support 0–12 Stories; fewer than three Publishers is a visible non-blocking warning. Approving zero Stories records a durable no-publication outcome. See the [legacy-flow inventory](docs/legacy-flow-inventory.md) for the evidence and deletion gates.
 
 ## 🚀 Explore the product
 
-The shortest path to a useful result is the deployed, read-only product:
+The shortest path to a useful reader result is the deployed public product:
 
 | Surface | Open it | What it provides |
 | --- | --- | --- |
@@ -90,11 +91,12 @@ flowchart LR
     A["Approved public sources"] --> B["Bounded acquisition<br/>and evidence gates"]
     B --> C["Story → Claim → Evidence"]
     C --> D["Immutable Digest Plan"]
-    D --> E{"Operator approves<br/>the exact content?"}
-    E -- "Yes" --> F["Published Digest"]
-    E -- "No" --> G["Remains unpublished"]
-    F --> H["Accepted public knowledge"]
-    H --> I["Cited Research answer<br/>or explicit refusal"]
+    D --> E["Operator may remove Stories<br/>into a new immutable Plan"]
+    E --> F{"Operator approves<br/>the exact latest Plan"}
+    F -- "1–12 Stories" --> G["Published Digest"]
+    F -- "0 Stories" --> H["Durable no-publication"]
+    G --> I["Accepted public knowledge"]
+    I --> J["Cited Research answer<br/>or explicit refusal"]
 ```
 
 The production scheduler collects at 06:00 and 18:00 Asia/Shanghai and prepares traceable drafts. Scheduling never crosses the publication boundary.

@@ -13,3 +13,12 @@ user IDs. This keeps deployment small and editorial policy singular at the cost 
 routing and packaged Operator assets part of the protected Web boundary. Revisit the shared
 runtime only if independently scaled Operator traffic, multiple operator roles, or service-level
 isolation becomes a demonstrated requirement.
+
+Caddy also enforces the separation before proxying: the Public Host rejects Operator paths, the
+Operator Host rejects public paths, public hashed Vue assets receive an immutable cache policy,
+and every Operator response remains `no-store`. Vite and Node exist only in a pinned image-build
+stage. This deliberately accepts repeated transfers of hashed Operator assets so one `no-store`
+policy covers the protected Host without a cacheable exception. The final Python image receives
+the generated asset directories but no Node executable, package manager, frontend source tree, or
+`node_modules`. Application-level Host, Session, Cookie, Origin, CSRF, and CSP checks remain
+mandatory defense in depth rather than trusting the proxy.

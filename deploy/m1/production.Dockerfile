@@ -1,3 +1,11 @@
+FROM node:22.23.2-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS frontend-build
+
+WORKDIR /build
+COPY frontend/package.json frontend/package-lock.json ./frontend/
+RUN npm --prefix frontend ci
+COPY frontend ./frontend
+RUN npm --prefix frontend run build
+
 FROM python:3.12.10-slim-bookworm@sha256:fd95fa221297a88e1cf49c55ec1828edd7c5a428187e67b5d1805692d11588db
 
 ARG AI_INTEL_RELEASE
@@ -16,6 +24,8 @@ WORKDIR /opt/ai-ledger
 COPY pyproject.toml uv.lock README.md alembic.ini ./
 COPY alembic ./alembic
 COPY src ./src
+COPY --from=frontend-build /build/src/ai_intel_agent/static ./src/ai_intel_agent/static
+COPY --from=frontend-build /build/src/ai_intel_agent/operator_static ./src/ai_intel_agent/operator_static
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends git git-lfs \
     && rm -rf /var/lib/apt/lists/* \

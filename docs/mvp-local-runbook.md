@@ -75,6 +75,13 @@ three Publishers is a visible non-blocking warning, not a publication gate. Dire
 `story accept`, `story reject`, `digest preview`, and `digest publish` are retired compatibility
 commands and are not part of the supported operator path.
 
+The protected Console performs the same routine loop: prepare or re-prepare the dated Plan,
+inspect source and Evidence details, remove any number of unsuitable Stories one request at a
+time, reload after any stale conflict, and approve only the exact latest Plan. A non-empty result
+publishes atomically and queues index follow-up; zero included Stories records no-publication.
+Local browser acceptance uses fake OAuth and Provider boundaries unless a separate authorization
+explicitly permits the real services.
+
 Observe these public URLs through a real browser session:
 
 - `http://127.0.0.1:8000/`

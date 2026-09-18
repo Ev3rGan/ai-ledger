@@ -24,7 +24,6 @@ dependencies = [
     "jinja2>=3.1,<4",
     "uvicorn>=0.35,<1",
     "trafilatura>=2.2.0",
-    "playwright>=1.62.0",
     "pgvector>=0.4,<1",
 ]
 
@@ -44,6 +43,7 @@ retrieval = [
 dev = [
     "httpx2>=2,<3",
     "pg0-embedded==0.15.1",
+    "playwright>=1.62.0",
     "pytest>=8.3",
     "ruff>=0.6",
 ]

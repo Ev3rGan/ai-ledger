@@ -14,3 +14,6 @@ secrets
 deploy/m1/state
 dist
 build
+frontend/node_modules
+src/ai_intel_agent/static
+src/ai_intel_agent/operator_static

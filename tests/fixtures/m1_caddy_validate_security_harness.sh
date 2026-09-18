@@ -40,6 +40,7 @@ validation_args+=(
   --tmpfs /config
   --tmpfs /data
   --env AI_INTEL_DOMAIN=validate.invalid
+  --env AI_INTEL_OPERATOR_DOMAIN=validate-operator.invalid
   --volume "$caddyfile:/etc/caddy/Caddyfile:ro"
   --entrypoint caddy
   "$image"

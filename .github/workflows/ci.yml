@@ -29,8 +29,22 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22.23.2"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
       - name: Install dependencies
         run: uv sync --locked --python 3.12 --extra ch3 --extra dev
+
+      - name: Test and rebuild locked frontend assets
+        run: |
+          npm --prefix frontend ci
+          npm --prefix frontend test
+          npm --prefix frontend run build
+          git diff --exit-code -- src/ai_intel_agent/static src/ai_intel_agent/operator_static
 
       - name: Run deterministic tests (mocked providers only)
         run: uv run --extra dev pytest
@@ -67,6 +81,89 @@ jobs:
               server.drop()
           '@
           uv run --extra dev python -c $script
+
+  release-candidate:
+    name: release candidate image
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Build the production image from locked sources
+        run: |
+          docker build \
+            --build-arg "AI_INTEL_RELEASE=${GITHUB_SHA}" \
+            --file deploy/m1/production.Dockerfile \
+            --tag ai-ledger-release-candidate:${GITHUB_SHA} .
+
+      - name: Prove the runtime image has no Node toolchain
+        run: |
+          docker run --rm --entrypoint sh ai-ledger-release-candidate:${GITHUB_SHA} -eu -c '
+            ! command -v node
+            ! command -v npm
+            ! command -v npx
+            ! find /opt/ai-ledger -path "*/playwright/driver/node" -type f -print -quit | grep -q .
+            test -z "$(find /opt/ai-ledger /usr/local /usr -type f \
+              \( -name node -o -name nodejs -o -name npm -o -name npx \) \
+              -perm /111 -print -quit)"
+            test -f /opt/ai-ledger/src/ai_intel_agent/static/.vite/manifest.json
+            test -f /opt/ai-ledger/src/ai_intel_agent/operator_static/.vite/manifest.json
+            ai-intel-agent --help >/dev/null
+          '
+
+      - name: Validate the production Caddy boundary
+        run: |
+          docker run --rm --network none --read-only \
+            --cap-drop ALL --cap-add NET_BIND_SERVICE \
+            --tmpfs /config --tmpfs /data \
+            --env AI_INTEL_DOMAIN=public.invalid \
+            --env AI_INTEL_OPERATOR_DOMAIN=operator.invalid \
+            --volume "${GITHUB_WORKSPACE}/deploy/m1/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            --entrypoint caddy \
+            caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d \
+            validate --config /etc/caddy/Caddyfile
+
+      - name: Exercise Host, header, and cache isolation through Caddy
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="ai-ledger-release-candidate:${GITHUB_SHA}"
+          network="ai-ledger-rc-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          backend="${network}-backend"
+          edge="${network}-edge"
+          cleanup() {
+            status=$?
+            if [[ ${status} -ne 0 ]]; then
+              docker logs "${backend}" || true
+              docker logs "${edge}" || true
+            fi
+            docker rm --force "${backend}" "${edge}" >/dev/null 2>&1 || true
+            docker network rm "${network}" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker network create "${network}"
+          docker run --detach --name "${backend}" \
+            --network "${network}" --network-alias web \
+            --entrypoint python \
+            --volume "${GITHUB_WORKSPACE}/tests/fixtures/m7_caddy_backend.py:/tmp/backend.py:ro" \
+            "${image}" /tmp/backend.py
+          docker run --detach --name "${edge}" \
+            --network "${network}" --network-alias edge \
+            --read-only --cap-drop ALL --cap-add NET_BIND_SERVICE \
+            --tmpfs /config --tmpfs /data \
+            --env AI_INTEL_DOMAIN=http://public.invalid \
+            --env AI_INTEL_OPERATOR_DOMAIN=http://operator.invalid \
+            --volume "${GITHUB_WORKSPACE}/deploy/m1/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            --entrypoint caddy \
+            caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d \
+            run --config /etc/caddy/Caddyfile
+          docker run --rm --network "${network}" \
+            --entrypoint python \
+            --volume "${GITHUB_WORKSPACE}/tests/fixtures/m7_caddy_acceptance.py:/tmp/acceptance.py:ro" \
+            "${image}" /tmp/acceptance.py
 
   provider-scope:
     name: detect Provider-facing changes
@@ -119,11 +216,13 @@ jobs:
     name: live Provider qualification
     needs:
       - quality
+      - release-candidate
       - provider-scope
     if: >-
       github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       needs.quality.result == 'success' &&
+      needs.release-candidate.result == 'success' &&
       needs.provider-scope.outputs.required == 'true'
     runs-on: windows-latest
     timeout-minutes: 15

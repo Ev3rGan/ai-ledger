@@ -47,10 +47,6 @@ from ai_intel_agent.editorial import (
     RetrievalIndexFollowUp,
     StoryInspection,
 )
-from ai_intel_agent.extraction_benchmark import (
-    BenchmarkConfigurationError,
-    run_document_extraction_benchmark,
-)
 from ai_intel_agent.feed_acquisition import (
     HttpFeedFetcher,
     SampleFeedFetcher,
@@ -177,6 +173,25 @@ DEFAULT_RESEARCH_PROVIDER_QUALIFICATION_OUTPUT = Path(
 RETRIEVAL_TIME_BOUNDARY_PATTERN = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})"
 )
+
+
+def run_document_extraction_benchmark(
+    output: Path,
+    *,
+    attempts: int,
+    concurrency: int,
+    progress,
+):
+    from ai_intel_agent.extraction_benchmark import (
+        run_document_extraction_benchmark as run_benchmark,
+    )
+
+    return run_benchmark(
+        output,
+        attempts=attempts,
+        concurrency=concurrency,
+        progress=progress,
+    )
 
 
 @app.callback()
@@ -2061,7 +2076,17 @@ def benchmark_document_extraction(
             concurrency=concurrency,
             progress=progress,
         )
-    except BenchmarkConfigurationError as error:
+    except ModuleNotFoundError as error:
+        if error.name == "playwright":
+            raise typer.BadParameter(
+                "Install development dependencies to run the extraction benchmark."
+            ) from error
+        raise
+    except ValueError as error:
+        from ai_intel_agent.extraction_benchmark import BenchmarkConfigurationError
+
+        if not isinstance(error, BenchmarkConfigurationError):
+            raise
         raise typer.BadParameter(str(error)) from error
     console.print(
         "[green]Benchmarked "

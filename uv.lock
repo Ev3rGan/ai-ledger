@@ -16,7 +16,6 @@ dependencies = [
     { name = "httpx" },
     { name = "jinja2" },
     { name = "pgvector" },
-    { name = "playwright" },
     { name = "psycopg", extra = ["binary"] },
     { name = "pydantic" },
     { name = "pydantic-settings" },
@@ -37,6 +36,7 @@ ch3 = [
 dev = [
     { name = "httpx2" },
     { name = "pg0-embedded" },
+    { name = "playwright" },
     { name = "pytest" },
     { name = "ruff" },
 ]
@@ -57,7 +57,7 @@ requires-dist = [
     { name = "jinja2", specifier = ">=3.1,<4" },
     { name = "pg0-embedded", marker = "extra == 'dev'", specifier = "==0.15.1" },
     { name = "pgvector", specifier = ">=0.4,<1" },
-    { name = "playwright", specifier = ">=1.62.0" },
+    { name = "playwright", marker = "extra == 'dev'", specifier = ">=1.62.0" },
     { name = "psutil", marker = "extra == 'retrieval'", specifier = ">=7,<8" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
     { name = "pydantic", specifier = ">=2.9" },
