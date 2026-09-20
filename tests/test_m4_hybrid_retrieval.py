@@ -1198,6 +1198,7 @@ def test_production_bundle_prepares_exact_sha_hybrid_acceptance_without_model_su
     assert (
         "${AI_INTEL_RERANKER_MODEL_DIR:?required}:/opt/ai-ledger/models/reranker:ro"
     ) in scheduler
+    assert "timeout: 60s" in scheduler
     assert 'command: ["operator", "retrieval", "index", "--complete", "--production"]' in compose
     assert all(
         f"{key}=" in release_environment
