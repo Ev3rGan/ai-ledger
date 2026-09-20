@@ -1182,14 +1182,22 @@ def test_production_bundle_prepares_exact_sha_hybrid_acceptance_without_model_su
         encoding="utf-8"
     )
     operator = (project_root / "deploy/m1/operate.sh").read_text(encoding="utf-8")
+    scheduler = compose.split("\n  scheduler:\n", 1)[1].split("\n  backup:\n", 1)[0]
 
     assert "--extra retrieval" in dockerfile
     assert "apt-get install --yes --no-install-recommends git git-lfs" in dockerfile
     assert "AI_INTEL_EMBEDDING_MODEL_DIR" in compose
     assert "AI_INTEL_RERANKER_MODEL_DIR" in compose
     assert "AI_INTEL_RETRIEVAL_THREADS" in compose
-    assert compose.count(":/opt/ai-ledger/models/embedding:ro") == 2
-    assert compose.count(":/opt/ai-ledger/models/reranker:ro") == 2
+    assert compose.count(":/opt/ai-ledger/models/embedding:ro") == 3
+    assert compose.count(":/opt/ai-ledger/models/reranker:ro") == 3
+    assert "<<: [*database-environment, *provider-environment, *retrieval-environment]" in scheduler
+    assert (
+        "${AI_INTEL_EMBEDDING_MODEL_DIR:?required}:/opt/ai-ledger/models/embedding:ro"
+    ) in scheduler
+    assert (
+        "${AI_INTEL_RERANKER_MODEL_DIR:?required}:/opt/ai-ledger/models/reranker:ro"
+    ) in scheduler
     assert 'command: ["operator", "retrieval", "index", "--complete", "--production"]' in compose
     assert all(
         f"{key}=" in release_environment
