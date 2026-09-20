@@ -258,6 +258,42 @@ def test_scheduler_drains_durable_follow_up_on_restart_and_after_collection() ->
     assert follow_up_runs == ["drained", "drained"]
 
 
+def test_scheduler_reports_running_while_draining_startup_follow_ups() -> None:
+    events: list[str] = []
+    current = datetime(2026, 8, 15, 5, 59, tzinfo=SHANGHAI)
+
+    class RecordingStatus:
+        def running(self, *, started_at: datetime) -> None:
+            events.append("status:running")
+
+        def waiting(self, *, next_run_at: datetime, observed_at: datetime) -> None:
+            events.append("status:waiting")
+
+        def succeeded(self, *, completed_at: datetime) -> None:
+            events.append("status:succeeded")
+
+        def failed(self, *, completed_at: datetime) -> None:
+            events.append("status:failed")
+
+        def stopped(self, *, observed_at: datetime) -> None:
+            events.append("status:stopped")
+
+    GeminiScheduler(
+        collect=lambda: events.append("collected"),
+        run_pending_index_follow_ups=lambda: events.append("follow-ups:drained"),
+        now=lambda: current,
+        wait=lambda _: True,
+        status=RecordingStatus(),
+    ).run()
+
+    assert events == [
+        "status:running",
+        "follow-ups:drained",
+        "status:waiting",
+        "status:stopped",
+    ]
+
+
 def test_scheduler_stop_controller_handles_windows_break_and_restores_handler() -> None:
     previous_handler = signal.getsignal(signal.SIGBREAK)
 

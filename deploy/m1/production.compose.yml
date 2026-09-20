@@ -153,7 +153,7 @@ services:
     healthcheck:
       test: ["CMD", "ai-intel-agent", "operator", "scheduler-health", "--production"]
       interval: 30s
-      timeout: 10s
+      timeout: 60s
       retries: 3
       start_period: 10s
 

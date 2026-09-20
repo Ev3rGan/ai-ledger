@@ -333,6 +333,7 @@ class GeminiScheduler:
 
     def run(self) -> None:
         if self._run_pending_index_follow_ups is not None:
+            self._status.running(started_at=self._now())
             self._run_pending_index_follow_ups()
         while True:
             current = self._now()
