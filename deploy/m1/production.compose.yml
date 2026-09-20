@@ -139,11 +139,14 @@ services:
     <<: *app
     command: ["schedule-sources", "--production", "--backfill-limit", "${AI_INTEL_SCHEDULE_BACKFILL_LIMIT:-5}"]
     environment:
-      <<: [*database-environment, *provider-environment]
+      <<: [*database-environment, *provider-environment, *retrieval-environment]
       AI_INTEL_SCHEDULE_BACKFILL_LIMIT: ${AI_INTEL_SCHEDULE_BACKFILL_LIMIT:?required}
     secrets:
       - database-password
       - deepseek-api-key
+    volumes:
+      - ${AI_INTEL_EMBEDDING_MODEL_DIR:?required}:/opt/ai-ledger/models/embedding:ro
+      - ${AI_INTEL_RERANKER_MODEL_DIR:?required}:/opt/ai-ledger/models/reranker:ro
     networks:
       - edge
       - database
